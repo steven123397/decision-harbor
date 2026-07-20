@@ -1,0 +1,102 @@
+{
+  "dataset": "sales-analytics",
+  "version": "1.0.0",
+  "schema": "analytics",
+  "default_seed": 20260720,
+  "encoding": "UTF-8",
+  "tables": [
+    {
+      "name": "customers",
+      "row_count": 100,
+      "columns": [
+        {"name": "id", "type": "bigint", "nullable": false, "primary_key": true},
+        {"name": "customer_code", "type": "varchar(20)", "nullable": false, "unique": true},
+        {"name": "display_name", "type": "varchar(120)", "nullable": false},
+        {"name": "region", "type": "varchar(20)", "nullable": false, "allowed_values": ["Central", "East", "North", "South", "West"]},
+        {"name": "segment", "type": "varchar(20)", "nullable": true, "allowed_values": ["enterprise", "mid_market", "small_business"]},
+        {"name": "created_at", "type": "timestamptz", "nullable": false}
+      ],
+      "references": []
+    },
+    {
+      "name": "product_categories",
+      "row_count": 8,
+      "columns": [
+        {"name": "id", "type": "bigint", "nullable": false, "primary_key": true},
+        {"name": "category_code", "type": "varchar(20)", "nullable": false, "unique": true},
+        {"name": "name", "type": "varchar(80)", "nullable": false}
+      ],
+      "references": []
+    },
+    {
+      "name": "products",
+      "row_count": 50,
+      "columns": [
+        {"name": "id", "type": "bigint", "nullable": false, "primary_key": true},
+        {"name": "sku", "type": "varchar(30)", "nullable": false, "unique": true},
+        {"name": "name", "type": "varchar(120)", "nullable": false},
+        {"name": "category_id", "type": "bigint", "nullable": false},
+        {"name": "list_price", "type": "numeric(12,2)", "nullable": false},
+        {"name": "cost_price", "type": "numeric(12,2)", "nullable": false},
+        {"name": "active", "type": "boolean", "nullable": false}
+      ],
+      "references": [{"column": "category_id", "table": "product_categories", "target_column": "id"}]
+    },
+    {
+      "name": "orders",
+      "row_count": 1000,
+      "columns": [
+        {"name": "id", "type": "bigint", "nullable": false, "primary_key": true},
+        {"name": "order_no", "type": "varchar(30)", "nullable": false, "unique": true},
+        {"name": "customer_id", "type": "bigint", "nullable": false},
+        {"name": "ordered_at", "type": "timestamptz", "nullable": false},
+        {"name": "status", "type": "varchar(20)", "nullable": false, "allowed_values": ["cancelled", "confirmed", "pending", "refunded"]},
+        {"name": "currency", "type": "char(3)", "nullable": false, "allowed_values": ["CNY"]}
+      ],
+      "references": [{"column": "customer_id", "table": "customers", "target_column": "id"}]
+    },
+    {
+      "name": "order_items",
+      "row_count": 3000,
+      "columns": [
+        {"name": "id", "type": "bigint", "nullable": false, "primary_key": true},
+        {"name": "order_id", "type": "bigint", "nullable": false},
+        {"name": "product_id", "type": "bigint", "nullable": false},
+        {"name": "quantity", "type": "integer", "nullable": false},
+        {"name": "unit_price", "type": "numeric(12,2)", "nullable": false},
+        {"name": "discount_rate", "type": "numeric(5,4)", "nullable": false}
+      ],
+      "references": [
+        {"column": "order_id", "table": "orders", "target_column": "id"},
+        {"column": "product_id", "table": "products", "target_column": "id"}
+      ],
+      "unique_constraints": [["order_id", "product_id"]]
+    }
+  ],
+  "expected_counts": {
+    "customers": 100,
+    "product_categories": 8,
+    "products": 50,
+    "orders": 1000,
+    "order_items": 3000
+  },
+  "order_status_counts": {
+    "confirmed": 720,
+    "pending": 100,
+    "cancelled": 100,
+    "refunded": 80
+  },
+  "business_rules": {
+    "confirmed_orders_are_realized_sales": true,
+    "sales_amount": "quantity * unit_price * (1 - discount_rate)",
+    "cost_amount": "quantity * products.cost_price",
+    "gross_margin": "sales_amount - cost_amount",
+    "discount_rate_range": [0, 1],
+    "product_cost_not_above_list_price": true,
+    "all_currency_values": "CNY"
+  },
+  "date_range": {
+    "ordered_at_start": "2024-01-01",
+    "ordered_at_end": "2025-12-31"
+  }
+}

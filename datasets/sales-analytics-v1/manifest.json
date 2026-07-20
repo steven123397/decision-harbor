@@ -1,0 +1,44 @@
+{
+  "dataset": "sales-analytics",
+  "version": "1.0.0",
+  "seed": 20260720,
+  "contract_sha256": "b790ae12efe3393529829008c794e56df469a96b3861130443bbf200ca34b757",
+  "generator_sha256": "794af358b52c41895533105d8fa21b7685df34f78a6eabb69d5aff928b0a6349",
+  "files": {
+    "customers": {
+      "path": "data/customers.csv",
+      "rows": 100,
+      "sha256": "4994d86a1d02eac66d69282b0153a579e0ab04b3c578bcebf967f5449dacad67"
+    },
+    "product_categories": {
+      "path": "data/product_categories.csv",
+      "rows": 8,
+      "sha256": "de513743d896a2e269c2b8089729e240b4c7ae5905a2b9b1e6a39b3e093e7c98"
+    },
+    "products": {
+      "path": "data/products.csv",
+      "rows": 50,
+      "sha256": "78b699081c4ecaa3505f3f301e9fc55c78fc25f4f21079b9b07b7a2f46e2cda4"
+    },
+    "orders": {
+      "path": "data/orders.csv",
+      "rows": 1000,
+      "sha256": "15b0199eb6a63a3f6a92ff45e713410f8fec574b137d7da4273be962c7b2d576"
+    },
+    "order_items": {
+      "path": "data/order_items.csv",
+      "rows": 3000,
+      "sha256": "9051fe416a651ef8a55a292e5dad10343f2ecc942bbff001f2138a0665897735"
+    }
+  },
+  "status_counts": {
+    "confirmed": 720,
+    "pending": 100,
+    "refunded": 80,
+    "cancelled": 100
+  },
+  "ordered_at": {
+    "start": "2024-01-01",
+    "end": "2025-12-31"
+  }
+}

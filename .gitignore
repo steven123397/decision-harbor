@@ -1,0 +1,11 @@
+.worktrees/
+.env
+.env.*
+!.env.example
+node_modules/
+dist/
+__pycache__/
+.pytest_cache/
+.venv/
+playwright-report/
+test-results/

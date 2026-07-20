@@ -1,0 +1,96 @@
+# DecisionHarbor 本地运行环境。
+# 隔离约束（docs/background/technical-constraints.md）：不固定 container_name、
+# 网络名、数据卷名与绑定目录；db 不发布宿主端口。项目名与端口经 .env 配置。
+
+name: ${DH_PROJECT_NAME:-decisionharbor}
+
+x-api-env: &api-env
+  PLATFORM_DATABASE_URL: postgresql+psycopg://platform_app:${PLATFORM_APP_PASSWORD:?missing in .env}@db:5432/platform
+  ANALYTICS_OWNER_DATABASE_URL: postgresql+psycopg://analytics_owner:${ANALYTICS_OWNER_PASSWORD:?missing in .env}@db:5432/analytics
+  ANALYTICS_READONLY_DATABASE_URL: postgresql+psycopg://analytics_readonly:${ANALYTICS_READONLY_PASSWORD:?missing in .env}@db:5432/analytics
+  STATEMENT_TIMEOUT_MS: ${STATEMENT_TIMEOUT_MS:-5000}
+  MAX_ROWS: ${MAX_ROWS:-1000}
+  DATASETS_DIR: /datasets
+
+services:
+  db:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?missing in .env}
+      POSTGRES_DB: postgres
+      PLATFORM_APP_PASSWORD: ${PLATFORM_APP_PASSWORD:?missing in .env}
+      ANALYTICS_OWNER_PASSWORD: ${ANALYTICS_OWNER_PASSWORD:?missing in .env}
+      ANALYTICS_READONLY_PASSWORD: ${ANALYTICS_READONLY_PASSWORD:?missing in .env}
+    volumes:
+      # postgres:18+ 要求挂载点在 /var/lib/postgresql（数据落在 18/docker 子目录）
+      - pgdata:/var/lib/postgresql
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  migrate:
+    build:
+      context: ./api
+      args:
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+    depends_on:
+      db:
+        condition: service_healthy
+    environment: *api-env
+    volumes:
+      - ./datasets/sales-analytics-v1:/datasets:ro
+    command: ["python", "-m", "app.migrate"]
+
+  api:
+    build:
+      context: ./api
+      args:
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment: *api-env
+    ports:
+      - "${DH_API_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  web:
+    build: ./web
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "${DH_WEB_PORT:-5173}:80"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  # 测试入口（scripts/test.sh 使用），不参与默认启动
+  web-unit:
+    build:
+      context: ./web
+      target: test
+    profiles: ["test"]
+    command: ["npm", "run", "test:run"]
+
+  e2e:
+    build: ./e2e
+    profiles: ["test"]
+    depends_on:
+      web:
+        condition: service_healthy
+    environment:
+      BASE_URL: http://web
+
+volumes:
+  pgdata:

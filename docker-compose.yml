@@ -1,0 +1,55 @@
+services:
+  db:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      # PG 18+ stores versioned data under /var/lib/postgresql (not .../data).
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    # No fixed host port — only reachable on the compose network.
+
+  api:
+    build:
+      context: ./apps/api
+    environment:
+      POSTGRES_ADMIN_URL: postgresql://postgres:postgres@db:5432/postgres
+      PLATFORM_DATABASE_URL: postgresql+psycopg://platform_app:platform_app@db:5432/platform
+      ANALYTICS_READONLY_URL: postgresql+psycopg://analytics_readonly:analytics_readonly@db:5432/analytics
+      ANALYTICS_MIGRATOR_URL: postgresql+psycopg://analytics_migrator:analytics_migrator@db:5432/analytics
+      DATASET_DIR: /datasets/sales-analytics-v1
+      STATEMENT_TIMEOUT_MS: ${STATEMENT_TIMEOUT_MS:-5000}
+      MAX_RESULT_ROWS: ${MAX_RESULT_ROWS:-1000}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:${WEB_HOST_PORT:-5173},http://127.0.0.1:${WEB_HOST_PORT:-5173}}
+    volumes:
+      - ./datasets/sales-analytics-v1:/datasets/sales-analytics-v1:ro
+    ports:
+      - "${API_HOST_PORT:-8000}:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/ready"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  web:
+    build:
+      context: ./apps/web
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:${API_HOST_PORT:-8000}}
+    ports:
+      - "${WEB_HOST_PORT:-5173}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  pgdata:

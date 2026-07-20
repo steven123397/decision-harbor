@@ -9,3 +9,8 @@ __pycache__/
 .venv/
 playwright-report/
 test-results/
+apps/web/playwright-report/
+apps/web/test-results/
+*.pyc
+.coverage
+htmlcov/

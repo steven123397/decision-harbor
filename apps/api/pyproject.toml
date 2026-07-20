@@ -1,0 +1,12 @@
+[project]
+name = "decisionharbor-api"
+version = "0.1.0"
+description = "DecisionHarbor API"
+requires-python = ">=3.13"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+markers = [
+  "integration: tests that need PostgreSQL",
+]

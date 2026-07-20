@@ -6,6 +6,10 @@ node_modules/
 dist/
 __pycache__/
 .pytest_cache/
+.coverage
+htmlcov/
 .venv/
 playwright-report/
 test-results/
+coverage/
+*.tsbuildinfo

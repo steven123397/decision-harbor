@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$root"
+
+if [[ -z "${COMPOSE_PROJECT_NAME:-}" ]]; then
+  workspace="$(basename "$(git rev-parse --show-toplevel)")"
+  workspace="$(printf '%s' "$workspace" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-')"
+  export COMPOSE_PROJECT_NAME="decisionharbor-${workspace%-}"
+fi
+
+command="${1:-}"
+case "$command" in
+  up)
+    docker compose up -d --build --wait
+    ;;
+  test)
+    docker compose up -d --build --wait
+    docker compose --profile test build api-test web-test e2e
+    docker compose --profile test run --rm api-test
+    docker compose --profile test run --rm web-test
+    docker compose --profile test run --rm e2e
+    ;;
+  down)
+    docker compose down --remove-orphans
+    ;;
+  destroy)
+    docker compose down --volumes --remove-orphans
+    ;;
+  config)
+    docker compose config
+    ;;
+  *)
+    printf 'Usage: ./dev {up|test|down|destroy|config}\n' >&2
+    exit 2
+    ;;
+esac

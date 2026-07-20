@@ -2,7 +2,9 @@
 
 DecisionHarbor 是一个面向企业内部业务人员的受治理数据分析平台。它让用户提交显式 SQL，并在受控规则内完成校验、只读执行、结果展示与查询审计。
 
-当前仓库提供首轮产品背景、需求、技术约束和固定销售分析数据。应用源码、依赖、容器配置、迁移、测试和运行命令尚未建立。
+当前仓库已实现首轮受治理 SQL 查询链路，包括 React 查询工作台、FastAPI、两个 PostgreSQL 逻辑数据库、SQLGlot AST 策略、查询审计、迁移、固定数据 seed 和容器化测试。
+
+项目文档的职责、阅读顺序和正式入口见 [文档索引](docs/index.md)。
 
 ## 背景资料
 
@@ -19,3 +21,70 @@ DecisionHarbor 是一个面向企业内部业务人员的受治理数据分析�
 ```bash
 python3 validate.py
 ```
+
+## 本地运行
+
+唯一运行前提是 Docker 与 Docker Compose。应用的 Python 3.13、Node.js 24 和 PostgreSQL 18 均在容器内运行。
+
+```bash
+./dev up
+```
+
+启动完成后访问：
+
+- 查询工作台：`http://127.0.0.1:5173`
+- API 健康检查：`http://127.0.0.1:8000/health`
+- API 就绪检查：`http://127.0.0.1:8000/ready`
+
+默认宿主地址只绑定回环接口。首轮没有应用鉴权，不得直接用于共享网络或生产部署。
+
+停止服务但保留当前实例的数据卷：
+
+```bash
+./dev down
+```
+
+只有明确需要删除当前实例全部数据库数据时才运行：
+
+```bash
+./dev destroy
+```
+
+## 并行实例
+
+项目名和两个宿主端口都可以覆盖，因此不同工作区可以同时运行且不会共享网络或 PostgreSQL 卷：
+
+```bash
+COMPOSE_PROJECT_NAME=decisionharbor-a \
+WEB_HOST_PORT=15173 \
+API_HOST_PORT=18080 \
+./dev up
+```
+
+## 查询 API
+
+提交一条同步只读查询：
+
+```bash
+curl -H 'content-type: application/json' \
+  --data '{"sql":"SELECT region, count(*) FROM customers GROUP BY region"}' \
+  http://127.0.0.1:8000/api/v1/query-runs
+```
+
+读取持久化审计事实：
+
+```bash
+curl http://127.0.0.1:8000/api/v1/query-runs/<query-run-id>
+```
+
+历史读取不返回结果单元格；结果只随成功的 POST 即时返回。
+
+## 测试
+
+统一入口会启动完整 Compose 环境，并在容器内运行 pytest、Vitest 和 Playwright：
+
+```bash
+./dev test
+```
+
+实现边界与错误语义见[首轮系统设计](docs/design/first-release-system-design.md)，当前验证状态见[项目状态](docs/status/project_status.md)。

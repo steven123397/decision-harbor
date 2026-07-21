@@ -1,0 +1,51 @@
+services:
+  db:
+    image: postgres:18
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-devpassword}
+      PLATFORM_DB_PASSWORD: ${PLATFORM_DB_PASSWORD:-platform_pass}
+      ANALYTICS_READER_PASSWORD: ${ANALYTICS_READER_PASSWORD:-reader_pass}
+      ANALYTICS_ADMIN_PASSWORD: ${ANALYTICS_ADMIN_PASSWORD:-admin_pass}
+    volumes:
+      - pgdata:/var/lib/postgresql
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build: ./api
+    environment:
+      PLATFORM_DATABASE_URL: postgresql+psycopg://platform_app:${PLATFORM_DB_PASSWORD:-platform_pass}@db:5432/platform
+      ANALYTICS_DATABASE_URL: postgresql+psycopg://analytics_reader:${ANALYTICS_READER_PASSWORD:-reader_pass}@db:5432/analytics
+      ANALYTICS_ADMIN_DATABASE_URL: postgresql+psycopg://analytics_admin:${ANALYTICS_ADMIN_PASSWORD:-admin_pass}@db:5432/analytics
+      QUERY_STATEMENT_TIMEOUT_MS: ${QUERY_STATEMENT_TIMEOUT_MS:-30000}
+      QUERY_MAX_ROWS: ${QUERY_MAX_ROWS:-1000}
+    volumes:
+      - ./datasets:/datasets:ro
+    ports:
+      - "${API_HOST_PORT:-8000}:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 3s
+      timeout: 5s
+      retries: 10
+
+  web:
+    build:
+      context: ./web
+      args:
+        VITE_API_BASE_URL: http://localhost:${API_HOST_PORT:-8000}
+    ports:
+      - "${WEB_HOST_PORT:-5173}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  pgdata:

@@ -1,0 +1,149 @@
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background: #f5f7fa;
+  color: #1a1a2e;
+  line-height: 1.6;
+}
+
+.app {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 2rem 1rem;
+}
+
+.app-header {
+  margin-bottom: 2rem;
+}
+
+.app-header h1 {
+  font-size: 1.5rem;
+  color: #16213e;
+}
+
+.app-header p {
+  color: #666;
+  font-size: 0.9rem;
+}
+
+.workbench {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.sql-input-area {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.sql-input-area textarea {
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-size: 0.9rem;
+  padding: 0.75rem;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  resize: vertical;
+  background: #fff;
+}
+
+.sql-input-area textarea:focus {
+  outline: none;
+  border-color: #3b82f6;
+  box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.1);
+}
+
+.sql-input-area button {
+  align-self: flex-start;
+  padding: 0.5rem 1.5rem;
+  background: #3b82f6;
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  font-size: 0.9rem;
+  cursor: pointer;
+}
+
+.sql-input-area button:disabled {
+  background: #9ca3af;
+  cursor: not-allowed;
+}
+
+.status-indicator {
+  color: #6b7280;
+  font-style: italic;
+}
+
+.result-area {
+  background: #fff;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.result-meta {
+  padding: 0.5rem 0.75rem;
+  background: #f0fdf4;
+  border-bottom: 1px solid #e5e7eb;
+  font-size: 0.85rem;
+  color: #166534;
+}
+
+.table-wrapper {
+  overflow-x: auto;
+  max-height: 400px;
+  overflow-y: auto;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+
+th, td {
+  padding: 0.4rem 0.75rem;
+  text-align: left;
+  border-bottom: 1px solid #f3f4f6;
+  white-space: nowrap;
+}
+
+th {
+  background: #f9fafb;
+  font-weight: 600;
+  position: sticky;
+  top: 0;
+}
+
+.error-area {
+  padding: 0.75rem;
+  border-radius: 6px;
+  border: 1px solid;
+}
+
+.error-rejected {
+  background: #fef3c7;
+  border-color: #f59e0b;
+}
+
+.error-failed {
+  background: #fee2e2;
+  border-color: #ef4444;
+}
+
+.error-code {
+  font-weight: 600;
+  font-size: 0.9rem;
+  margin-bottom: 0.25rem;
+}
+
+.error-message {
+  font-size: 0.85rem;
+  color: #374151;
+}

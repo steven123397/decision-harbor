@@ -6,6 +6,7 @@ DecisionHarbor 是一个面向企业内部业务人员的受治理数据分析�
 
 ## 背景资料
 
+- [文档索引](docs/index.md) — 文档导航与阅读入口
 - [产品需求](docs/background/product-requirements.md)
 - [技术约束](docs/background/technical-constraints.md)
 - [销售分析数据集 v1](datasets/sales-analytics-v1/README.md)

@@ -1,0 +1,62 @@
+name: ${DH_PROJECT_NAME:-decisionharbor}
+
+services:
+  db:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: ${DH_BOOTSTRAP_USER:-postgres}
+      POSTGRES_PASSWORD: ${DH_BOOTSTRAP_PASSWORD:-decisionharbor}
+      POSTGRES_DB: postgres
+      DH_PLATFORM_DB: ${DH_PLATFORM_DB:-platform}
+      DH_ANALYTICS_DB: ${DH_ANALYTICS_DB:-analytics}
+      DH_PLATFORM_WRITER_USER: ${DH_PLATFORM_WRITER_USER:-dh_platform_writer}
+      DH_PLATFORM_WRITER_PASSWORD: ${DH_PLATFORM_WRITER_PASSWORD:-dh_platform_writer}
+      DH_ANALYTICS_READER_USER: ${DH_ANALYTICS_READER_USER:-dh_analytics_reader}
+      DH_ANALYTICS_READER_PASSWORD: ${DH_ANALYTICS_READER_PASSWORD:-dh_analytics_reader}
+    volumes:
+      - db-data:/var/lib/postgresql
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  api:
+    build: ./api
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DH_DB_HOST: db
+      DH_DB_PORT: "5432"
+      DH_BOOTSTRAP_USER: ${DH_BOOTSTRAP_USER:-postgres}
+      DH_BOOTSTRAP_PASSWORD: ${DH_BOOTSTRAP_PASSWORD:-decisionharbor}
+      DH_PLATFORM_DB: ${DH_PLATFORM_DB:-platform}
+      DH_ANALYTICS_DB: ${DH_ANALYTICS_DB:-analytics}
+      DH_PLATFORM_WRITER_USER: ${DH_PLATFORM_WRITER_USER:-dh_platform_writer}
+      DH_PLATFORM_WRITER_PASSWORD: ${DH_PLATFORM_WRITER_PASSWORD:-dh_platform_writer}
+      DH_ANALYTICS_READER_USER: ${DH_ANALYTICS_READER_USER:-dh_analytics_reader}
+      DH_ANALYTICS_READER_PASSWORD: ${DH_ANALYTICS_READER_PASSWORD:-dh_analytics_reader}
+      DH_STATEMENT_TIMEOUT_MS: ${DH_STATEMENT_TIMEOUT_MS:-30000}
+      DH_ROW_LIMIT: ${DH_ROW_LIMIT:-1000}
+      DH_ANALYTICS_SEED_DIR: /datasets/sales-analytics-v1
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./datasets:/datasets:ro
+    ports:
+      - "${DH_API_PORT:-8000}:8000"
+    restart: unless-stopped
+
+  web:
+    build: ./web
+    depends_on:
+      - api
+    ports:
+      - "${DH_WEB_PORT:-5173}:5173"
+    restart: unless-stopped
+
+volumes:
+  db-data:

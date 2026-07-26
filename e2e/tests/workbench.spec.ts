@@ -17,7 +17,15 @@ test("提交合法查询后展示结果表格", async ({ page }) => {
 
 test("提交期间展示执行中且按钮禁用", async ({ page }) => {
   await page.goto("/");
-  await page.getByTestId("sql-input").fill("SELECT PG_SLEEP(1.5)");
+  // 延后响应来稳定观察过渡状态：过渡态是前端职责，不该依赖数据库把查询拖慢
+  // （能拖慢的函数也不在策略允许集内，见 docs/design/query-governance.md）
+  await page.route("**/api/v1/query-runs", async (route) => {
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    await route.continue();
+  });
+  await page
+    .getByTestId("sql-input")
+    .fill("SELECT count(*) AS n FROM orders");
   await page.getByTestId("submit-query").click();
 
   await expect(page.getByTestId("query-status")).toHaveText("执行中");

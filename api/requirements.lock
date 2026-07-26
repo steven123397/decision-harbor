@@ -1,0 +1,39 @@
+# API 依赖的解析结果，锁定到具体版本，供镜像构建使用。
+# 直接依赖及其版本区间的权威来源是 pyproject.toml；本文件只记录一次解析的产物。
+#
+# 重新生成（改动 pyproject.toml 依赖后执行，输出覆盖本文件）：
+#   docker run --rm -v "$PWD/api:/src:ro" python:3.13-slim sh -c \
+#     'cp -r /src /build && cd /build && pip install -q -e ".[dev]" setuptools \
+#      && pip freeze --exclude-editable'
+#
+# setuptools 是 pyproject.toml 声明的构建后端，一并锁定，使镜像构建无需联网取构建依赖。
+alembic==1.18.5
+annotated-doc==0.0.4
+annotated-types==0.8.0
+anyio==4.14.2
+certifi==2026.7.22
+click==8.4.2
+fastapi==0.140.0
+greenlet==3.5.4
+h11==0.16.0
+httpcore==1.0.9
+httpx==0.28.1
+idna==3.18
+iniconfig==2.3.0
+Mako==1.3.12
+MarkupSafe==3.0.3
+packaging==26.2
+pluggy==1.6.0
+psycopg==3.3.4
+psycopg-binary==3.3.4
+pydantic==2.13.4
+pydantic_core==2.46.4
+Pygments==2.20.0
+pytest==8.4.2
+setuptools==83.0.0
+SQLAlchemy==2.0.51
+sqlglot==27.29.0
+starlette==1.3.1
+typing-inspection==0.4.2
+typing_extensions==4.16.0
+uvicorn==0.51.0

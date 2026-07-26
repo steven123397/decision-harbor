@@ -6,8 +6,9 @@ ENV NPM_CONFIG_REGISTRY=${NPM_CONFIG_REGISTRY}
 
 WORKDIR /app
 
-COPY package.json package-lock.json* ./
-RUN npm install
+# npm ci 严格按 package-lock.json 安装：lockfile 与 package.json 不一致即失败
+COPY package.json package-lock.json ./
+RUN npm ci
 
 COPY . .
 

@@ -18,6 +18,20 @@
 
 数据库端口不发布到宿主机；宿主只暴露 `web` 与 `api` 两个可配置端口。
 
+## 依赖可复现性
+
+三个自建镜像都按锁文件安装，同一份提交在任意时点构建得到同一组依赖版本：
+
+| 镜像 | 锁文件 | 安装方式 |
+| --- | --- | --- |
+| `api` | `api/requirements.lock` | `pip install --no-deps -r requirements.lock`，再以 `--no-deps --no-build-isolation -e .` 装项目自身 |
+| `web` | `web/package-lock.json` | `npm ci` |
+| `e2e` | `e2e/package-lock.json` | `npm ci` |
+
+- 直接依赖及其版本区间的权威来源仍是 `api/pyproject.toml`，锁文件只是一次解析的产物；重新生成的命令写在锁文件头部。`--no-deps` 保证不引入锁外版本，构建后端 `setuptools` 也在锁内，配合 `--no-build-isolation` 使构建不再临时联网取构建依赖。
+- `npm ci` 严格按 lockfile 安装，lockfile 与 `package.json` 不一致即失败；`npm install` 会就地改写 lockfile，把"构建"变成"重新解析"，因此不用于镜像构建。
+- lockfile 中的 `resolved` 一律指向官方 registry。`PIP_INDEX_URL` / `NPM_CONFIG_REGISTRY` 只在构建时切换取包来源，不写进锁文件，换镜像源不改变解析结果。
+
 ## 并行隔离配置
 
 配置经 `.env` 文件注入（`.env` 不提交，提交 `.env.example` 作为模板）：
@@ -29,6 +43,8 @@
 | `API_PORT` | API 宿主端口 | `8000` |
 | 数据库口令类变量 | 三个应用身份的口令 | `.env.example` 提供本地开发默认值 |
 | 治理参数 | 语句超时、行数上限、输入长度上限 | 见 [query-governance.md](query-governance.md) |
+| `DB_CONNECT_TIMEOUT_S` | 建立数据库连接的上界（秒） | `5` |
+| `DB_STATEMENT_TIMEOUT_MS` | 连接级语句超时兜底 | `5000` |
 
 不同工作区设置不同的项目名与端口即可并行运行，互不共享任何容器、网络或卷。
 
@@ -72,6 +88,7 @@ seed 将 `datasets/sales-analytics-v1/data/` 的权威 CSV 装载进 `analytics`
 ## 失败与迁移
 
 - `/ready` 等待超时说明迁移或数据库启动失败，脚本以非零退出并提示查看对应服务日志。
+- 数据库完全不可达时，`/ready` 必须在有限时间内失败而不是挂起：引擎统一带 `connect_timeout`（`DB_CONNECT_TIMEOUT_S`），否则连接请求被静默丢弃时会一直等待，就绪轮询既拿不到成功也拿不到失败。连接级 `statement_timeout`（`DB_STATEMENT_TIMEOUT_MS`）为没有自带超时的语句（就绪探测、审计写入）兜底；查询执行由执行器每事务 `SET LOCAL` 管控，该设置覆盖连接级取值。
 - PostgreSQL 大版本升级需要删卷重建（本地数据可由迁移 + seed 完全重建，无保留价值）。
 
 ## 测试接缝

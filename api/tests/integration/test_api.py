@@ -9,6 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
+from conftest import SYSTEM_CATALOG_BYPASSES
 
 pytestmark = pytest.mark.integration
 
@@ -86,6 +87,51 @@ def test_forbidden_object_rejected():
         "/api/v1/query-runs", json={"sql": "SELECT * FROM pg_catalog.pg_tables"}
     )
     assert response.json()["query_run"]["error"]["code"] == "policy_forbidden_object"
+
+
+@pytest.mark.parametrize(
+    "label,sql,code",
+    SYSTEM_CATALOG_BYPASSES,
+    ids=[c[0] for c in SYSTEM_CATALOG_BYPASSES],
+)
+def test_system_catalog_bypass_rejected_without_execution(label, sql, code):
+    """已知的系统目录读取路径必须以稳定错误码拒绝，且完全不进入执行。"""
+    response = client.post("/api/v1/query-runs", json={"sql": sql})
+    assert response.status_code == 201
+    body = response.json()
+    assert body["result"] is None, f"{label} 返回了结果，说明查询被执行"
+    run = body["query_run"]
+    assert run["status"] == "rejected"
+    assert run["error"]["code"] == code
+    # 未执行的证据：审计记录中既无行数也无执行耗时
+    assert run["row_count"] is None
+    assert run["duration_ms"] is None
+
+    stored = client.get(f"/api/v1/query-runs/{run['id']}").json()["query_run"]
+    assert stored["status"] == "rejected"
+    assert stored["error"]["code"] == code
+    assert stored["sql_text"] == sql
+
+
+def test_analytical_query_with_cte_and_window_succeeds():
+    """收敛函数允许集后，含 CTE、聚合与窗口函数的正常业务查询仍可执行。"""
+    sql = (
+        "WITH confirmed AS ("
+        "SELECT o.customer_id, "
+        "oi.quantity * oi.unit_price * (1 - oi.discount_rate) AS amount "
+        "FROM orders o JOIN order_items oi ON oi.order_id = o.id "
+        "WHERE o.status = 'confirmed'"
+        ") "
+        "SELECT c.region, round(sum(confirmed.amount), 2) AS sales, "
+        "rank() OVER (ORDER BY sum(confirmed.amount) DESC) AS rk "
+        "FROM confirmed JOIN customers c ON c.id = confirmed.customer_id "
+        "GROUP BY c.region ORDER BY rk"
+    )
+    body = client.post("/api/v1/query-runs", json={"sql": sql}).json()
+    run = body["query_run"]
+    assert run["status"] == "succeeded", run["error"]
+    assert run["row_count"] > 0
+    assert [c["name"] for c in body["result"]["columns"]] == ["region", "sales", "rk"]
 
 
 def test_row_limit_truncation():

@@ -43,6 +43,8 @@ running ──> succeeded
 
 平台库与分析库均可连接、且两套迁移都处于最新版本时返回 `200`；否则 `503` 并说明未就绪原因。供统一启动命令与编排等待使用。
 
+失败必须有界：数据库完全不可达（连接被静默丢弃）时也要在有限时间内返回 `503`，不得挂起——挂起会让编排的就绪等待既拿不到结论也拿不到失败。上界由连接超时给出，见 [local-runtime.md](local-runtime.md) 的 `DB_CONNECT_TIMEOUT_S`。未就绪原因只写库别名与错误类型，不含连接串或口令。
+
 ### `POST /api/v1/query-runs`
 
 请求体 `{"sql": "..."}`。处理流程见 [architecture.md](architecture.md) 数据流。
@@ -90,8 +92,9 @@ running ──> succeeded
 | `policy_parse_error` | SQL 不可解析 | `rejected` |
 | `policy_multiple_statements` | 多条语句 | `rejected` |
 | `policy_forbidden_statement` | 非只读语句形态 | `rejected` |
-| `policy_forbidden_feature` | `SELECT INTO`、锁定子句等被禁特性 | `rejected` |
+| `policy_forbidden_feature` | `SELECT INTO`、锁定子句、非内建类型的转换目标等被禁特性 | `rejected` |
 | `policy_forbidden_object` | 越出允许对象范围 | `rejected` |
+| `policy_forbidden_function` | 调用安全允许集之外的函数或系统信息表达式 | `rejected` |
 | `execution_timeout` | 触发语句超时 | `failed` |
 | `execution_error` | 其他执行期数据库错误 | `failed` |
 | `internal_error` | 平台自身故障（含审计写入失败） | HTTP 500 |
@@ -108,6 +111,7 @@ running ──> succeeded
 集成测试基于真实双库环境（pytest + Compose）：
 
 - 身份边界：`platform_app` 无法连接 `analytics`；`analytics_reader` 无法连接 `platform`、对契约表只能 `SELECT`、写入尝试被库层拒绝。
-- 执行限制：`pg_sleep` 类慢查询触发 `execution_timeout`；超行数查询返回截断标记且行数等于上限。
+- 执行限制：`pg_sleep` 类慢查询触发 `execution_timeout`；超行数查询返回截断标记且行数等于上限。该函数不在策略允许集内（见 [query-governance.md](query-governance.md)），因此超时在执行器接缝上直接验证，不经端到端路径。
 - 端到端：提交合法查询 → `201` + `succeeded` + 结果与 seed 数据一致；提交被禁 SQL → `rejected` + 对应错误码；每种请求各自留下状态正确的审计记录，可经 `GET` 读回。
-- 幂等与就绪：`/ready` 在迁移完成前后行为正确。
+- 系统目录绕过：两条已知路径（函数参数走私系统 SQL、内层 CTE 遮蔽物理表）以稳定错误码 `rejected`，且 `result`、`row_count`、`duration_ms` 均为空——没有行数与耗时即"未进入执行"的证据。SQL 见 `api/conftest.py`。
+- 幂等与就绪：`/ready` 在迁移完成前后行为正确；数据库不可达时在连接超时上界内返回未就绪原因，且原因中不含连接串。

@@ -14,6 +14,8 @@ class Settings:
     query_timeout_ms: int
     query_row_limit: int
     query_max_sql_length: int
+    db_connect_timeout_s: int
+    db_statement_timeout_ms: int
 
 
 @lru_cache(maxsize=1)
@@ -24,4 +26,6 @@ def get_settings() -> Settings:
         query_timeout_ms=int(os.environ.get("QUERY_TIMEOUT_MS", "5000")),
         query_row_limit=int(os.environ.get("QUERY_ROW_LIMIT", "1000")),
         query_max_sql_length=int(os.environ.get("QUERY_MAX_SQL_LENGTH", "100000")),
+        db_connect_timeout_s=int(os.environ.get("DB_CONNECT_TIMEOUT_S", "5")),
+        db_statement_timeout_ms=int(os.environ.get("DB_STATEMENT_TIMEOUT_MS", "5000")),
     )

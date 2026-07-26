@@ -6,9 +6,12 @@ ENV PIP_INDEX_URL=${PIP_INDEX_URL}
 
 WORKDIR /app
 
-COPY pyproject.toml ./
+# 依赖按 requirements.lock 的解析结果安装；--no-deps 保证不引入锁外版本，
+# --no-build-isolation 让构建后端也取自锁文件，构建结果与网络时点无关。
+COPY requirements.lock pyproject.toml ./
 RUN mkdir -p app && touch app/__init__.py \
-    && pip install --no-cache-dir -e .[dev]
+    && pip install --no-cache-dir --no-deps -r requirements.lock \
+    && pip install --no-cache-dir --no-deps --no-build-isolation -e .
 
 COPY . .
 

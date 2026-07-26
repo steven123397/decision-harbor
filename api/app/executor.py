@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -20,6 +21,8 @@ from app.db import psycopg_url
 
 QUERY_TIMEOUT = "QUERY_TIMEOUT"
 EXECUTION_ERROR = "EXECUTION_ERROR"
+
+logger = logging.getLogger("decisionharbor.executor")
 
 
 @dataclass
@@ -65,6 +68,8 @@ def execute(sql: str) -> ExecutionResult:
     start = time.perf_counter()
     try:
         with psycopg.connect(psycopg_url(settings.analytics_readonly_url)) as conn:
+            # 事务级只读：角色默认只读之外的第二道事务防线
+            conn.execute("SET TRANSACTION READ ONLY")
             conn.execute(f"SET statement_timeout = {settings.statement_timeout_ms}")
             with conn.cursor() as cur:
                 cur.execute(sql)
@@ -87,11 +92,22 @@ def execute(sql: str) -> ExecutionResult:
                 truncated = len(fetched) > limit
                 rows = fetched[:limit]
     except psycopg.errors.QueryCanceled as exc:
+        logger.warning("query cancelled by statement_timeout: %s", exc)
         raise ExecutionFailure(QUERY_TIMEOUT, "执行超过语句超时限制被取消。") from exc
     except psycopg.Error as exc:
+        sqlstate = getattr(exc, "sqlstate", None)
         primary = exc.diag.message_primary if exc.diag else None
-        detail = (primary or str(exc))[:500]
-        raise ExecutionFailure(EXECUTION_ERROR, f"数据库执行错误：{detail}") from exc
+        # 数据库原文只进服务端日志；对外只给稳定、不含数据的摘要
+        logger.warning(
+            "query execution failed: sqlstate=%s error=%s sql=%s",
+            sqlstate, (primary or str(exc))[:500], sql[:500],
+        )
+        public = (
+            f"数据库执行错误（SQLSTATE {sqlstate}）。"
+            if sqlstate
+            else "数据库执行错误。"
+        )
+        raise ExecutionFailure(EXECUTION_ERROR, public) from exc
     duration_ms = int((time.perf_counter() - start) * 1000)
     return ExecutionResult(
         columns=columns,

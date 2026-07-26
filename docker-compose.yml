@@ -4,12 +4,16 @@
 
 name: ${DH_PROJECT_NAME:-decisionharbor}
 
+# API 运行进程不持有 analytics owner 凭据（最小权限）；owner 仅迁移/seed 使用。
 x-api-env: &api-env
   PLATFORM_DATABASE_URL: postgresql+psycopg://platform_app:${PLATFORM_APP_PASSWORD:?missing in .env}@db:5432/platform
-  ANALYTICS_OWNER_DATABASE_URL: postgresql+psycopg://analytics_owner:${ANALYTICS_OWNER_PASSWORD:?missing in .env}@db:5432/analytics
   ANALYTICS_READONLY_DATABASE_URL: postgresql+psycopg://analytics_readonly:${ANALYTICS_READONLY_PASSWORD:?missing in .env}@db:5432/analytics
   STATEMENT_TIMEOUT_MS: ${STATEMENT_TIMEOUT_MS:-5000}
   MAX_ROWS: ${MAX_ROWS:-1000}
+
+x-migrate-env: &migrate-env
+  <<: *api-env
+  ANALYTICS_OWNER_DATABASE_URL: postgresql+psycopg://analytics_owner:${ANALYTICS_OWNER_PASSWORD:?missing in .env}@db:5432/analytics
   DATASETS_DIR: /datasets
 
 services:
@@ -40,7 +44,7 @@ services:
     depends_on:
       db:
         condition: service_healthy
-    environment: *api-env
+    environment: *migrate-env
     volumes:
       - ./datasets/sales-analytics-v1:/datasets:ro
     command: ["python", "-m", "app.migrate"]

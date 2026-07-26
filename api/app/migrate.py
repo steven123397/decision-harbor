@@ -16,12 +16,18 @@ from sqlalchemy import text
 from app.db import analytics_owner_engine
 from app.seed import run as run_seed
 
+# 最小表授权：只授予契约五表；清除旧版的全表授权与默认授权，
+# 使未来新增的 analytics 表不会自动对查询身份可见。
 _GRANTS = [
     "GRANT USAGE ON SCHEMA analytics TO analytics_readonly",
-    "GRANT SELECT ON ALL TABLES IN SCHEMA analytics TO analytics_readonly",
-    # owner 后续新建表默认授予只读身份，防止迁移加表后失声
     "ALTER DEFAULT PRIVILEGES FOR ROLE analytics_owner IN SCHEMA analytics "
-    "GRANT SELECT ON TABLES TO analytics_readonly",
+    "REVOKE SELECT ON TABLES FROM analytics_readonly",
+    "REVOKE SELECT ON ALL TABLES IN SCHEMA analytics FROM analytics_readonly",
+    "GRANT SELECT ON analytics.customers TO analytics_readonly",
+    "GRANT SELECT ON analytics.product_categories TO analytics_readonly",
+    "GRANT SELECT ON analytics.products TO analytics_readonly",
+    "GRANT SELECT ON analytics.orders TO analytics_readonly",
+    "GRANT SELECT ON analytics.order_items TO analytics_readonly",
 ]
 
 

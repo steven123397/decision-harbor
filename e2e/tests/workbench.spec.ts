@@ -18,7 +18,12 @@ test('允许的查询：展示结果表格与行数', async ({ page }) => {
 
 test('执行期间展示执行中状态', async ({ page }) => {
   await page.goto('/')
-  await page.getByLabel('SQL').fill('SELECT pg_sleep(2)')
+  // 策略不允许 pg_sleep；用 1e8 规模的交叉连接制造可观察的执行窗口
+  await page
+    .getByLabel('SQL')
+    .fill(
+      'SELECT COUNT(*) FROM customers a CROSS JOIN customers b CROSS JOIN customers c CROSS JOIN customers d',
+    )
   await page.getByRole('button', { name: '提交' }).click()
 
   await expect(page.getByText('执行中')).toBeVisible()

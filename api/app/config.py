@@ -10,7 +10,7 @@ from functools import lru_cache
 @dataclass(frozen=True)
 class Settings:
     platform_url: str
-    analytics_owner_url: str
+    analytics_owner_url: str | None  # 仅迁移/seed 环境持有，API 运行进程为 None
     analytics_readonly_url: str
     statement_timeout_ms: int
     max_rows: int
@@ -28,7 +28,7 @@ def _required(name: str) -> str:
 def get_settings() -> Settings:
     return Settings(
         platform_url=_required("PLATFORM_DATABASE_URL"),
-        analytics_owner_url=_required("ANALYTICS_OWNER_DATABASE_URL"),
+        analytics_owner_url=os.environ.get("ANALYTICS_OWNER_DATABASE_URL"),
         analytics_readonly_url=_required("ANALYTICS_READONLY_DATABASE_URL"),
         statement_timeout_ms=int(os.environ.get("STATEMENT_TIMEOUT_MS", "5000")),
         max_rows=int(os.environ.get("MAX_ROWS", "1000")),

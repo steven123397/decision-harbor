@@ -30,6 +30,8 @@ _TRUNCATE = (
 
 def run() -> dict[str, int]:
     settings = get_settings()
+    if not settings.analytics_owner_url:
+        raise RuntimeError("ANALYTICS_OWNER_DATABASE_URL 仅在迁移/seed 环境提供")
     datasets = Path(settings.datasets_dir)
     contract = json.loads((datasets / "contract.json").read_text(encoding="utf-8"))
     expected = contract["expected_counts"]

@@ -23,7 +23,10 @@ def platform_engine() -> Engine:
 
 @lru_cache
 def analytics_owner_engine() -> Engine:
-    return create_engine(get_settings().analytics_owner_url, pool_pre_ping=True)
+    url = get_settings().analytics_owner_url
+    if not url:
+        raise RuntimeError("ANALYTICS_OWNER_DATABASE_URL 仅在迁移/seed 环境提供")
+    return create_engine(url, pool_pre_ping=True)
 
 
 @lru_cache

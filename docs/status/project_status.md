@@ -2,19 +2,22 @@
 
 ## 当前结论
 
-首轮实现已完成并通过全部验证：Web 工作台、API、PostgreSQL 双库基座、AST 治理的只读执行、查询审计、幂等迁移与 seed、可并行 Compose、三层测试均已落地。变更尚未提交（工作区 `run/kimi-kimi-k3-thinking`，HEAD 为 `1fb48f4`）。
+首轮实现已完成，并叠加一轮安全加固：SQL 策略改为词法作用域 + 函数允许集，数据库权限收紧为三层只读防线与逐表最小授权，契约业务约束经迁移 a0002 落地，失败摘要对外去敏。全部验证通过，加固变更尚未提交。
 
 ## 进展
 
-- 已确认输入：`docs/background/`、`datasets/sales-analytics-v1/` 与 `docs/design/` 五篇设计。
-- 已实现：`api/`（FastAPI、SQLGlot 策略、执行器、审计、Alembic 双库迁移、幂等 seed）、`web/`（React 工作台 + nginx 反代）、`db/`（建库建角色初始化）、`e2e/`（Playwright）、`docker-compose.yml`、`.env.example`、`scripts/run.sh` 与 `scripts/test.sh`。
-- 已验证（2026-07-20）：策略单元 39 通过；双库集成 15 通过（身份分离、超时、截断、seed 幂等）；Vitest 6 通过；Playwright 3 通过；`scripts/run.sh` 重复启动幂等，`/health`、`/ready` 正常；允许/拒绝/越权/404 的 API 证据齐备；`git diff --check` 通过；数据集 `validate.py` 通过。
+- 首轮实现：Web 工作台、API、双库基座、AST 治理执行、查询审计、幂等迁移 seed、可并行 Compose、三层测试（已提交于分支历史）。
+- 安全加固（本次）：
+  - 策略：修复"同名 CTE 遮蔽显式 pg_catalog 引用"与"query_to_xml 二次 SQL"两个缺陷；函数采用显式允许集，schema 限定函数经 token 词法检测拒绝。
+  - 权限：API 进程不再持有 analytics owner 凭据；角色默认只读 + 事务级只读 + 逐表最小授权；撤销默认授权，未来新增表对查询身份不可见。
+  - 数据与运行：a0002 落地契约 CHECK（currency char(3)/CNY、订单状态、区域、细分、折扣 0..1、成本≤标价）；失败对外只含 SQLSTATE 稳定摘要，原文进服务端日志；`/ready` 数据库不可达时有界失败。
+- 已验证（2026-07-20/21）：策略单元 62、Vitest 6、双库集成 26（含权限、约束、缺陷回归）、Playwright 3；`scripts/test.sh` 全流程通过；`validate.py` 通过；`git diff --check` 通过。
 
 ## 风险
 
-- 本机访问 PyPI 极慢：api 镜像构建提供 `PIP_INDEX_URL` build arg，本地 `.env` 已指向清华镜像；干净环境默认官方源，慢但可用。
+- 本机访问 Docker Hub 与 PyPI 不稳定（瞬时 EOF、低速）：构建支持 `PIP_INDEX_URL` 镜像源；nginx 基础镜像偶发元数据拉取失败，重试可恢复。
 - e2e 固定使用 Playwright v1.61.1-noble（镜像 tag 与 npm 包版本必须成对变更）。
 
 ## 下一步
 
-- 由用户决定提交与合并方式（如合并回主分支、发起评审）。
+- 提交本次加固变更后，由用户决定合并与后续阶段。

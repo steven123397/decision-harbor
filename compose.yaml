@@ -1,0 +1,62 @@
+services:
+  db:
+    image: postgres:18
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_SUPER_PASSWORD:?}
+      PLATFORM_APP_PASSWORD: ${PLATFORM_APP_PASSWORD:?}
+      ANALYTICS_OWNER_PASSWORD: ${ANALYTICS_OWNER_PASSWORD:?}
+      ANALYTICS_READER_PASSWORD: ${ANALYTICS_READER_PASSWORD:?}
+      QUERY_TIMEOUT_MS: ${QUERY_TIMEOUT_MS:-5000}
+    volumes:
+      - dbdata:/var/lib/postgresql
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  api:
+    build:
+      context: ./api
+      args:
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+    environment:
+      PLATFORM_DATABASE_URL: postgresql+psycopg://platform_app:${PLATFORM_APP_PASSWORD:?}@db:5432/platform
+      ANALYTICS_READER_URL: postgresql+psycopg://analytics_reader:${ANALYTICS_READER_PASSWORD:?}@db:5432/analytics
+      QUERY_TIMEOUT_MS: ${QUERY_TIMEOUT_MS:-5000}
+      QUERY_ROW_LIMIT: ${QUERY_ROW_LIMIT:-1000}
+      QUERY_MAX_SQL_LENGTH: ${QUERY_MAX_SQL_LENGTH:-100000}
+    ports:
+      - "${API_PORT:-8000}:8000"
+    volumes:
+      - ./datasets/sales-analytics-v1:/data/sales-analytics-v1:ro
+    depends_on:
+      db:
+        condition: service_healthy
+
+  web:
+    build:
+      context: ./web
+      args:
+        NPM_CONFIG_REGISTRY: ${NPM_CONFIG_REGISTRY:-https://registry.npmjs.org}
+    environment:
+      API_PROXY_TARGET: http://api:8000
+    ports:
+      - "${WEB_PORT:-5173}:5173"
+    depends_on:
+      - api
+
+  e2e:
+    profiles: ["test"]
+    build:
+      context: ./e2e
+      args:
+        NPM_CONFIG_REGISTRY: ${NPM_CONFIG_REGISTRY:-https://registry.npmjs.org}
+    environment:
+      E2E_BASE_URL: http://web:5173
+    depends_on:
+      - web
+
+volumes:
+  dbdata:

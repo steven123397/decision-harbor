@@ -2,9 +2,23 @@
 
 DecisionHarbor 是一个面向企业内部业务人员的受治理数据分析平台。它让用户提交显式 SQL，并在受控规则内完成校验、只读执行、结果展示与查询审计。
 
-当前仓库提供首轮产品背景、需求、技术约束和固定销售分析数据。应用源码、依赖、容器配置、迁移、测试和运行命令尚未建立。
+仓库包含首轮完整实现：React 查询工作台（`web/`）、FastAPI 受治理查询服务（`api/`）、PostgreSQL 双库 Compose 环境、契约数据迁移与幂等 seed，以及三层测试。
 
-## 背景资料
+## 本地运行
+
+干净 WSL 环境只需 Git、Docker 与 Docker Compose：
+
+```bash
+./dev.sh up     # 构建、启动、迁移、seed，等待就绪（可重复执行）
+./dev.sh test   # 单元、集成、组件与浏览器测试
+./dev.sh down   # 停止本实例（--volumes 一并删数据卷）
+```
+
+多工作区并行：在 `.env` 中调整 `COMPOSE_PROJECT_NAME`、`WEB_PORT`、`API_PORT`（首次运行自动从 `.env.example` 生成）。
+
+## 文档
+
+[docs/index.md](docs/index.md) 是全部项目文档的导航入口，涵盖背景、设计、计划与状态。核心背景资料：
 
 - [产品需求](docs/background/product-requirements.md)
 - [技术约束](docs/background/technical-constraints.md)

@@ -29,6 +29,50 @@ def test_allows_select_from_contract_table(policy: SqlPolicy) -> None:
 @pytest.mark.parametrize(
     "raw_sql",
     [
+        "SELECT customer_code::varchar(20) FROM customers",
+        "SELECT quantity::bigint FROM order_items",
+        "SELECT list_price::numeric(12, 2) FROM products",
+        "SELECT ordered_at::date FROM orders",
+        "SELECT created_at::timestamptz FROM customers",
+    ],
+)
+def test_allows_safe_builtin_casts(policy: SqlPolicy, raw_sql: str) -> None:
+    decision = policy.evaluate(raw_sql)
+
+    assert decision.allowed is True
+    assert decision.referenced_objects
+
+
+@pytest.mark.parametrize(
+    "raw_sql",
+    [
+        "SELECT 'maintenance.dataset_seeds'::regclass::text",
+        "SELECT 'harbor_admin'::regrole::text",
+        "SELECT 'count'::regproc::text",
+        "SELECT 'count(integer)'::regprocedure::text",
+        "SELECT '='::regoper::text",
+        "SELECT '=(integer,integer)'::regoperator::text",
+        "SELECT 'pg_catalog'::regnamespace::text",
+        "SELECT 'pg_catalog.int4'::regtype::text",
+        "SELECT 'default'::regcollation::text",
+        "SELECT 'default'::regconfig::text",
+        "SELECT 'simple'::regdictionary::text",
+    ],
+)
+def test_rejects_casts_that_resolve_postgres_catalog_objects(
+    policy: SqlPolicy,
+    raw_sql: str,
+) -> None:
+    decision = policy.evaluate(raw_sql)
+
+    assert decision.allowed is False
+    assert decision.code == "sql_object_not_allowed"
+    assert decision.referenced_objects == ()
+
+
+@pytest.mark.parametrize(
+    "raw_sql",
+    [
         "SELECT 1",
         "SELECT * FROM analytics.customers;",
         "SELECT c.id FROM customers c JOIN orders o ON o.customer_id = c.id",

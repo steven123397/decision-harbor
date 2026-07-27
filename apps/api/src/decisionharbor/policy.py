@@ -38,6 +38,23 @@ ALLOWED_FUNCTIONS = frozenset(
 ALLOWED_ROOTS = (exp.Select, exp.Union, exp.Intersect, exp.Except)
 MAX_SQL_BYTES = 64 * 1024
 STRUCTURAL_FUNCTION_NODES = (exp.Case, exp.Cast, exp.Exists, exp.If)
+SAFE_CAST_TYPES = frozenset(
+    {
+        exp.DataType.Type.BIGINT,
+        exp.DataType.Type.BOOLEAN,
+        exp.DataType.Type.CHAR,
+        exp.DataType.Type.DATE,
+        exp.DataType.Type.DECIMAL,
+        exp.DataType.Type.INT,
+        exp.DataType.Type.SMALLINT,
+        exp.DataType.Type.TEXT,
+        exp.DataType.Type.TIMESTAMP,
+        exp.DataType.Type.TIMESTAMPTZ,
+        exp.DataType.Type.VARCHAR,
+    }
+)
+MAX_CHARACTER_CAST_LENGTH = 10_485_760
+MAX_NUMERIC_PRECISION = 1_000
 PROHIBITED_NODES = tuple(
     node_type
     for name in (
@@ -170,6 +187,10 @@ class SqlPolicy:
             if isinstance(function.parent, exp.Dot) or function_name not in ALLOWED_FUNCTIONS:
                 return self._reject("sql_function_not_allowed", "Function is not allowed.")
 
+        cast_rejection = self._validate_casts(expression)
+        if cast_rejection:
+            return cast_rejection
+
         referenced_objects: set[str] = set()
         for scope in traverse_scope(expression):
             for table in scope.tables:
@@ -194,6 +215,58 @@ class SqlPolicy:
             summary=None,
             referenced_objects=tuple(sorted(referenced_objects)),
         )
+
+    def _validate_casts(self, expression: exp.Expression) -> PolicyDecision | None:
+        for cast in expression.find_all(exp.Cast):
+            target = cast.args.get("to")
+            if type(target) is not exp.DataType:
+                return self._reject("sql_object_not_allowed", "Cast type is not allowed.")
+            if target.this == exp.DataType.Type.USERDEFINED or target.args.get("kind") is not None:
+                return self._reject("sql_object_not_allowed", "Cast type is not allowed.")
+            if target.this not in SAFE_CAST_TYPES or target.args.get("nested"):
+                return self._reject("unsupported_sql", "Cast type is not supported.")
+
+            parameter_rejection = self._validate_cast_parameters(target)
+            if parameter_rejection:
+                return parameter_rejection
+        return None
+
+    def _validate_cast_parameters(self, target: exp.DataType) -> PolicyDecision | None:
+        parameters = target.expressions or []
+        values: list[int] = []
+        for parameter in parameters:
+            if not isinstance(parameter, exp.DataTypeParam):
+                return self._reject("unsupported_sql", "Cast type parameters are not supported.")
+            literal = parameter.this
+            if not isinstance(literal, exp.Literal) or literal.is_string:
+                return self._reject("unsupported_sql", "Cast type parameters are not supported.")
+            try:
+                values.append(int(literal.this))
+            except (TypeError, ValueError):
+                return self._reject("unsupported_sql", "Cast type parameters are not supported.")
+
+        if target.this == exp.DataType.Type.DECIMAL:
+            if len(values) > 2 or any(value < 0 for value in values):
+                return self._reject("unsupported_sql", "Cast type parameters are not supported.")
+            if values and not 1 <= values[0] <= MAX_NUMERIC_PRECISION:
+                return self._reject("unsupported_sql", "Cast type parameters are not supported.")
+            if len(values) == 2 and values[1] > values[0]:
+                return self._reject("unsupported_sql", "Cast type parameters are not supported.")
+            return None
+
+        if target.this in {exp.DataType.Type.CHAR, exp.DataType.Type.VARCHAR}:
+            if len(values) > 1 or (values and not 1 <= values[0] <= MAX_CHARACTER_CAST_LENGTH):
+                return self._reject("unsupported_sql", "Cast type parameters are not supported.")
+            return None
+
+        if target.this in {exp.DataType.Type.TIMESTAMP, exp.DataType.Type.TIMESTAMPTZ}:
+            if len(values) > 1 or (values and not 0 <= values[0] <= 6):
+                return self._reject("unsupported_sql", "Cast type parameters are not supported.")
+            return None
+
+        if values:
+            return self._reject("unsupported_sql", "Cast type parameters are not supported.")
+        return None
 
     @staticmethod
     def _reject(code: str, summary: str) -> PolicyDecision:

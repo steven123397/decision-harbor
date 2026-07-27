@@ -25,24 +25,28 @@ WHERE o.status = 'confirmed'
 GROUP BY c.region
 ORDER BY revenue DESC;`
 
-const KNOWN_ERRORS = new Set([
-  'sql_empty',
-  'sql_too_large',
-  'sql_parse_error',
-  'multiple_statements',
-  'sql_statement_not_allowed',
-  'sql_object_not_allowed',
-  'sql_function_not_allowed',
-  'unsupported_sql',
-  'query_semantic_error',
-  'query_capacity_exceeded',
-  'query_timeout',
-  'analytics_unavailable',
-  'audit_unavailable',
-  'service_not_ready',
-  'policy_internal_error',
-  'internal_error',
-])
+const ERROR_MESSAGES: Record<string, string> = {
+  invalid_request: 'The request could not be accepted.',
+  sql_empty: 'Enter a SQL query before running it.',
+  sql_too_large: 'The SQL query exceeds the supported size limit.',
+  sql_parse_error: 'The SQL query could not be parsed.',
+  multiple_statements: 'Submit exactly one SQL statement.',
+  sql_statement_not_allowed: 'This SQL statement is not allowed.',
+  sql_object_not_allowed: 'This query references an object outside the analytics dataset.',
+  sql_function_not_allowed: 'This query uses a function that is not allowed.',
+  unsupported_sql: 'This SQL construct is not supported.',
+  query_semantic_error: 'The query is not valid for this dataset.',
+  query_capacity_exceeded: 'The query service is busy. Run it again shortly.',
+  query_timeout: 'The query exceeded its time limit.',
+  analytics_unavailable: 'The analytics database is unavailable.',
+  audit_unavailable: 'The audit store is unavailable.',
+  service_not_ready: 'The service is not ready.',
+  policy_internal_error: 'The query policy could not complete.',
+  internal_error: 'The query could not be completed.',
+  unsupported_result_type: 'The query returned a result type that is not supported.',
+  query_run_not_found: 'The query run was not found.',
+  execution_interrupted: 'The query execution was interrupted before completion.',
+}
 
 type ViewState =
   | { kind: 'idle' }
@@ -239,7 +243,6 @@ function AuditFacts({ run }: { run: QueryRun }) {
 }
 
 function safeMessage(response: QueryResponse): string {
-  const code = response.error?.code
-  if (code && KNOWN_ERRORS.has(code)) return response.error?.message ?? 'The query could not be completed.'
-  return 'The query could not be completed.'
+  const code = response.error?.code ?? response.data?.query_run.error_code
+  return (code && ERROR_MESSAGES[code]) ?? 'The query could not be completed.'
 }

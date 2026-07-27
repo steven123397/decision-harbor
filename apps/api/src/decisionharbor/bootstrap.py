@@ -20,12 +20,18 @@ def _database_url(admin_url: str, database: str, *, sqlalchemy: bool = False) ->
     return urlunsplit((scheme, parsed.netloc, f"/{database}", "", ""))
 
 
-def _ensure_roles_and_databases(admin_url: str, platform_password: str, analytics_password: str) -> None:
+def _ensure_roles_and_databases(
+    admin_url: str,
+    platform_password: str,
+    analytics_password: str,
+    readiness_password: str,
+) -> None:
     with psycopg.connect(admin_url, autocommit=True) as connection:
         with connection.cursor() as cursor:
             for role, password in (
                 ("platform_app", platform_password),
                 ("analytics_reader", analytics_password),
+                ("analytics_readiness", readiness_password),
             ):
                 cursor.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (role,))
                 if cursor.fetchone() is None:
@@ -41,6 +47,7 @@ def _ensure_roles_and_databases(admin_url: str, platform_password: str, analytic
                         )
                     )
             cursor.execute("ALTER ROLE analytics_reader SET default_transaction_read_only = on")
+            cursor.execute("ALTER ROLE analytics_readiness SET default_transaction_read_only = on")
             for database in ("platform", "analytics"):
                 cursor.execute("SELECT 1 FROM pg_database WHERE datname = %s", (database,))
                 if cursor.fetchone() is None:
@@ -51,18 +58,23 @@ def _ensure_roles_and_databases(admin_url: str, platform_password: str, analytic
                     )
 
             cursor.execute(
-                "REVOKE CONNECT ON DATABASE postgres FROM PUBLIC, platform_app, analytics_reader"
+                "REVOKE CONNECT ON DATABASE postgres FROM PUBLIC, platform_app, analytics_reader, analytics_readiness"
             )
             cursor.execute(
-                "REVOKE CONNECT ON DATABASE template1 FROM PUBLIC, platform_app, analytics_reader"
+                "REVOKE CONNECT ON DATABASE template1 FROM PUBLIC, platform_app, analytics_reader, analytics_readiness"
             )
-            cursor.execute("REVOKE CONNECT ON DATABASE platform FROM PUBLIC, analytics_reader")
+            cursor.execute("REVOKE CONNECT ON DATABASE platform FROM PUBLIC, analytics_reader, analytics_readiness")
             cursor.execute("GRANT CONNECT ON DATABASE platform TO platform_app")
             cursor.execute("REVOKE CONNECT ON DATABASE analytics FROM PUBLIC, platform_app")
-            cursor.execute("REVOKE TEMPORARY ON DATABASE analytics FROM PUBLIC, analytics_reader")
-            cursor.execute("GRANT CONNECT ON DATABASE analytics TO analytics_reader")
+            cursor.execute(
+                "REVOKE TEMPORARY ON DATABASE analytics FROM PUBLIC, analytics_reader, analytics_readiness"
+            )
+            cursor.execute("GRANT CONNECT ON DATABASE analytics TO analytics_reader, analytics_readiness")
             cursor.execute(
                 "ALTER ROLE analytics_reader IN DATABASE analytics SET search_path = analytics, public"
+            )
+            cursor.execute(
+                "ALTER ROLE analytics_readiness IN DATABASE analytics SET search_path = maintenance, public"
             )
 
 
@@ -72,11 +84,14 @@ def _migrate(config_path: Path, database_url: str) -> None:
     command.upgrade(config, "head")
 
 
-def _harden_public_schema(database_url: str, runtime_role: str) -> None:
+def _harden_public_schema(database_url: str, runtime_roles: tuple[str, ...]) -> None:
     with psycopg.connect(database_url) as connection:
         with connection.cursor() as cursor:
-            cursor.execute("REVOKE CREATE ON SCHEMA public FROM PUBLIC")
-            cursor.execute(sql.SQL("GRANT USAGE ON SCHEMA public TO {}").format(sql.Identifier(runtime_role)))
+            cursor.execute("REVOKE ALL ON SCHEMA public FROM PUBLIC")
+            for runtime_role in runtime_roles:
+                cursor.execute(
+                    sql.SQL("GRANT USAGE ON SCHEMA public TO {}").format(sql.Identifier(runtime_role))
+                )
 
 
 def main() -> None:
@@ -84,17 +99,18 @@ def main() -> None:
     dataset_root = Path(os.environ["DATASET_ROOT"])
     platform_password = os.environ["PLATFORM_APP_PASSWORD"]
     analytics_password = os.environ["ANALYTICS_READER_PASSWORD"]
+    readiness_password = os.environ["ANALYTICS_READINESS_PASSWORD"]
 
     run_public_validator(dataset_root)
     dataset = load_dataset(dataset_root)
-    _ensure_roles_and_databases(admin_url, platform_password, analytics_password)
+    _ensure_roles_and_databases(admin_url, platform_password, analytics_password, readiness_password)
 
     platform_admin_url = _database_url(admin_url, "platform")
     analytics_admin_url = _database_url(admin_url, "analytics")
     _migrate(ROOT / "alembic-platform.ini", _database_url(admin_url, "platform", sqlalchemy=True))
     _migrate(ROOT / "alembic-analytics.ini", _database_url(admin_url, "analytics", sqlalchemy=True))
-    _harden_public_schema(platform_admin_url, "platform_app")
-    _harden_public_schema(analytics_admin_url, "analytics_reader")
+    _harden_public_schema(platform_admin_url, ("platform_app",))
+    _harden_public_schema(analytics_admin_url, ("analytics_readiness",))
     result = seed_dataset(analytics_admin_url, dataset)
     print(f"bootstrap complete: dataset {result}")
 

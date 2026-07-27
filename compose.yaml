@@ -22,6 +22,7 @@ services:
       ADMIN_DATABASE_URL: postgresql://harbor_admin:${POSTGRES_ADMIN_PASSWORD:-decisionharbor_admin_local}@postgres:5432/postgres
       PLATFORM_APP_PASSWORD: ${PLATFORM_APP_PASSWORD:-decisionharbor_platform_local}
       ANALYTICS_READER_PASSWORD: ${ANALYTICS_READER_PASSWORD:-decisionharbor_analytics_local}
+      ANALYTICS_READINESS_PASSWORD: ${ANALYTICS_READINESS_PASSWORD:-decisionharbor_readiness_local}
       DATASET_ROOT: /app/datasets/sales-analytics-v1
     depends_on:
       postgres:
@@ -35,6 +36,7 @@ services:
     environment:
       PLATFORM_DATABASE_URL: postgresql+psycopg://platform_app:${PLATFORM_APP_PASSWORD:-decisionharbor_platform_local}@postgres:5432/platform
       ANALYTICS_DATABASE_URL: postgresql+psycopg://analytics_reader:${ANALYTICS_READER_PASSWORD:-decisionharbor_analytics_local}@postgres:5432/analytics
+      ANALYTICS_READINESS_DATABASE_URL: postgresql+psycopg://analytics_readiness:${ANALYTICS_READINESS_PASSWORD:-decisionharbor_readiness_local}@postgres:5432/analytics
       DATASET_ROOT: /app/datasets/sales-analytics-v1
       QUERY_STATEMENT_TIMEOUT_MS: ${QUERY_STATEMENT_TIMEOUT_MS:-5000}
       QUERY_MAX_ROWS: ${QUERY_MAX_ROWS:-500}
@@ -78,6 +80,7 @@ services:
     environment:
       PLATFORM_DATABASE_URL: postgresql+psycopg://platform_app:${PLATFORM_APP_PASSWORD:-decisionharbor_platform_local}@postgres:5432/platform
       ANALYTICS_DATABASE_URL: postgresql+psycopg://analytics_reader:${ANALYTICS_READER_PASSWORD:-decisionharbor_analytics_local}@postgres:5432/analytics
+      ANALYTICS_READINESS_DATABASE_URL: postgresql+psycopg://analytics_readiness:${ANALYTICS_READINESS_PASSWORD:-decisionharbor_readiness_local}@postgres:5432/analytics
       TEST_ADMIN_DATABASE_URL: postgresql://harbor_admin:${POSTGRES_ADMIN_PASSWORD:-decisionharbor_admin_local}@postgres:5432/postgres
       API_BASE_URL: http://api:8000
       DATASET_ROOT: /app/datasets/sales-analytics-v1

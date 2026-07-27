@@ -94,12 +94,13 @@ API 进程启动时，将本实例上次运行遗留的 `received` 或 `running`
 | 查询工作台 | 收集显式 SQL、展示运行中状态、结果、拒绝或失败。 | 策略判断、SQL 改写、审计持久化。 | HTTP API。 |
 | API 路由 | Pydantic 请求/响应校验、统一 envelope、HTTP 状态映射。 | AST 规则和数据库事务细节。 | `QueryRunService`。 |
 | `QueryRunService` | 编排审计、策略、容量和执行顺序；维护状态机。 | 解析 AST、直接执行 SQL、直接拼接数据库语句。 | `SqlPolicy`、`QueryExecutor`、`QueryRunRepository`。 |
-| `SqlPolicy` | 解析 PostgreSQL SQL、验证单语句、语句形态、对象和函数范围。 | 访问数据库、持久化审计、修改用户 SQL。 | 纯输入/输出策略判定。 |
+| `SqlPolicy` | 解析 PostgreSQL SQL、验证单语句、语句形态、对象、函数和类型转换范围。 | 访问数据库、持久化审计、修改用户 SQL。 | 纯输入/输出策略判定。 |
 | `QueryExecutor` | 使用分析只读连接、应用事务与资源限制、执行和序列化结果。 | 平台写入、策略放行、迁移或 seed。 | 已允许的 SQL 与资源配置。 |
 | `QueryRunRepository` | 使用平台写入连接创建记录和执行条件状态迁移。 | 分析查询和结果持久化。 | 查询运行聚合的创建、迁移和读取。 |
+| 就绪探针 | 使用独立的最小权限身份检查迁移、seed 标记和连接只读状态。 | 执行用户 SQL、把维护元数据暴露给查询执行器。 | `/ready` 的布尔结论。 |
 | 引导与迁移 | 创建数据库/身份、应用迁移、校验并 seed 固定数据、设置授权。 | 处理在线用户请求。 | Compose 一次性初始化服务。 |
 
-API 进程持有两个完全分离的连接池。依赖注入只把平台池交给 `QueryRunRepository`，只把分析池交给 `QueryExecutor`；业务模块不能接受通用连接或任意 DSN，以免身份边界退化为调用约定。
+API 进程持有平台写入池、分析查询池，以及不复用连接的就绪探针引擎。依赖注入只把平台池交给 `QueryRunRepository`，只把分析查询池交给 `QueryExecutor`，只把 readiness DSN 交给就绪探针；业务模块不能接受通用连接或任意 DSN，以免身份边界退化为调用约定。
 
 ## 端到端数据流
 
@@ -121,20 +122,22 @@ API 进程持有两个完全分离的连接池。依赖注入只把平台池交�
 | 数据库 | 运行时身份 | 允许能力 | 明确禁止 |
 | --- | --- | --- | --- |
 | `platform` | 平台写入身份 | 读写查询运行和必要的产品元数据。 | 连接 `analytics`、执行分析 SQL。 |
-| `analytics` | 分析只读身份 | 读取契约中的 5 张业务表和只读就绪元数据。 | `INSERT`、`UPDATE`、`DELETE`、DDL、创建临时对象、访问 `platform`。 |
+| `analytics` | 分析查询身份 | 读取契约中的 5 张业务表。 | 读取维护 schema 或迁移版本、`INSERT`、`UPDATE`、`DELETE`、DDL、创建临时对象、访问 `platform`。 |
+| `analytics` | 分析就绪身份 | 仅读取迁移版本和 seed 标记以服务 `/ready`。 | 读取业务表、执行用户 SQL、写入、DDL、创建临时对象、访问 `platform`。 |
 
 引导身份只注入 Compose 一次性初始化服务，用于创建逻辑数据库、运行两套 Alembic 迁移、seed 和授权。API 与 Web 容器不得包含引导 DSN 或管理员密码。
 
 分析只读身份的数据库约束包括：
 
-- 只允许连接 `analytics` 数据库；平台写入身份只允许连接 `platform`。
+- 分析查询与分析就绪身份只允许连接 `analytics` 数据库；平台写入身份只允许连接 `platform`。
 - 从两个逻辑数据库撤销 `PUBLIC CONNECT`，再分别显式授予对应运行时身份；从分析数据库撤销 `PUBLIC CREATE` 和 `PUBLIC TEMP`。
-- 对 `analytics` schema 仅授予 `USAGE`，对契约表显式授予 `SELECT`；不授予 schema 创建、表级写入、序列使用或函数创建权限。
-- 角色默认事务只读；执行器每次仍显式开启只读事务并 `SET LOCAL statement_timeout`。
+- 分析查询身份只对 `analytics` schema 拥有 `USAGE`，且只对契约表拥有 `SELECT`；它不拥有维护 schema 或 `public.alembic_version` 的读取权。
+- 分析就绪身份只对维护 schema 与 `public` 拥有读取 seed 标记和迁移版本所需的最小权限，不拥有任何业务表 `SELECT`。它只注入就绪探针，不能传给 `QueryExecutor`。
+- 两个分析身份默认事务只读；执行器每次仍显式开启只读事务并 `SET LOCAL statement_timeout`。
 - `PUBLIC` 不得拥有业务 schema 创建权限。新对象不通过默认权限自动暴露，迁移必须显式授权。
-- 迁移版本和 seed 标记可以授予最窄只读权限供 `/ready` 检查，但用户 SQL 的对象策略仍拒绝这些维护对象。
+- 就绪探针使用无池连接、1 秒连接超时和 1,000 ms 语句超时；API 还把完整 readiness 检查限制在单个 1 秒工作线程截止时间内，超时或不可达都返回 `503 service_not_ready`。
 
-首轮 API 进程同时持有两个受限运行时身份，因此模块边界不能抵御整个 API 进程被攻陷；它防止正常调用路径误用凭据。需要进程级隔离时，应把查询执行器拆为独立服务并重新设计合同。
+首轮 API 进程同时持有三个受限运行时身份，因此模块边界不能抵御整个 API 进程被攻陷；它防止正常调用路径误用凭据。需要进程级隔离时，应把查询执行器和就绪探针拆为独立服务并重新设计合同。
 
 ## 查询审计事实
 
@@ -147,7 +150,7 @@ API 进程持有两个完全分离的连接池。依赖注入只把平台池交�
 | `status` | 带 `CHECK` 的 `text`：`received`、`running`、`succeeded`、`rejected` 或 `failed`。 |
 | `policy_decision` | 带 `CHECK` 的 `text`：`not_evaluated`、`allowed` 或 `rejected`。 |
 | `policy_version` | 非空 `text`；策略规则版本、数据集版本和 contract 摘要的稳定组合。 |
-| `referenced_objects` | 非空 `jsonb` 数组；对象名规范化、去重并排序，例如 `analytics.orders`。 |
+| `referenced_objects` | 非空 `jsonb` 数组；元素只能是规范化、去重、排序后的契约业务表，例如 `analytics.orders`。允许的空数组只表示没有解析任何数据库对象的常量表达式。 |
 | `statement_timeout_ms`、`max_rows` | 正整数；本次运行实际使用的资源边界快照。 |
 | `returned_row_count` | 非负整数；仅成功终态非空，最大为 `max_rows`。 |
 | `result_truncated` | `boolean`；仅成功终态非空。 |
@@ -172,11 +175,12 @@ API 进程持有两个完全分离的连接池。依赖注入只把平台池交�
 5. 按 CTE 作用域解析表引用。物理表只能是 contract 中 5 张表，允许不带 schema 或显式 `analytics.<table>`；数据库限定名、其他 schema、系统目录和 `information_schema` 一律拒绝。
 6. CTE 名可以被后续查询引用，但不得与允许的物理表同名，避免对象遮蔽导致审计与执行理解不一致。所有嵌套查询和集合分支都执行相同对象检查。
 7. 函数调用采用版本化允许列表。首轮仅允许 `count`、`sum`、`avg`、`min`、`max`、`abs`、`round`、`floor`、`ceil`、`lower`、`upper`、`length`、`trim`、`concat`、`substring`、`date_trunc`、`extract`、`coalesce`、`nullif`、`row_number`、`rank`、`dense_rank`、`lag` 和 `lead`。schema 限定函数、用户定义函数、表函数、未知函数和副作用函数默认拒绝。
-8. 返回规范化、去重并排序的物理对象集合，供审计记录；不把格式化后的 SQL 当作执行输入。
+8. `CAST` 和 `DataType` 采用内建标量允许集：文本、字符、整数、定点数、布尔、日期、时间戳和带时区时间戳。长度、精度和 scale 只能是有界字面量；数组、未列入的内建类型和表达式型参数默认拒绝。SQLGlot 解析出的 `ObjectIdentifier`、用户定义或 schema 限定类型一律按对象访问拒绝，因此 `regclass`、`regrole`、`regproc`、`regprocedure`、`regoper`、`regoperator`、`regnamespace`、`regtype` 及其他 catalog 解析类型不能通过转换绕过对象策略。
+9. 返回规范化、去重并排序的物理对象集合，供审计记录；不把格式化后的 SQL 当作执行输入。任何允许结论中，这个集合只能包含契约业务表。
 
-函数允许列表不是字符串黑名单：函数名必须来自 AST 函数节点并按 PostgreSQL 语义规范化。`CASE`、`CAST`、算术、比较、布尔和窗口 frame 等非函数表达式按 AST 类型检查。表引用允许集在启动时从固定 `contract.json` 读取，manifest 中的 contract 摘要不匹配时 API 不进入就绪状态，避免手工复制表名造成漂移。
+函数和类型允许列表不是字符串黑名单：函数名与转换目标都必须来自 AST 节点并按 PostgreSQL 语义规范化。`CASE`、`CAST`、算术、比较、布尔和窗口 frame 等非函数表达式按 AST 类型检查。表引用允许集在启动时从固定 `contract.json` 读取，manifest 中的 contract 摘要不匹配时 API 不进入就绪状态，避免手工复制表名造成漂移。
 
-策略允许不引用物理表的常量 `SELECT`，但仍执行函数和禁止节点检查。即使 SQLGlot 错判或漏判，分析只读身份和只读事务仍必须阻止数据库写入。
+策略允许不引用物理表的常量 `SELECT`，但仍执行函数、类型和禁止节点检查；它不得触发未审计的数据库对象解析。即使 SQLGlot 错判或漏判，分析查询身份和只读事务仍必须阻止数据库写入。
 
 ## 资源限制与结果语义
 
@@ -211,7 +215,7 @@ API 进程持有两个完全分离的连接池。依赖注入只把平台池交�
 | 端点 | 成功语义 | 失败语义 |
 | --- | --- | --- |
 | `GET /health` | `200`；只证明 API 进程可响应。 | 进程不可响应时由容器健康检查判定失败。 |
-| `GET /ready` | `200`；两个数据库可达、迁移为预期 head、seed 标记与 contract/manifest 匹配、分析连接为只读。 | `503 service_not_ready`，不泄露凭据或内部 DSN。 |
+| `GET /ready` | `200`；两个数据库可达、迁移为预期 head、seed 标记与 contract/manifest 匹配、分析就绪身份为只读。 | 依赖探测在 1 秒内未完成或失败时返回 `503 service_not_ready`，不泄露凭据或内部 DSN。 |
 | `POST /api/v1/query-runs` | 同步执行；`200` 返回终态 `query_run` 和即时 `result`。 | 根据下表返回稳定 HTTP 状态，同时尽可能返回已持久化的查询运行。 |
 | `GET /api/v1/query-runs/{id}` | `200` 返回当前状态和审计事实，包括拒绝或失败终态。 | `404 query_run_not_found`。 |
 
@@ -250,7 +254,7 @@ Web 不复制 SQL 策略，不根据字符串猜测能否执行；客户端校�
 
 - 平台迁移创建 `query_runs`、`text + CHECK` 状态约束、恢复索引和迁移元数据。
 - 分析迁移在 `analytics` 数据库的 `analytics` schema 中创建 contract 的 5 张表、字段、主外键、唯一约束和定点数类型，不添加订单总额等派生业务字段。
-- 分析数据库另有只对引导身份开放写入的维护 schema，用于 seed 标记；该 schema 不属于业务数据契约，用户 SQL 对象策略禁止访问。
+- 分析数据库另有只对引导身份开放写入的维护 schema，用于 seed 标记；分析就绪身份可读取该标记，分析查询身份和用户 SQL 都不能访问该 schema。
 - 每次迁移显式重建最小授权，不能依赖宽泛默认权限。集成测试将数据库实际 schema 与 `contract.json` 逐字段比较。
 
 seed 流程必须先运行数据集 `validate.py`，再执行以下单事务步骤：
@@ -295,7 +299,7 @@ Compose 必须满足：
 
 ### AST 默认拒绝，并叠加数据库只读权限
 
-只使用字符串黑名单容易被注释、嵌套结构和语法变体绕过；只使用数据库只读权限又不能限制系统目录、未授权对象和资源滥用。因此策略基于完整 AST、对象范围和函数允许列表，数据库角色与只读事务负责独立兜底。函数允许列表会限制部分合法 PostgreSQL 分析能力，但这是首轮可解释安全边界；扩展函数必须带 AST 与真实数据库测试。
+只使用字符串黑名单容易被注释、嵌套结构和语法变体绕过；只使用数据库只读权限又不能限制系统目录、未授权对象和资源滥用。因此策略基于完整 AST、对象范围、函数与类型允许列表，数据库角色与只读事务负责独立兜底。显式验证类型可避免 PostgreSQL 对象标识转换在没有 `Table` 节点时解析 relation、role、function、namespace 或 type catalog。函数或类型允许集会限制部分合法 PostgreSQL 分析能力，但这是首轮可解释安全边界；扩展能力必须带 AST 与真实数据库测试。
 
 ### 先持久化审计，再执行用户 SQL
 
@@ -315,7 +319,7 @@ Compose 必须满足：
 - 分析执行成功但终态审计写入失败时丢弃响应结果，返回 `audit_unavailable`；启动恢复把遗留记录标记为 `execution_interrupted`。
 - 分析连接在异常、取消或超时后必须回滚并归还或丢弃，不能带着会话级状态进入连接池。
 - 错误映射以 SQLSTATE 类别和已知驱动异常为输入，未知异常统一映射为 `internal_error`；外部响应不包含原始数据库消息。
-- `/ready` 失败不影响 `/health` 的进程存活语义，但 Web 应阻止提交并展示服务未就绪。
+- `/ready` 失败不影响 `/health` 的进程存活语义；数据库完全不可达或探针卡住时也必须在 1 秒截止时间内返回 `service_not_ready`，Web 应阻止提交并展示服务未就绪。
 - Alembic 迁移失败或 seed 冲突使初始化服务非零退出，API/Web 不启动。重复 `./dev up` 从当前迁移状态继续，不跳过失败检查。
 - 迁移回滚只处理应用 schema；固定数据集版本替换、身份模型变更和跨数据库拆分都需要新的设计，不在通用 downgrade 中猜测恢复。
 
@@ -323,11 +327,11 @@ Compose 必须满足：
 
 ### 单元测试
 
-- `SqlPolicy` 作为纯模块覆盖允许的 SELECT、CTE、连接、子查询、聚合、窗口和集合操作，以及多语句、所有禁止语句、修改型 CTE、`SELECT INTO`、锁、CTE 遮蔽、系统对象、schema 限定、函数允许列表和未知节点默认拒绝。
+- `SqlPolicy` 作为纯模块覆盖允许的 SELECT、CTE、连接、子查询、聚合、窗口和集合操作，以及多语句、所有禁止语句、修改型 CTE、`SELECT INTO`、锁、CTE 遮蔽、系统对象、schema 限定、函数与安全类型允许列表、对象标识类型转换和未知节点默认拒绝。
 - 状态机覆盖全部允许迁移、终态不可变、条件写入冲突和启动恢复。
-- API 错误映射覆盖每个稳定错误码、HTTP 状态和脱敏规则。
+- API 错误映射覆盖每个稳定错误码、HTTP 状态和脱敏规则，`/ready` 覆盖阻塞依赖的截止时间。
 - 结果序列化覆盖重复列名、null、定点数、bigint、日期时间、截断和不支持类型。
-- Web 使用 Vitest 覆盖初始、运行中、成功、拒绝、失败、截断和未知错误码视图；测试通过与真实 API 相同的客户端边界驱动组件。
+- Web 使用 Vitest 覆盖初始、运行中、成功、拒绝、失败、截断、全部已知错误码和未知错误码视图；测试通过与真实 API 相同的客户端边界驱动组件。
 
 ### PostgreSQL 集成测试
 
@@ -335,8 +339,8 @@ Compose 必须满足：
 
 - 在空数据库上运行两套迁移与 seed 两次，证明第二次无操作且 contract、manifest、行数、状态分布和日期范围保持一致。
 - 将实际表、列、类型、可空性、主外键和唯一约束与 `contract.json` 比较。
-- 证明平台写入身份可以写审计但不能连接分析数据库；分析只读身份可以 SELECT 契约表，但不能写入、创建对象、访问平台数据库或绕过只读事务。
-- 经真实 API 验证成功、策略拒绝、数据库语义失败、超时、容量拒绝、截断、审计终态和启动恢复。
+- 证明平台写入身份可以写审计但不能连接分析数据库；分析查询身份可以 SELECT 契约表，但不能读取维护元数据、写入、创建对象、访问平台数据库或绕过只读事务；分析就绪身份只可读取迁移版本和 seed 标记。
+- 经真实 API 验证成功、安全转换、对象标识类型策略拒绝、数据库语义失败、超时、容量拒绝、截断、审计终态和启动恢复。
 - 证明拒绝查询未到达分析执行接缝，成功结果行没有写入平台数据库。
 - 使用两个 Compose 项目名、两组宿主端口同时启动实例，证明容器、网络、卷和数据互不共享。
 

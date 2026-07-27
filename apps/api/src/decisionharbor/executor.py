@@ -7,7 +7,6 @@ from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import DBAPIError
 
-from decisionharbor.dataset import DatasetContract
 from decisionharbor.domain import JsonCell, QueryColumn, QueryResult
 
 
@@ -104,31 +103,6 @@ class PostgresQueryExecutor:
             raise ExecutionFailure("analytics_unavailable", "The analytics database is unavailable.") from exc
         except Exception as exc:
             raise ExecutionFailure("internal_error", "The query could not be completed.") from exc
-
-    def check_ready(self, dataset: DatasetContract) -> bool:
-        try:
-            with self._engine.connect() as connection:
-                read_only = connection.exec_driver_sql("SHOW default_transaction_read_only").scalar_one()
-                migration = connection.exec_driver_sql("SELECT version_num FROM public.alembic_version").scalar_one()
-                marker = connection.exec_driver_sql(
-                    """
-                    SELECT contract_sha256, manifest_sha256, row_counts
-                    FROM maintenance.dataset_seeds
-                    WHERE dataset = %s AND version = %s
-                    """,
-                    (dataset.manifest["dataset"], dataset.manifest["version"]),
-                ).one_or_none()
-                return bool(
-                    read_only == "on"
-                    and migration == "analytics_0001"
-                    and marker
-                    and marker[0].strip() == dataset.contract_sha256
-                    and marker[1].strip() == dataset.manifest_sha256
-                    and marker[2] == dataset.contract["expected_counts"]
-                )
-        except Exception:
-            return False
-
 
 def map_database_error(error: psycopg.Error) -> ExecutionFailure:
     sqlstate = error.sqlstate or ""

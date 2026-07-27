@@ -1,7 +1,10 @@
 from datetime import datetime, timezone
+from threading import Event
+from time import monotonic
 
 from fastapi.testclient import TestClient
 
+import decisionharbor.api as api_module
 from decisionharbor.api import create_app
 from decisionharbor.domain import QueryColumn, QueryResult, QueryRun
 from decisionharbor.service import QueryOutcome, ServiceFailure
@@ -84,6 +87,38 @@ def test_ready_failure_is_safe_and_does_not_change_health() -> None:
         assert response.status_code == 503
         assert response.json()["error"]["code"] == "service_not_ready"
         assert test_client.get("/health").status_code == 200
+
+
+def test_ready_returns_promptly_when_a_dependency_probe_hangs(
+    monkeypatch,
+) -> None:
+    started = Event()
+    release = Event()
+
+    def blocked_readiness_check() -> bool:
+        started.set()
+        release.wait(timeout=1)
+        return False
+
+    monkeypatch.setattr(api_module, "READINESS_TIMEOUT_SECONDS", 0.01, raising=False)
+    app = create_app(
+        service=FakeService(),
+        repository=FakeRepository(),
+        readiness_check=blocked_readiness_check,
+        recover_on_startup=False,
+    )
+    try:
+        with TestClient(app) as test_client:
+            started_at = monotonic()
+            response = test_client.get("/ready")
+            elapsed = monotonic() - started_at
+    finally:
+        release.set()
+
+    assert started.is_set()
+    assert elapsed < 0.1
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "service_not_ready"
 
 
 def test_post_returns_terminal_audit_and_immediate_result() -> None:

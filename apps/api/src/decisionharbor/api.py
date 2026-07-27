@@ -1,6 +1,8 @@
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import asdict
+from threading import Lock
 from typing import Protocol
 from uuid import UUID
 
@@ -14,11 +16,13 @@ from decisionharbor.config import Settings
 from decisionharbor.dataset import load_dataset
 from decisionharbor.executor import PostgresQueryExecutor
 from decisionharbor.policy import SqlPolicy
+from decisionharbor.readiness import AnalyticsReadinessProbe, PlatformReadinessProbe
 from decisionharbor.repository import QueryRunRepository
 from decisionharbor.service import QueryRunService, ServiceFailure
 
 
 MAX_REQUEST_BYTES = 128 * 1024
+READINESS_TIMEOUT_SECONDS = 1.0
 
 HTTP_STATUS_BY_CODE = {
     "invalid_request": 422,
@@ -80,11 +84,31 @@ def create_app(
     readiness_check: Callable[[], bool],
     recover_on_startup: bool = True,
 ) -> FastAPI:
+    readiness_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="readiness")
+    readiness_lock = Lock()
+    readiness_future: Future[bool] | None = None
+
+    def check_readiness_with_deadline() -> bool:
+        nonlocal readiness_future
+        with readiness_lock:
+            if readiness_future is not None and not readiness_future.done():
+                return False
+            readiness_future = readiness_executor.submit(readiness_check)
+        try:
+            return bool(readiness_future.result(timeout=READINESS_TIMEOUT_SECONDS))
+        except TimeoutError:
+            return False
+        except Exception:
+            return False
+
     @asynccontextmanager
     async def lifespan(_: FastAPI):
-        if recover_on_startup:
-            repository.recover_interrupted()
-        yield
+        try:
+            if recover_on_startup:
+                repository.recover_interrupted()
+            yield
+        finally:
+            readiness_executor.shutdown(wait=False, cancel_futures=True)
 
     app = FastAPI(title="DecisionHarbor API", version="1.0.0", lifespan=lifespan)
 
@@ -122,7 +146,7 @@ def create_app(
 
     @app.get("/ready", response_model=None)
     def ready():
-        if not readiness_check():
+        if not check_readiness_with_deadline():
             return JSONResponse(
                 _envelope(error=_error("service_not_ready", "The service is not ready.")),
                 status_code=503,
@@ -171,6 +195,8 @@ def create_runtime_app() -> FastAPI:
     dataset = load_dataset(settings.dataset_root)
     repository = QueryRunRepository(settings.platform_database_url)
     executor = PostgresQueryExecutor(settings.analytics_database_url, settings.max_concurrency)
+    platform_readiness = PlatformReadinessProbe(settings.platform_database_url)
+    analytics_readiness = AnalyticsReadinessProbe(settings.analytics_readiness_database_url)
     policy = SqlPolicy(dataset.allowed_tables)
     service = QueryRunService(
         repository=repository,
@@ -185,5 +211,5 @@ def create_runtime_app() -> FastAPI:
     return create_app(
         service=service,
         repository=repository,
-        readiness_check=lambda: repository.check_ready() and executor.check_ready(dataset),
+        readiness_check=lambda: platform_readiness.check_ready() and analytics_readiness.check_ready(dataset),
     )

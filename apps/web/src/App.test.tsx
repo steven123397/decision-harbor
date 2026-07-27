@@ -31,6 +31,29 @@ const succeeded: QueryResponse = {
   error: null,
 }
 
+const knownErrorMessages = {
+  invalid_request: 'The request could not be accepted.',
+  sql_empty: 'Enter a SQL query before running it.',
+  sql_too_large: 'The SQL query exceeds the supported size limit.',
+  sql_parse_error: 'The SQL query could not be parsed.',
+  multiple_statements: 'Submit exactly one SQL statement.',
+  sql_statement_not_allowed: 'This SQL statement is not allowed.',
+  sql_object_not_allowed: 'This query references an object outside the analytics dataset.',
+  sql_function_not_allowed: 'This query uses a function that is not allowed.',
+  unsupported_sql: 'This SQL construct is not supported.',
+  query_semantic_error: 'The query is not valid for this dataset.',
+  query_capacity_exceeded: 'The query service is busy. Run it again shortly.',
+  query_timeout: 'The query exceeded its time limit.',
+  analytics_unavailable: 'The analytics database is unavailable.',
+  audit_unavailable: 'The audit store is unavailable.',
+  service_not_ready: 'The service is not ready.',
+  policy_internal_error: 'The query policy could not complete.',
+  internal_error: 'The query could not be completed.',
+  unsupported_result_type: 'The query returned a result type that is not supported.',
+  query_run_not_found: 'The query run was not found.',
+  execution_interrupted: 'The query execution was interrupted before completion.',
+} as const
+
 
 function api(runQuery = vi.fn().mockResolvedValue(succeeded)): ApiClient {
   return {
@@ -95,8 +118,24 @@ describe('query workbench', () => {
 
     expect(await screen.findByText('Query rejected')).toBeInTheDocument()
     expect(screen.getByText('sql_object_not_allowed')).toBeInTheDocument()
+    expect(screen.getByText(knownErrorMessages.sql_object_not_allowed)).toBeInTheDocument()
     expect(screen.queryByRole('table')).not.toBeInTheDocument()
   })
+
+  it.each(Object.entries(knownErrorMessages))(
+    'maps known API error code %s to its stable display message',
+    async (code, expectedMessage) => {
+      const failed: QueryResponse = {
+        data: null,
+        error: { code, message: 'Raw internal detail' },
+      }
+      render(<App api={api(vi.fn().mockResolvedValue(failed))} />)
+      await userEvent.click(await screen.findByRole('button', { name: 'Run query' }))
+
+      expect(await screen.findByText(expectedMessage)).toBeInTheDocument()
+      expect(screen.queryByText('Raw internal detail')).not.toBeInTheDocument()
+    },
+  )
 
   it('uses a stable fallback for unknown execution errors', async () => {
     const failed: QueryResponse = {

@@ -129,6 +129,7 @@ def test_analytics_schema_and_rows_match_contract() -> None:
 
 def test_runtime_database_identities_are_independently_bounded() -> None:
     analytics_url = psycopg_url("ANALYTICS_DATABASE_URL")
+    readiness_url = psycopg_url("ANALYTICS_READINESS_DATABASE_URL")
     platform_url = psycopg_url("PLATFORM_DATABASE_URL")
     with psycopg.connect(analytics_url) as connection:
         with connection.cursor() as cursor:
@@ -136,6 +137,30 @@ def test_runtime_database_identities_are_independently_bounded() -> None:
             assert cursor.fetchone()[0] == "on"
             cursor.execute("SELECT count(*) FROM analytics.customers")
             assert cursor.fetchone()[0] == 100
+
+    for statement in (
+        "SELECT * FROM maintenance.dataset_seeds",
+        "SELECT * FROM public.alembic_version",
+    ):
+        with psycopg.connect(analytics_url) as connection:
+            with pytest.raises(psycopg.Error):
+                connection.execute(statement)
+
+    with psycopg.connect(readiness_url) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SHOW default_transaction_read_only")
+            assert cursor.fetchone()[0] == "on"
+            cursor.execute("SELECT version_num FROM public.alembic_version")
+            assert cursor.fetchone()[0] == "analytics_0002"
+            cursor.execute("SELECT count(*) FROM maintenance.dataset_seeds")
+            assert cursor.fetchone()[0] == 1
+        for statement in (
+            "SELECT count(*) FROM analytics.customers",
+            "CREATE TEMP TABLE forbidden_readiness_temp (id integer)",
+        ):
+            with pytest.raises(psycopg.Error):
+                connection.execute(statement)
+
     with psycopg.connect(platform_url) as connection:
         assert connection.execute("SELECT current_database()").fetchone()[0] == "platform"
 
@@ -150,6 +175,7 @@ def test_runtime_database_identities_are_independently_bounded() -> None:
 
     for runtime_url, forbidden_databases in (
         (analytics_url, ("platform", "postgres", "template1")),
+        (readiness_url, ("platform", "postgres", "template1")),
         (platform_url, ("analytics", "postgres", "template1")),
     ):
         for database in forbidden_databases:
@@ -161,7 +187,7 @@ def test_seed_marker_matches_manifest_and_expected_counts() -> None:
     root = Path(os.environ["DATASET_ROOT"])
     contract = json.loads((root / "contract.json").read_text())
     manifest = json.loads((root / "manifest.json").read_text())
-    with psycopg.connect(psycopg_url("ANALYTICS_DATABASE_URL")) as connection:
+    with psycopg.connect(psycopg_url("ANALYTICS_READINESS_DATABASE_URL")) as connection:
         marker = connection.execute(
             """
             SELECT contract_sha256, manifest_sha256, row_counts

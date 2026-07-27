@@ -26,6 +26,24 @@ def test_real_api_success_rejection_failure_and_audit() -> None:
         assert success_run["status"] == "succeeded"
         assert success_run["referenced_objects"] == ["analytics.customers"]
 
+        safe_casts = client.post(
+            "/api/v1/query-runs",
+            json={
+                "sql": (
+                    "SELECT customer_code::varchar(20), id::bigint, created_at::date "
+                    "FROM customers ORDER BY id LIMIT 1"
+                )
+            },
+        )
+        assert safe_casts.status_code == 200
+        assert safe_casts.json()["data"]["query_run"]["status"] == "succeeded"
+        assert safe_casts.json()["data"]["query_run"]["referenced_objects"] == ["analytics.customers"]
+        assert [column["type"] for column in safe_casts.json()["data"]["result"]["columns"]] == [
+            "character varying",
+            "bigint",
+            "date",
+        ]
+
         rejected = client.post(
             "/api/v1/query-runs",
             json={"sql": "DELETE FROM customers"},
@@ -45,6 +63,30 @@ def test_real_api_success_rejection_failure_and_audit() -> None:
         audit = client.get(f"/api/v1/query-runs/{success_run['id']}")
         assert audit.status_code == 200
         assert set(audit.json()["data"]) == {"query_run"}
+
+
+@pytest.mark.parametrize(
+    "raw_sql",
+    [
+        "SELECT 'maintenance.dataset_seeds'::regclass::text",
+        "SELECT 'harbor_admin'::regrole::text",
+        "SELECT 'count'::regproc::text",
+        "SELECT 'count(integer)'::regprocedure::text",
+        "SELECT '='::regoper::text",
+        "SELECT '=(integer,integer)'::regoperator::text",
+        "SELECT 'pg_catalog'::regnamespace::text",
+        "SELECT 'pg_catalog.int4'::regtype::text",
+    ],
+)
+def test_real_api_rejects_catalog_resolving_casts_before_execution(raw_sql: str) -> None:
+    app = create_runtime_app()
+    with TestClient(app) as client:
+        response = client.post("/api/v1/query-runs", json={"sql": raw_sql})
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "sql_object_not_allowed"
+    assert response.json()["data"]["query_run"]["status"] == "rejected"
+    assert response.json()["data"]["query_run"]["referenced_objects"] == []
 
 
 def test_real_api_truncates_at_configured_row_limit(monkeypatch: pytest.MonkeyPatch) -> None:

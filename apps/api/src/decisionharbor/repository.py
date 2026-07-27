@@ -111,14 +111,6 @@ class QueryRunRepository:
             )
         return result.rowcount
 
-    def check_ready(self) -> bool:
-        try:
-            with self._engine.connect() as connection:
-                return connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "platform_0001"
-        except Exception:
-            return False
-
-
 def _row_to_query_run(row: Row) -> QueryRun:
     values = row._mapping
     return QueryRun(

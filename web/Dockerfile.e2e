@@ -1,0 +1,11 @@
+FROM mcr.microsoft.com/playwright:v1.61.1-noble
+
+WORKDIR /work
+
+COPY web/package.json web/package-lock.json /work/
+RUN npm ci
+
+COPY web /work
+
+ENV PLAYWRIGHT_BASE_URL=http://web
+CMD ["npx", "playwright", "test"]

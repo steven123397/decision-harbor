@@ -1,0 +1,10 @@
+FROM node:24-bookworm-slim
+
+WORKDIR /app
+
+COPY web/package.json web/package-lock.json /app/
+RUN npm ci
+
+COPY web /app
+
+CMD ["npm", "test"]

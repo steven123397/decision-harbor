@@ -1,0 +1,40 @@
+:root {
+  font-family: sans-serif;
+  color: #12202b;
+  background: #f4f1ea;
+}
+
+body {
+  margin: 0;
+}
+
+main {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 24px;
+}
+
+textarea {
+  width: 100%;
+  min-height: 160px;
+  font-family: ui-monospace, monospace;
+}
+
+button {
+  margin-top: 12px;
+}
+
+table {
+  border-collapse: collapse;
+  margin-top: 16px;
+}
+
+th,
+td {
+  border: 1px solid #8a8175;
+  padding: 6px 10px;
+}
+
+.error {
+  color: #8b1e1e;
+}

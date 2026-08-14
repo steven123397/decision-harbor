@@ -1,0 +1,75 @@
+name: ${COMPOSE_PROJECT_NAME:-decisionharbor}
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:-postgres}
+      POSTGRES_DB: postgres
+      DB_MIGRATOR_PASSWORD: ${DB_MIGRATOR_PASSWORD:-db_migrator}
+      PLATFORM_WRITER_PASSWORD: ${PLATFORM_WRITER_PASSWORD:-platform_writer}
+      ANALYTICS_READER_PASSWORD: ${ANALYTICS_READER_PASSWORD:-analytics_reader}
+      PLATFORM_READINESS_PASSWORD: ${PLATFORM_READINESS_PASSWORD:-platform_readiness}
+      ANALYTICS_READINESS_PASSWORD: ${ANALYTICS_READINESS_PASSWORD:-analytics_readiness}
+    volumes:
+      - postgres-data:/var/lib/postgresql
+      - ./infra/postgres/01-init-databases.sh:/docker-entrypoint-initdb.d/01-init-databases.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  migrate:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    command: ["python", "-m", "decisionharbor_api.bootstrap"]
+    environment:
+      PLATFORM_ADMIN_URL: postgresql+psycopg://db_migrator:${DB_MIGRATOR_PASSWORD:-db_migrator}@postgres:5432/platform
+      ANALYTICS_ADMIN_URL: postgresql+psycopg://db_migrator:${DB_MIGRATOR_PASSWORD:-db_migrator}@postgres:5432/analytics
+      DATASET_ROOT: /app/datasets/sales-analytics-v1
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    command: ["uvicorn", "decisionharbor_api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      PLATFORM_RUNTIME_URL: postgresql+psycopg://platform_writer:${PLATFORM_WRITER_PASSWORD:-platform_writer}@postgres:5432/platform
+      ANALYTICS_RUNTIME_URL: postgresql+psycopg://analytics_reader:${ANALYTICS_READER_PASSWORD:-analytics_reader}@postgres:5432/analytics
+      PLATFORM_READINESS_URL: postgresql+psycopg://platform_readiness:${PLATFORM_READINESS_PASSWORD:-platform_readiness}@postgres:5432/platform
+      ANALYTICS_READINESS_URL: postgresql+psycopg://analytics_readiness:${ANALYTICS_READINESS_PASSWORD:-analytics_readiness}@postgres:5432/analytics
+    ports:
+      - "${API_HOST_PORT:-18080}:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    ports:
+      - "${WEB_HOST_PORT:-15173}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -Y off -qO- http://127.0.0.1/ >/dev/null"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  postgres-data:

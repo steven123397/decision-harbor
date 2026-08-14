@@ -2,7 +2,11 @@
 
 DecisionHarbor 是一个面向企业内部业务人员的受治理数据分析平台。它让用户提交显式 SQL，并在受控规则内完成校验、只读执行、结果展示与查询审计。
 
-当前仓库提供首轮产品背景、需求、技术约束和固定销售分析数据。应用源码、依赖、容器配置、迁移、测试和运行命令尚未建立。
+当前仓库提供首轮产品背景、需求、技术约束、固定销售分析数据和可运行的 Web/API/PostgreSQL 基座。
+
+## 项目文档
+
+- [文档入口](docs/index.md)：查看默认阅读顺序和各类文档职责。
 
 ## 背景资料
 
@@ -18,4 +22,21 @@ DecisionHarbor 是一个面向企业内部业务人员的受治理数据分析�
 
 ```bash
 python3 validate.py
+```
+
+## 本地运行
+
+需要 Docker、Docker Compose v2、Node.js 和 Python 3.13。首次启动前可复制 `.env.example` 为 `.env`，再按需修改当前实例的项目名和 Web/API 宿主端口：
+
+```bash
+cp .env.example .env
+./dev up
+```
+
+启动后访问 `http://127.0.0.1:15173`；API 的 `/health` 和 `/ready` 也可直接访问。`./dev down` 只停止当前 Compose 项目，`./dev destroy` 才会连同当前项目数据卷一起删除。
+
+验证数据、API、Web 单元测试和浏览器主链：
+
+```bash
+./dev test
 ```

@@ -1,0 +1,52 @@
+name: decision-harbor-api
+
+services:
+  db:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    volumes:
+      # PostgreSQL 18+ 要求数据卷挂在 /var/lib/postgresql（版本子目录由镜像管理）。
+      - pgdata:/var/lib/postgresql
+      - ../deploy/initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  api:
+    build:
+      context: ../api
+    environment:
+      PLATFORM_OWNER_URL: postgresql+psycopg://platform_owner:platform_owner@db:5432/platform
+      PLATFORM_APP_URL: postgresql+psycopg://platform_app:platform_app@db:5432/platform
+      ANALYTICS_OWNER_DSN: postgresql://analytics_owner:analytics_owner@db:5432/analytics
+      ANALYTICS_READONLY_DSN: postgresql://analytics_readonly:analytics_readonly@db:5432/analytics
+      DATASET_DIR: /srv/datasets/sales-analytics-v1
+    volumes:
+      - ../datasets:/srv/datasets:ro
+    ports:
+      - "${API_PORT:-8081}:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ../web
+      args:
+        API_BASE_URL: ""
+    ports:
+      - "${WEB_PORT:-8080}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  pgdata:

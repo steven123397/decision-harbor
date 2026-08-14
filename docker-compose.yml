@@ -1,0 +1,69 @@
+name: decisionharbor
+
+services:
+  db:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+    volumes:
+      - pgdata:/var/lib/postgresql
+
+  api:
+    build: ./api
+    environment:
+      DB_HOST: db
+      DB_PORT: "5432"
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      PLATFORM_DB: ${PLATFORM_DB:-platform}
+      ANALYTICS_DB: ${ANALYTICS_DB:-analytics}
+      DH_ADMIN_USER: ${DH_ADMIN_USER:-dh_admin}
+      DH_ADMIN_PASSWORD: ${DH_ADMIN_PASSWORD:-dh_admin}
+      PLATFORM_WRITER_USER: ${PLATFORM_WRITER_USER:-platform_writer}
+      PLATFORM_WRITER_PASSWORD: ${PLATFORM_WRITER_PASSWORD:-platform_writer}
+      ANALYTICS_READER_USER: ${ANALYTICS_READER_USER:-analytics_reader}
+      ANALYTICS_READER_PASSWORD: ${ANALYTICS_READER_PASSWORD:-analytics_reader}
+      QUERY_TIMEOUT_MS: ${QUERY_TIMEOUT_MS:-30000}
+      QUERY_ROW_LIMIT: ${QUERY_ROW_LIMIT:-10000}
+      MAX_SQL_BYTES: ${MAX_SQL_BYTES:-65536}
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:5173}
+      DATASET_DIR: /datasets
+    ports:
+      - "${API_PORT:-8000}:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./datasets/sales-analytics-v1:/datasets:ro
+
+  web:
+    build:
+      context: ./web
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8000}
+    ports:
+      - "${WEB_PORT:-5173}:5173"
+    depends_on:
+      - api
+
+  e2e:
+    profiles: ["e2e"]
+    build:
+      context: ./web
+      dockerfile: e2e.Dockerfile
+    network_mode: host
+    environment:
+      BASE_URL: http://localhost:${WEB_PORT:-5173}
+      API_BASE_URL: http://localhost:${API_PORT:-8000}
+    depends_on:
+      - web
+      - api
+
+volumes:
+  pgdata:

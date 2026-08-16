@@ -58,8 +58,52 @@ def _render_type(raw: str) -> str:
     return raw.upper() if raw.lower().startswith("numeric") else raw.upper()
 
 
-def build_create_table(table: dict) -> str:
+def _quote_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _check_constraints(table: dict, rules: dict) -> list[str]:
+    """由契约列约束与业务规则生成 CHECK 约束（与契约单一事实源派生）。
+
+    - 列级 `allowed_values` → IN 清单；
+    - business_rules.discount_rate_range → 对含 discount_rate 列的表生效；
+    - business_rules.product_cost_not_above_list_price → 对同时含
+      cost_price 与 list_price 列的表生效。
+    """
+    name = table["name"]
+    checks: list[str] = []
+    for col in table["columns"]:
+        values = col.get("allowed_values")
+        if values:
+            literal = ", ".join(_quote_literal(v) for v in values)
+            checks.append(
+                f'CONSTRAINT "ck_{name}_{col["name"]}_allowed" '
+                f'CHECK ("{col["name"]}" IN ({literal}))'
+            )
+
+    columns = {col["name"] for col in table["columns"]}
+    rate_range = rules.get("discount_rate_range")
+    if rate_range and "discount_rate" in columns:
+        lo, hi = float(rate_range[0]), float(rate_range[1])
+        checks.append(
+            f'CONSTRAINT "ck_{name}_discount_rate_range" '
+            f'CHECK ("discount_rate" BETWEEN {lo!r} AND {hi!r})'
+        )
+
+    if rules.get("product_cost_not_above_list_price") and {
+        "cost_price",
+        "list_price",
+    } <= columns:
+        checks.append(
+            f'CONSTRAINT "ck_{name}_cost_not_above_list" '
+            f'CHECK ("cost_price" <= "list_price")'
+        )
+    return checks
+
+
+def build_create_table(table: dict, rules: dict | None = None) -> str:
     """由契约条目生成 CREATE TABLE IF NOT EXISTS，字段语义与契约一致。"""
+    rules = rules or {}
     cols = []
     for col in table["columns"]:
         parts = [f'"{col["name"]}"', _render_type(col["type"])]
@@ -79,6 +123,7 @@ def build_create_table(table: dict) -> str:
         )
     for uq in table.get("unique_constraints", []):
         cols.append("UNIQUE (" + ", ".join(f'"{n}"' for n in uq) + ")")
+    cols.extend(_check_constraints(table, rules))
     body = ",\n  ".join(cols)
     return f'CREATE TABLE IF NOT EXISTS "{SCHEMA}"."{table["name"]}" (\n  {body}\n)'
 
@@ -143,8 +188,9 @@ def _create_and_load(
         with conn.transaction():
             cur = conn.cursor()
             cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{SCHEMA}"')
+            rules = contract.get("business_rules", {})
             for name in facts.tables:  # 契约顺序即外键依赖顺序
-                cur.execute(build_create_table(table_specs[name]))
+                cur.execute(build_create_table(table_specs[name], rules))
             for name in facts.tables:
                 csv_path = dataset_dir / "data" / f"{name}.csv"
                 copy_sql = (

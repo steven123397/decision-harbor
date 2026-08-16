@@ -1,0 +1,12 @@
+# 仓库根构建上下文（api / db 镜像）只需要的子集。
+.git
+.venv
+.worktrees
+.env
+docs
+web
+Makefile
+README.md
+AGENTS.md
+**/__pycache__
+**/.pytest_cache

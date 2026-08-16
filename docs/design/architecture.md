@@ -26,21 +26,23 @@
 ├─ Makefile          # make up / make test 统一入口
 ├─ .env.example      # 本地配置模板（.env 已被 .gitignore 忽略）
 ├─ web/            # React 19 + TypeScript + Vite 查询工作台
-│  └─ Dockerfile   # 多阶段：Node 24 构建 → Nginx 托管静态资源并反向代理 API
+│  └─ Dockerfile   # 多阶段：Node 24 构建 → 测试阶段（test profile）→ Nginx 托管静态资源并反向代理 API
 ├─ api/
-│  ├─ Dockerfile   # Python 3.13 + FastAPI
+│  ├─ Dockerfile   # Python 3.13 + FastAPI（构建上下文为仓库根，数据集烤进镜像）
 │  ├─ migrations/  # Alembic，仅管理 platform 库
 │  └─ app/
 │     ├─ main.py        # 组装、生命周期、/health 与 /ready
-│     ├─ config.py      # 环境变量配置
+│     ├─ bootstrap.py   # 一次性初始化入口（init 容器）：迁移 + seed 后退出
+│     ├─ config.py      # 环境变量配置（带上界校验）
 │     ├─ db.py          # SQLAlchemy 2.0 双数据库引擎与连接管理
 │     ├─ policy/        # SQL 策略判定，纯函数，不访问数据库
 │     ├─ runs/          # 查询运行记录仓库与服务编排
-│     ├─ execute/       # 只读执行器：流式取数、超时、行数上限
+│     ├─ execute/       # 只读执行器与服务端游标流式取数、有界连接池
 │     ├─ routes/        # HTTP 端点与请求/响应模型
-│     └─ seed/          # 由 contract.json 派生 DDL 并加载固定数据
+│     └─ seed/          # 由 contract.json 派生 DDL（含 CHECK 约束）并加载固定数据
 ├─ deploy/
-│  ├─ compose.yaml      # Web、API、PostgreSQL
+│  ├─ compose.yaml      # Web、API、init、PostgreSQL 与 test profile 测试服务
+│  ├─ Dockerfile.db     # postgres:18 + initdb 脚本烤进镜像
 │  └─ initdb/           # 首次初始化的建库与建角色脚本
 └─ datasets/sales-analytics-v1/   # 产品输入，不修改
 ```
@@ -70,8 +72,9 @@
 
 - **前端经同源反向代理访问 API，不配置 CORS。** Web 容器内的 Nginx 托管静态资源并把 `/api/`、`/health`、`/ready` 代理到 API 容器。理由：浏览器与测试只面对单一来源，避免本地跨域配置；同时贴近生产形态。
 - **源码构建进镜像，不使用绑定挂载。** 两个工作区即使共享内核也不会共享任何主机目录。理由：技术约束禁止共享绑定目录，镜像化是最强的隔离方式，且满足「干净 WSL 一条命令」的目标；代价是本地迭代需要重建镜像，首轮接受。
-- **引导在 API 容器入口执行。** 容器启动顺序为：等待 PostgreSQL 可连接 → Alembic 迁移（platform）→ 幂等 seed（analytics）→ 启动服务进程。理由：保证每次启动都收敛到确定状态，避免依赖一次性 bootstrap 服务的重跑语义；服务进程本身只用 `platform_app` 与 `analytics_readonly` 身份，引导身份仅存在于同一容器内的启动脚本。该身份是本地开发凭据，数据库也不发布宿主端口，风险局限在本地 compose 网络内。
-- **`make up` 使用 `docker compose up --build --wait` 完成构建、启动与健康等待**，符合「一条统一命令」要求；`--wait` 依赖各容器 healthcheck（API 用 `/health`，就绪业务检查用 `/ready`）。
+- **初始化由独立 init 容器执行，服务进程不接触高权限凭据。** compose 拓扑：`init` 服务用 `platform_owner` / `analytics_owner` 身份完成 Alembic 迁移与幂等 seed 后退出；`api` 服务以 `service_completed_successfully` 依赖 init，环境里自始至终只有 `platform_app` 与 `analytics_readonly` 两条低权限连接串。理由：迁移/seed 每次启动都收敛到确定状态，同时保证「运行中的服务进程不持有高权限身份」在容器层面成立，而不是依赖同一容器内的启动顺序。该身份是本地开发凭据，数据库也不发布宿主端口，风险局限在本地 compose 网络内。
+- **`make up` 使用 `docker compose up --build --wait` 完成构建、启动与健康等待**，符合「一条统一命令」要求；`--wait` 依赖各容器 healthcheck（API 用 `/health`，就绪业务检查用 `/ready`），init 一次性服务成功退出即视为完成。
+- **测试运行在专门构建的测试镜像里，不借用生产容器。** `web-test`（Node 工具链阶段）跑 Web 单元测试，`api-test`（API 镜像 + owner 环境变量）跑双数据库集成测试；两者都在 compose `test` profile 下，`make test` 经 `docker compose run --rm` 一次性执行。
 
 ## 失败与迁移
 

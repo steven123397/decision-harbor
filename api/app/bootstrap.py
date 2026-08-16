@@ -1,7 +1,8 @@
-"""容器入口：等待数据库 → Alembic 迁移（owner）→ 幂等 seed → 启动服务。
+"""初始化入口（init 容器）：等待数据库 → Alembic 迁移（owner）→ 幂等 seed → 退出。
 
-迁移与 seed 使用高权限身份，服务进程只持有 platform_app 与
-analytics_readonly（见 docs/design/architecture.md 引导决策）。
+迁移与 seed 使用高权限身份，但只存在于一次性 init 服务中；
+API 服务进程自始至终只持有 platform_app 与 analytics_readonly
+（见 docs/design/architecture.md 引导决策）。
 """
 
 from __future__ import annotations
@@ -70,10 +71,7 @@ def main() -> None:
     logger.info("检查/加载固定数据集")
     outcome = run_seed()
     logger.info("seed 结果：%s（标记 %s）", outcome, load_facts(Path(settings.dataset_dir)).marker_key)
-
-    import uvicorn
-
-    uvicorn.run("app.main:app", host="0.0.0.0", port=8000)
+    logger.info("初始化完成，init 容器退出")
 
 
 if __name__ == "__main__":

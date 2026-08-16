@@ -20,7 +20,8 @@
 - `analytics_readonly` 无任何写权限、无 `CREATE`，对象权限只授予契约五张表；未授权对象（含未来新增对象）默认不可见。表清单不在 initdb 脚本中硬编码：建表发生在 API 引导阶段，`analytics_owner` 建表后按契约表清单逐一 `GRANT SELECT`，与 DDL 同源派生。
 - 各库撤销 `PUBLIC` 在 schema `public` 上的 `CREATE`。系统目录（`pg_catalog`）的只读访问是 PostgreSQL 固有行为，不构成写风险；用户 SQL 访问系统目录已由策略层禁止。
 - 凭据经环境变量注入 compose；数据库不发布宿主端口，凭据只在 compose 网络内有效。本地默认凭据仅是开发便利，不构成外部暴露。
-- 运行中的服务进程只持有 `platform_app` 与 `analytics_readonly`；`platform_owner` 与 `analytics_owner` 仅在容器入口的迁移与 seed 阶段使用（见 [architecture.md](architecture.md) 引导决策）。
+- 运行中的服务进程只持有 `platform_app` 与 `analytics_readonly`；`platform_owner` 与 `analytics_owner` 凭据只注入一次性 `init` 容器（迁移与 seed 完成后退出），API 服务容器的环境里不存在高权限连接串（见 [architecture.md](architecture.md) 引导决策）。
+- initdb 脚本与数据集文件分别烤进 `db` 与 `api` 镜像，不使用主机绑定挂载，并行工作区不共享任何主机目录。
 
 ## 迁移（platform）
 
@@ -30,7 +31,7 @@
 
 ## seed（analytics）
 
-- **DDL 从契约派生**：读取 `datasets/sales-analytics-v1/contract.json` 生成 `CREATE TABLE IF NOT EXISTS`，字段类型、`NOT NULL`、主键、唯一约束与外键与契约一致；不手写第二份 schema，契约保持单一事实源。
+- **DDL 从契约派生**：读取 `datasets/sales-analytics-v1/contract.json` 生成 `CREATE TABLE IF NOT EXISTS`，字段类型、`NOT NULL`、主键、唯一约束与外键与契约一致；不手写第二份 schema，契约保持单一事实源。契约中的业务口径同时落为 CHECK 约束：列级 `allowed_values` 生成 `IN` 清单，`business_rules.discount_rate_range` 约束折扣列区间，`product_cost_not_above_list_price` 约束成本不高于标价——违反契约口径的数据在数据库层即被拒绝。
 - **数据加载**：读取已提交的权威 CSV，经 psycopg 的 `COPY ... FROM STDIN`（CSV 模式，`NULL ''`）流式加载；时间戳为 ISO 8601 UTC 文本，由 PostgreSQL 解析为 `timestamptz`。seed 不调用生成器，不重新生成数据。
 - **幂等标记**：数据集标识（dataset + version + seed，取自 `manifest.json`）写入 `platform` 库的 `dataset_markers`。启动时三分支：
   1. `analytics` 中表不存在 → 建 DDL，单事务加载全部数据，提交后写标记；

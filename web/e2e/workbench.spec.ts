@@ -22,4 +22,25 @@ test.describe("查询工作台主链", () => {
 
     await expect(page.getByTestId("rejected")).toContainText("QY_FORBIDDEN_STATEMENT");
   });
+
+  test("执行错误展示失败面板", async ({ page }) => {
+    await page.goto("/");
+    await page.getByTestId("sql-input").fill("SELECT no_such_column FROM customers");
+    await page.getByTestId("submit").click();
+
+    await expect(page.getByTestId("failed")).toContainText("QY_EXECUTION_ERROR");
+  });
+
+  test("长查询先展示执行中状态，超时后展示失败面板", async ({ page }) => {
+    // 笛卡尔积计数远超语句超时：请求返回前「执行中」可见，
+    // 最终以 QY_TIMEOUT 失败收场（同时覆盖失败面板与稳定失败码）。
+    await page.goto("/");
+    await page.getByTestId("sql-input").fill(
+      "SELECT count(*) FROM order_items a, order_items b, orders o"
+    );
+    await page.getByTestId("submit").click();
+
+    await expect(page.getByTestId("running")).toBeVisible();
+    await expect(page.getByTestId("failed")).toContainText("QY_TIMEOUT", { timeout: 30_000 });
+  });
 });

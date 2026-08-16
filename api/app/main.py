@@ -7,11 +7,15 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from app.config import Settings, get_settings
 from app.db import create_platform_engine, create_platform_session_factory
 from app.readiness import Readiness
+from app.routes.query_runs import (
+    invalid_request_handler as invalid_request,
+)
 from app.routes.query_runs import router as query_runs_router
 from app.runs.service import QueryRunService
 from app.seed.loader import contract_tables, ensure_dataset, load_facts
@@ -40,12 +44,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             max_rows=settings.query_max_rows,
             sql_max_length=settings.query_sql_max_length,
             allowed_tables=contract_tables(dataset_dir),
+            max_concurrency=settings.query_max_concurrency,
         )
         yield
+        app.state.runs.close()
         platform_engine.dispose()
 
     app = FastAPI(title="DecisionHarbor API", lifespan=lifespan)
     app.include_router(query_runs_router)
+    app.add_exception_handler(RequestValidationError, invalid_request)
 
     @app.get("/health")
     def health():

@@ -19,7 +19,7 @@
 
 - `succeeded`：策略通过且执行成功，含结果与统计。
 - `rejected`：策略判定不通过，含稳定拒绝码与可读说明。
-- `failed`：策略通过但执行出错（含超时），含稳定错误码与摘要。
+- `failed`：策略通过但执行出错（含超时与资源繁忙），含稳定错误码与摘要。容量耗尽（`QY_CAPACITY_EXCEEDED`）与数据库不可达（`QY_ANALYTICS_UNAVAILABLE`）属于执行侧失败而非策略拒绝，统一落在 `failed`，客户端不会把资源问题误读成 SQL 违规。
 
 POST 同步等待终态后返回；`running` 是持久化的中间态，用于崩溃取证与并发下的 GET 可见性。前端「执行中」由请求未返回呈现，无需轮询。理由：首轮无作业队列，执行时长由语句超时界定，同步语义最简单且完整保留审计链。
 
@@ -54,11 +54,13 @@ POST 同步等待终态后返回；`running` 是持久化的中间态，用于�
 
 | 状态 | 场景 | 错误码 |
 | --- | --- | --- |
-| 400 | 请求体不是含字符串 `sql` 的对象 | `QY_INVALID_REQUEST` |
-| 404 | 指定 id 不存在 | `QY_RUN_NOT_FOUND` |
+| 400 | 请求体不是含字符串 `sql` 的对象（含多余字段与非法 JSON） | `QY_INVALID_REQUEST` |
+| 404 | 指定 id 不存在（含非整数 id，如 `/query-runs/does-not-exist`） | `QY_RUN_NOT_FOUND` |
 | 503 | `/ready` 未就绪 | 原因说明 |
-| 200 + `rejected` | 策略拒绝 | `QY_SQL_TOO_LONG`、`QY_INVALID_SYNTAX`、`QY_MULTIPLE_STATEMENTS`、`QY_FORBIDDEN_STATEMENT`、`QY_SELECT_INTO`、`QY_WRITE_CTE`、`QY_UNAUTHORIZED_OBJECT`、`QY_FORBIDDEN_FUNCTION` |
-| 200 + `failed` | 执行错误 | `QY_TIMEOUT`、`QY_EXECUTION_ERROR` |
+| 200 + `rejected` | 策略拒绝 | `QY_SQL_TOO_LONG`、`QY_INVALID_SYNTAX`、`QY_MULTIPLE_STATEMENTS`、`QY_FORBIDDEN_STATEMENT`（含行锁子句）、`QY_SELECT_INTO`、`QY_WRITE_CTE`、`QY_UNAUTHORIZED_OBJECT`、`QY_FORBIDDEN_FUNCTION`、`QY_UNSUPPORTED_SQL` |
+| 200 + `failed` | 执行错误 | `QY_TIMEOUT`、`QY_EXECUTION_ERROR`、`QY_CAPACITY_EXCEEDED`、`QY_ANALYTICS_UNAVAILABLE` |
+
+非整数路径 id 属于「记录不存在」（404 + `QY_RUN_NOT_FOUND`），不会被请求体校验的 400 处理器捕获；路径参数在端点内按字符串接收并解析。
 
 ## 错误信息边界
 

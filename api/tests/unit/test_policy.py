@@ -46,6 +46,16 @@ def decide(sql: str) -> PolicyDecision:
         "SELECT count(*) FROM orders;",
         # 注释与大小写
         "-- top regions\nselect region /* inline */ from customers",
+        # CASE 表达式、DISTINCT、ILIKE 与窗口帧
+        "SELECT CASE WHEN quantity > 1 THEN 'multi' ELSE 'single' END FROM order_items",
+        "SELECT DISTINCT region FROM customers WHERE region ILIKE 'e%'",
+        "SELECT sum(quantity) OVER (ORDER BY quantity "
+        "ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM order_items",
+        # 递归 CTE 自引用在词法作用域内解析为 CTE 定义
+        "WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM r WHERE n < 3) "
+        "SELECT * FROM r",
+        # 常量查询
+        "SELECT 1",
     ],
 )
 def test_allows_readonly_queries(sql):
@@ -106,6 +116,10 @@ def test_rejects_placeholders(sql):
         "GRANT SELECT ON customers TO public",
         "SET statement_timeout = 0",
         "VACUUM customers",
+        # 行锁子句：只读查询表达式也不允许携带锁
+        "SELECT * FROM customers FOR UPDATE",
+        "SELECT * FROM customers WHERE id = 1 FOR SHARE",
+        "SELECT * FROM customers WHERE id = 1 FOR NO KEY UPDATE",
     ],
 )
 def test_rejects_forbidden_statements(sql):
@@ -141,6 +155,13 @@ def test_rejects_data_modifying_cte():
         "SELECT * FROM query_runs",
         # 未知 schema 限定
         "SELECT * FROM public.customers",
+        # CTE 遮蔽系统目录：非递归 CTE 体内自引用回退到 pg_catalog 真表
+        "WITH pg_class AS (SELECT relname FROM pg_class) SELECT * FROM pg_class",
+        # 作用域外借用 CTE 名访问裸系统表
+        "SELECT * FROM (WITH t AS (SELECT 1 AS a) SELECT a FROM t) s "
+        "JOIN pg_class ON true",
+        # CTE 名与授权表同名（遮蔽语义歧义，直接拒绝）
+        "WITH customers AS (SELECT 1 AS x) SELECT * FROM customers",
     ],
 )
 def test_rejects_unauthorized_objects(sql):
@@ -148,7 +169,51 @@ def test_rejects_unauthorized_objects(sql):
     assert (d.allowed, d.code) == (False, "QY_UNAUTHORIZED_OBJECT")
 
 
-# ---------------------------------------------------------------- 拒绝：函数
+# ---------------------------------------------------------------- 拒绝：类型转换
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # 对象标识类型转换是系统目录访问入口
+        "SELECT 'pg_catalog.pg_class'::regclass",
+        "SELECT 'orders'::regclass",
+        "SELECT CAST('1' AS oid)",
+        "SELECT 'x'::int[]",
+        "SELECT 'x'::\"regclass\"",
+        # 枚举/自定义类型
+        "SELECT CAST('x' AS some_enum)",
+    ],
+)
+def test_rejects_unsafe_casts(sql):
+    d = decide(sql)
+    assert (d.allowed, d.code) == (False, "QY_UNAUTHORIZED_OBJECT")
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT 'x'::varchar(99999999)",
+        "SELECT 'x'::numeric(-1)",
+        "SELECT 'x'::numeric(1001)",
+        "SELECT 'x'::numeric(5, 6)",
+        "SELECT 'x'::timestamp(9)",
+        "SELECT 'x'::text(3)",
+    ],
+)
+def test_rejects_out_of_range_cast_parameters(sql):
+    d = decide(sql)
+    assert (d.allowed, d.code) == (False, "QY_INVALID_SYNTAX")
+
+
+def test_allows_safe_casts():
+    assert decide(
+        "SELECT 'x'::text, CAST('1' AS integer), 'a'::varchar(50), "
+        "'1.5'::numeric(12, 2), quantity::bigint, ordered_at::date FROM order_items"
+    ).allowed
+
+
+# ---------------------------------------------------------------- 拒绝：函数与节点
 
 
 @pytest.mark.parametrize(
@@ -162,6 +227,13 @@ def test_rejects_unauthorized_objects(sql):
         "SELECT lo_export(0, '/tmp/x')",
         "SELECT dblink_exec('host=x', 'DELETE FROM customers')",
         "SELECT * FROM customers WHERE id = 1 OR pg_sleep(10)::text = 'x'",
+        # 系统信息与逃逸路径：白名单外一律拒绝
+        "SELECT query_to_xml('SELECT relname FROM pg_class', true, true, '')",
+        "SELECT current_setting('search_path')",
+        "SELECT current_user",
+        "SELECT session_user",
+        "SELECT version()",
+        "SELECT inet_client_addr()",
     ],
 )
 def test_rejects_forbidden_functions(sql):
@@ -171,3 +243,9 @@ def test_rejects_forbidden_functions(sql):
 
 def test_allows_normal_functions():
     assert decide("SELECT lower(region), coalesce(segment, 'none') FROM customers").allowed
+
+
+def test_rejects_unsupported_nodes():
+    # 结构在支持节点白名单之外（管道函数调用形态）
+    d = decide("SELECT to_jsonb(customers) FROM customers")
+    assert (d.allowed, d.code) == (False, "QY_FORBIDDEN_FUNCTION")

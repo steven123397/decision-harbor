@@ -22,6 +22,9 @@ GRANT USAGE ON SCHEMA public TO platform_app;
 \connect analytics
 REVOKE CREATE ON SCHEMA public FROM PUBLIC;
 GRANT ALL ON SCHEMA public TO analytics_owner;
+-- 库级 CONNECT 同样收紧；只保留两个分析身份。
+REVOKE CONNECT ON DATABASE analytics FROM PUBLIC;
+GRANT CONNECT ON DATABASE analytics TO analytics_owner, analytics_readonly;
 -- 契约表都在 analytics schema；两个身份的 search_path 都指向它。
 ALTER ROLE analytics_owner SET search_path = analytics;
 ALTER ROLE analytics_readonly SET search_path = analytics;

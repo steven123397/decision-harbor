@@ -1,8 +1,12 @@
-name: decision-harbor-api
+# 项目名从 .env 的 COMPOSE_PROJECT_NAME 读取（默认 decision-harbor），
+# 并行工作区靠它获得隔离的网络/卷/容器命名空间。
+name: ${COMPOSE_PROJECT_NAME:-decision-harbor}
 
 services:
   db:
-    image: postgres:18
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.db
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -10,7 +14,6 @@ services:
     volumes:
       # PostgreSQL 18+ 要求数据卷挂在 /var/lib/postgresql（版本子目录由镜像管理）。
       - pgdata:/var/lib/postgresql
-      - ../deploy/initdb:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 3s
@@ -18,22 +21,39 @@ services:
       retries: 30
     restart: unless-stopped
 
-  api:
+  # 一次性初始化：迁移 + seed 用高权限身份，跑完即退出。
+  # API 服务容器自始至终不接触 owner 凭据。
+  init:
     build:
-      context: ../api
+      context: ..
+      dockerfile: api/Dockerfile
+    command: ["python", "-m", "app.bootstrap"]
     environment:
       PLATFORM_OWNER_URL: postgresql+psycopg://platform_owner:platform_owner@db:5432/platform
-      PLATFORM_APP_URL: postgresql+psycopg://platform_app:platform_app@db:5432/platform
       ANALYTICS_OWNER_DSN: postgresql://analytics_owner:analytics_owner@db:5432/analytics
-      ANALYTICS_READONLY_DSN: postgresql://analytics_readonly:analytics_readonly@db:5432/analytics
       DATASET_DIR: /srv/datasets/sales-analytics-v1
-    volumes:
-      - ../datasets:/srv/datasets:ro
-    ports:
-      - "${API_PORT:-8081}:8000"
     depends_on:
       db:
         condition: service_healthy
+    restart: "no"
+
+  api:
+    build:
+      context: ..
+      dockerfile: api/Dockerfile
+    environment:
+      # 运行时身份只有低权限两条：审计读写 + 只读执行。
+      PLATFORM_APP_URL: postgresql+psycopg://platform_app:platform_app@db:5432/platform
+      ANALYTICS_READONLY_DSN: postgresql://analytics_readonly:analytics_readonly@db:5432/analytics
+      DATASET_DIR: /srv/datasets/sales-analytics-v1
+      QUERY_MAX_CONCURRENCY: "5"
+    depends_on:
+      db:
+        condition: service_healthy
+      init:
+        condition: service_completed_successfully
+    ports:
+      - "${API_PORT:-8081}:8000"
     restart: unless-stopped
 
   web:
@@ -47,6 +67,31 @@ services:
       api:
         condition: service_healthy
     restart: unless-stopped
+
+  # ---- test profile：只在 make test 时构建运行 ----
+
+  # 集成测试需要 owner 身份做负向用例，跑在独立容器而非 api 服务进程。
+  api-test:
+    profiles: ["test"]
+    build:
+      context: ..
+      dockerfile: api/Dockerfile
+    command: ["pytest", "tests/integration", "-q"]
+    environment:
+      ANALYTICS_OWNER_DSN: postgresql://analytics_owner:analytics_owner@db:5432/analytics
+      ANALYTICS_READONLY_DSN: postgresql://analytics_readonly:analytics_readonly@db:5432/analytics
+      PLATFORM_APP_URL: postgresql+psycopg://platform_app:platform_app@db:5432/platform
+      DATASET_DIR: /srv/datasets/sales-analytics-v1
+    depends_on:
+      api:
+        condition: service_healthy
+
+  # Web 单元测试在带 Node 工具链的测试镜像里执行，不进生产 Nginx 容器。
+  web-test:
+    profiles: ["test"]
+    build:
+      context: ../web
+      target: test
 
 volumes:
   pgdata:

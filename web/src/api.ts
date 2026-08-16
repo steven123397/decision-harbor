@@ -74,7 +74,7 @@ export async function submitSql(sql: string): Promise<ViewState> {
   } catch {
     return { kind: "network-error", message: "无法连接查询服务" };
   }
-  if (!resp.ok && resp.status !== 200) {
+  if (!resp.ok) {
     return { kind: "network-error", message: `请求失败（HTTP ${resp.status}）` };
   }
   const body = (await resp.json()) as QueryRunResponse;

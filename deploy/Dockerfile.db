@@ -1,0 +1,3 @@
+# 数据库初始化脚本烤进镜像，避免与并行工作区共享 initdb 绑定目录。
+FROM postgres:18
+COPY deploy/initdb/ /docker-entrypoint-initdb.d/

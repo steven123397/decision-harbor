@@ -1,9 +1,10 @@
-"""运行时配置：全部来自环境变量，带本地默认值。"""
+"""运行时配置：全部来自环境变量，带本地默认值与上下界校验。"""
 
 from __future__ import annotations
 
 from functools import lru_cache
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -29,10 +30,11 @@ class Settings(BaseSettings):
     dataset_dir: str = "datasets/sales-analytics-v1"
 
     # 查询治理资源限制，语义见 docs/design/query-governance.md。
-    query_sql_max_length: int = 100_000
-    query_statement_timeout_ms: int = 10_000
-    query_max_rows: int = 1_000
-    query_pool_size: int = 5
+    # 上下界在配置层拒绝明显失控的取值，而不是等运行期才失败。
+    query_sql_max_length: int = Field(default=100_000, ge=1, le=1_000_000)
+    query_statement_timeout_ms: int = Field(default=10_000, ge=100, le=60_000)
+    query_max_rows: int = Field(default=1_000, ge=1, le=50_000)
+    query_max_concurrency: int = Field(default=5, ge=1, le=32)
 
 
 @lru_cache

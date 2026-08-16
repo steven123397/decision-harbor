@@ -1,4 +1,4 @@
-"""只读执行器：psycopg 直连 analytics，流式取数、超时与行数上限。"""
+"""只读执行器：psycopg 直连 analytics，服务端游标流式取数、超时与行数上限。"""
 
 from __future__ import annotations
 
@@ -6,9 +6,9 @@ import time
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
+from uuid import uuid4
 
 import psycopg
-from psycopg import sql as pg_sql
 
 QY_TIMEOUT = "QY_TIMEOUT"
 QY_EXECUTION_ERROR = "QY_EXECUTION_ERROR"
@@ -41,32 +41,28 @@ class ExecutionResult:
 def execute_readonly(
     query: str,
     *,
-    readonly_dsn: str,
-    statement_timeout_ms: int,
+    conn: psycopg.Connection,
     max_rows: int,
 ) -> ExecutionResult:
-    """以只读身份执行一条已通过策略检查的 SQL。
+    """在池中已获取的只读连接上执行一条已通过策略检查的 SQL。
 
     错误信息在此映射为稳定摘要，不透传数据库原始文本。
     """
     started = time.perf_counter()
     try:
-        with psycopg.connect(readonly_dsn, connect_timeout=10) as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    pg_sql.SQL("SET statement_timeout = {}").format(
-                        pg_sql.Literal(str(statement_timeout_ms))
-                    )
-                )
-                cur.execute(query)
-                columns = [
-                    ColumnDef(name=col.name, type=_type_name(conn, col.type_code))
-                    for col in (cur.description or [])
-                ]
-                fetched = cur.fetchmany(max_rows + 1)
-                truncated = len(fetched) > max_rows
-                rows = [_convert_row(row) for row in fetched[:max_rows]]
-            conn.rollback()
+        # 服务端（命名）游标：结果集留在数据库侧按块传输，
+        # execute() 不会先在 API 进程内存里物化完整结果。
+        with conn.cursor(name=f"query_{uuid4().hex}") as cur:
+            cur.itersize = max_rows + 1
+            cur.execute(query)
+            columns = [
+                ColumnDef(name=col.name, type=_type_name(conn, col.type_code))
+                for col in (cur.description or [])
+            ]
+            fetched = cur.fetchmany(max_rows + 1)
+            truncated = len(fetched) > max_rows
+            rows = [_convert_row(row) for row in fetched[:max_rows]]
+        conn.rollback()
     except psycopg.errors.QueryCanceled as exc:
         raise ExecutionFailure(
             QY_TIMEOUT, "查询执行超时，已被语句超时限制中止"
@@ -84,6 +80,10 @@ def execute_readonly(
         truncated=truncated,
         duration_ms=duration_ms,
     )
+
+
+def execute_on_connection(query: str, *, conn, max_rows: int) -> ExecutionResult:
+    return execute_readonly(query, conn=conn, max_rows=max_rows)
 
 
 def _type_name(conn: psycopg.Connection, oid: int) -> str:

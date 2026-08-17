@@ -42,5 +42,6 @@ DecisionHarbor 是一个面向企业内部业务人员的受治理数据分析�
 
 ## 工作区
 
+- `v0.1.0/zcode-glm-5.3-high` 是独立发展的工程线，不合并回 `main`，也不以 `main` 为变更或 PR 目标；`main` 仅作参考对照。
 - `.worktrees/` 仅用于本地独立工作区，必须保持未跟踪。
 - 变更跨越 API、数据库、查询策略或运行环境时，同步更新受影响的文档（`CONTEXT.md`、相关 ADR、`README.md`）与测试。

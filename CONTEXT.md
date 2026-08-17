@@ -25,6 +25,10 @@ _Avoid_: 重试次数（retry 是用户动作）
 **重试关系（retry_of）**:
 用户对 failed 或 cancelled 运行发起重试时，新运行指向原运行的关系；重试创建新运行，不复活原运行。
 
+**幂等键（idempotency key）**:
+提交查询时可选携带的提交标识；数据库唯一索引保证一个键终身只绑定一条查询运行记录——同键同 SQL 重放返回原运行，同键异 SQL 构成冲突。
+_Avoid_: 与运行 id 混称
+
 **执行租约（lease）**:
 执行者认领运行时写入的 ownership 凭据（worker_id + lease_expires_at），到期未续期即视为失去所有权，其他执行者可接管。
 _Avoid_: 锁

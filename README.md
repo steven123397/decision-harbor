@@ -7,7 +7,7 @@ DecisionHarbor 是一个面向企业内部业务人员的受治理数据分析�
 ## 架构一览
 
 - `web/`：React 19 + TypeScript + Vite 查询工作台；Nginx 托管静态资源并同源反向代理 API（无 CORS）。
-- `api/`：Python 3.13 + FastAPI。`app/policy/` 是 SQL 策略判定（纯函数、全维度白名单）；`app/runs/` 受理提交（同事务入队或拒绝）与运行队列网关；`app/worker.py` 是后台执行组件（只读身份执行、终态+快照原子发布）；`app/seed/` 从契约派生 DDL 并加载固定数据；Alembic 迁移管理 `platform` 库。
+- `api/`：Python 3.13 + FastAPI。`app/policy/` 是 SQL 策略判定（纯函数、全维度白名单）；`app/runs/` 受理提交（同事务入队或拒绝，支持幂等键重放）、历史分页与运行队列网关；`app/worker.py` 是后台执行组件（只读身份执行、终态+快照原子发布）；`app/seed/` 从契约派生 DDL 并加载固定数据；Alembic 迁移管理 `platform` 库。
 - `deploy/`：Compose 栈（web、api、worker、一次性 init 容器、PostgreSQL 与 `test` profile 测试服务）。init 容器以 owner 身份完成迁移与幂等 seed 后退出，api 与 worker 只持低权限凭据。
 - `datasets/sales-analytics-v1/`：产品输入，`contract.json` 是五张分析表的单一事实源。
 

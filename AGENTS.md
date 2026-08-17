@@ -24,6 +24,7 @@ DecisionHarbor 是一个面向企业内部业务人员的受治理数据分析�
 - `docs/adr/`：不可逆决策记录，顺序编号，一个决策一个文件。产出与既有 ADR 矛盾时必须显式标出（「与 ADR-NNNN 矛盾，但值得重开，因为……」），不得静默覆盖。
 - `docs/agents/`：工程技能（mattpocock/skills）的仓库级配置，见下。
 - `docs/background/`：已确认的外部输入（产品需求与技术约束）。只有用户确认变更意图后才修改；不得改写背景约束来迁就实现。
+- ZCode 仓库 wiki：客户端从某次 commit 快照派生的代码导览，存放于仓库外（`~/.zcode/v2/repo-wiki/`）。它是只读参考，不是事实源，与仓库文档冲突时以仓库文档为准；随代码演进过期，需要时重新生成，不手工维护；仓库文档与 Issues 不引用 wiki 页面。
 - 规格与工单不再落在 `docs/`，统一进入 GitHub Issues（见下）。
 
 ## Agent skills

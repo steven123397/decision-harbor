@@ -42,6 +42,11 @@ class Settings(BaseSettings):
     worker_heartbeat_seconds: int = Field(default=10, ge=1, le=120)
     result_retention_hours: int = Field(default=24, ge=1, le=24 * 30)
 
+    # 容量与重试（ADR-0019）：全局并发以数据库有效租约数为准，跨实例
+    # 生效；单 worker 认领上限只做本地连接池对齐，不参与全局判定。
+    global_query_concurrency: int = Field(default=4, ge=1, le=64)
+    worker_max_concurrency: int = Field(default=2, ge=1, le=16)
+
 
 @lru_cache
 def get_settings() -> Settings:

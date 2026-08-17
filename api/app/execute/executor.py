@@ -11,6 +11,7 @@ from uuid import uuid4
 import psycopg
 
 QY_TIMEOUT = "QY_TIMEOUT"
+QY_ANALYTICS_UNAVAILABLE = "QY_ANALYTICS_UNAVAILABLE"
 QY_EXECUTION_ERROR = "QY_EXECUTION_ERROR"
 
 
@@ -66,6 +67,13 @@ def execute_readonly(
     except psycopg.errors.QueryCanceled as exc:
         raise ExecutionFailure(
             QY_TIMEOUT, "查询执行超时，已被语句超时限制中止"
+        ) from exc
+    except psycopg.OperationalError as exc:
+        # 连接类失败（断连、不可达）是基础设施错误，自动重试的资格
+        # 由 queue.RETRYABLE_ERROR_CODES 决定；QueryCanceled 是其子类，
+        # 必须先匹配。确定性数据库错误落到下面的 QY_EXECUTION_ERROR。
+        raise ExecutionFailure(
+            QY_ANALYTICS_UNAVAILABLE, "analytics 数据库暂不可达，请稍后重试"
         ) from exc
     except psycopg.Error as exc:
         raise ExecutionFailure(

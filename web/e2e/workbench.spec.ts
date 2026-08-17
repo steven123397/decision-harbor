@@ -31,9 +31,11 @@ test.describe("查询工作台主链", () => {
     await expect(page.getByTestId("failed")).toContainText("QY_EXECUTION_ERROR");
   });
 
-  test("长查询先展示执行中状态，超时后展示失败面板", async ({ page }) => {
-    // 笛卡尔积计数远超语句超时：请求返回前「执行中」可见，
-    // 最终以 QY_TIMEOUT 失败收场（同时覆盖失败面板与稳定失败码）。
+  test("长查询先展示执行中状态，超时后展示失败面板", { timeout: 90_000 }, async ({ page }) => {
+    // 笛卡尔积计数远超语句超时：请求返回前「执行中」可见，最终以
+    // QY_TIMEOUT 失败收场。QY_TIMEOUT 属基础设施类失败，自动重跑
+    // 满 attempt 1→3 后才落终态（ADR-0019）：3 次执行 × 10s 语句
+    // 超时，断言窗口须覆盖 ~30s 加调度与轮询余量。
     await page.goto("/");
     await page.getByTestId("sql-input").fill(
       "SELECT count(*) FROM order_items a, order_items b, orders o"
@@ -41,6 +43,6 @@ test.describe("查询工作台主链", () => {
     await page.getByTestId("submit").click();
 
     await expect(page.getByTestId("running")).toBeVisible();
-    await expect(page.getByTestId("failed")).toContainText("QY_TIMEOUT", { timeout: 30_000 });
+    await expect(page.getByTestId("failed")).toContainText("QY_TIMEOUT", { timeout: 60_000 });
   });
 });

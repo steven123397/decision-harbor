@@ -2,7 +2,13 @@
 
 多实例协同：SKIP LOCKED 认领互不重复，租约过期后被其他执行者接管
 （ADR-0017）；执行期间由守护线程心跳续期，健康执行者的长查询不会
-因租约到期被误接管。全局并发闸门与自动重试在后继工单（#11）落地。
+因租约到期被误接管。
+
+容量与重试（ADR-0019）：认领携带全局并发闸门（数据库有效租约数为
+唯一事实源，跨实例生效）；本进程并发持有多个认领，认领时排除自己在
+执行的运行（自接管排除）；基础设施类失败经 queue.retry_or_fail 回队
+重跑，attempt 硬上界 3；租约过期且耗尽的运行由 keeper 周期清扫终态。
+
 治理已在受理时同步完成，worker 信任队列里的 SQL 均通过策略判定，
 但仍只持分析只读身份执行。
 """
@@ -15,6 +21,7 @@ import signal
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 from sqlalchemy import text
 
@@ -27,6 +34,7 @@ from app.execute.executor import (
 )
 from app.execute.pool import ReadOnlyPool
 from app.runs import queue
+from app.runs.queue import Claim
 
 logger = logging.getLogger("decision_harbor.worker")
 
@@ -38,10 +46,10 @@ def main() -> None:
 
     engine = create_platform_engine(settings.platform_app_url)
     session_factory = create_platform_session_factory(engine)
-    # 串行执行一次只占一条连接；语句超时沿用治理配置。
+    # 本地并发与执行线程池对齐：一次最多同时执行 worker_max_concurrency 条。
     pool = ReadOnlyPool(
         settings.analytics_readonly_dsn,
-        max_size=1,
+        max_size=settings.worker_max_concurrency,
         statement_timeout_ms=settings.query_statement_timeout_ms,
     )
 
@@ -52,7 +60,12 @@ def main() -> None:
 
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
-    logger.info("worker %s 启动", worker_id)
+    logger.info(
+        "worker %s 启动（本地并发 %s，全局并发 %s）",
+        worker_id,
+        settings.worker_max_concurrency,
+        settings.global_query_concurrency,
+    )
 
     def beat() -> None:
         # 心跳写入 platform 库：healthcheck 与租约续期共用（ADR-0016/0017）。
@@ -66,11 +79,18 @@ def main() -> None:
             )
             session.commit()
 
-    # 当前执行中的认领；仅 keeper 线程读、主线程写（单槽引用赋值原子）。
-    active: list[queue.Claim | None] = [None]
+    # 本进程在执行的认领：run_id → Claim。主线程写（认领/完成），keeper
+    # 读并清理已失去所有权的项；完成回调也会写——统一由锁保护。
+    active: dict[int, Claim] = {}
+    active_lock = threading.Lock()
+
+    def release_active(claim: Claim) -> None:
+        with active_lock:
+            if active.get(claim.run_id) is claim:
+                del active[claim.run_id]
 
     def keeper() -> None:
-        """心跳 + 活动租约续期。主线程串行执行会阻塞在查询上，
+        """心跳 + 活动租约续期 + 耗尽清扫。执行线程会阻塞在查询上，
         续期必须独立于执行路径，否则长查询期间租约必然过期。"""
         interval = min(
             settings.worker_heartbeat_seconds,
@@ -82,51 +102,83 @@ def main() -> None:
                 return
             try:
                 beat()
-                claim = active[0]
-                if claim is None:
-                    continue
-                if not queue.renew_lease(
-                    session_factory,
-                    claim,
-                    worker_id=worker_id,
-                    lease_seconds=settings.worker_lease_seconds,
-                ):
-                    # 所有权已被接管：停止续期，结果发布自会被 fencing 拒绝。
-                    # 仅在槽内仍是该认领时清空——主线程可能已换入新认领。
+                with active_lock:
+                    claims = list(active.values())
+                for claim in claims:
+                    if queue.renew_lease(
+                        session_factory,
+                        claim,
+                        worker_id=worker_id,
+                        lease_seconds=settings.worker_lease_seconds,
+                    ):
+                        continue
+                    # 所有权已被接管：停止续期，结果处置自会被 fencing 拒绝。
+                    # 不在此移出 active——执行线程仍压着该运行，留在排除
+                    # 集合直到执行线程收尾，避免本进程把刚丢掉的运行抢回
+                    # 与自己的旧执行竞态。
                     logger.warning(
                         "运行 #%s 租约续期被拒绝（已失去所有权）", claim.run_id
                     )
-                    if active[0] is claim:
-                        active[0] = None
+                # 崩溃执行者留下的过期且耗尽运行没有认领路径可走，
+                # 只能由清扫补上终态（幂等，通常 0 行）。宽限取一个
+                # 租约周期：给续期抖动的执行者留复活窗口（ADR-0019）。
+                queue.fail_expired_exhausted(
+                    session_factory, grace_seconds=settings.worker_lease_seconds
+                )
             except Exception:
                 # 单次心跳失败不退出：租约到期前仍有后续续期机会。
                 logger.exception("keeper 心跳/续期失败")
 
     threading.Thread(target=keeper, name="keeper", daemon=True).start()
 
+    executor = ThreadPoolExecutor(
+        max_workers=settings.worker_max_concurrency, thread_name_prefix="exec"
+    )
+
+    def run(claim: Claim) -> None:
+        try:
+            _run_claim(session_factory, pool, settings, claim)
+        finally:
+            release_active(claim)
+
     try:
         while not stop.is_set():
             if queue.worker_paused(session_factory):
-                time.sleep(settings.worker_poll_interval_ms / 1000)
+                stop.wait(settings.worker_poll_interval_ms / 1000)
                 continue
-            claim = queue.claim_next(
-                session_factory,
-                worker_id=worker_id,
-                lease_seconds=settings.worker_lease_seconds,
-            )
-            if claim is None:
-                time.sleep(settings.worker_poll_interval_ms / 1000)
-                continue
-            active[0] = claim
-            _run_claim(session_factory, pool, settings, claim)
-            active[0] = None
+            with active_lock:
+                slots = settings.worker_max_concurrency - len(active)
+                # 自接管排除：不认领自己仍在执行的运行（即使其租约已
+                # 过期——那是本进程的执行线程还压着它，抢回只会自相竞态）。
+                exclude = set(active)
+            claimed = 0
+            while claimed < slots:
+                claim = queue.claim_next(
+                    session_factory,
+                    worker_id=worker_id,
+                    lease_seconds=settings.worker_lease_seconds,
+                    capacity=settings.global_query_concurrency,
+                    exclude_run_ids=exclude,
+                )
+                if claim is None:
+                    break
+                claimed += 1
+                with active_lock:
+                    active[claim.run_id] = claim
+                executor.submit(run, claim)
+            if claimed == 0:
+                # 队列空、全局容量满或本地并发满：按轮询间隔空转。
+                stop.wait(settings.worker_poll_interval_ms / 1000)
     finally:
         pool.close()
         engine.dispose()
+        # 等在执行的运行走完处置路径再退出；语句超时上界（10s）内会
+        # 自然结束，超时由 docker 的 SIGKILL 与接管路径兜底。
+        executor.shutdown(wait=True)
         logger.info("worker %s 退出", worker_id)
 
 
-def _run_claim(session_factory, pool, settings, claim) -> None:
+def _run_claim(session_factory, pool, settings, claim: Claim) -> None:
     logger.info("认领运行 #%s（attempt=%s）", claim.run_id, claim.attempt)
     try:
         conn = pool.acquire()
@@ -135,14 +187,14 @@ def _run_claim(session_factory, pool, settings, claim) -> None:
         finally:
             pool.release(conn)
     except ExecutionFailure as exc:
-        _publish(session_factory, claim, error=(exc.code, exc.message))
+        _handle_failure(session_factory, claim, exc)
         return
     except Exception:
         logger.exception("运行 #%s 执行异常", claim.run_id)
-        _publish(
+        _handle_failure(
             session_factory,
             claim,
-            error=(QY_EXECUTION_ERROR, "查询执行失败，请稍后重试"),
+            ExecutionFailure(QY_EXECUTION_ERROR, "查询执行失败，请稍后重试"),
         )
         return
 
@@ -165,14 +217,24 @@ def _run_claim(session_factory, pool, settings, claim) -> None:
     logger.info("运行 #%s 发布成功（%s 行）", claim.run_id, result.row_count)
 
 
-def _publish(session_factory, claim, *, error: tuple[str, str]) -> None:
-    ok = queue.publish_failure(
-        session_factory, claim, error_code=error[0], error_message=error[1]
+def _handle_failure(session_factory, claim: Claim, exc: ExecutionFailure) -> None:
+    """失败处置走 requeue_or_fail：基础设施类失败自动回队重跑，其余
+    直接终态。未捕获异常按确定性失败处理（保守面：不自动重跑未知故障）。
+    """
+    outcome = queue.requeue_or_fail(
+        session_factory, claim, error_code=exc.code, error_message=exc.message
     )
-    if not ok:
-        logger.warning("运行 #%s 失败发布被 fencing 拒绝", claim.run_id)
+    if outcome == "fenced":
+        logger.warning("运行 #%s 失败处置被 fencing 拒绝", claim.run_id)
+    elif outcome == "requeued":
+        logger.warning(
+            "运行 #%s 基础设施失败（%s），已回队等待第 %s 次执行",
+            claim.run_id,
+            exc.code,
+            claim.attempt + 1,
+        )
     else:
-        logger.info("运行 #%s 发布失败（%s）", claim.run_id, error[0])
+        logger.info("运行 #%s 发布失败（%s）", claim.run_id, exc.code)
 
 
 if __name__ == "__main__":

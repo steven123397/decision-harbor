@@ -4,7 +4,7 @@
 
 容量满时新提交以 `QY_CAPACITY_EXCEEDED` 落为 `failed`——资源繁忙是执行失败，不是策略拒绝，避免用户查询耗尽审计写入能力；连接建立失败映射 `QY_ANALYTICS_UNAVAILABLE`，同样不留 `running` 审计记录。
 
-> **状态：游标与有界池部分仍有效（执行器随迁 worker 进程）。** 信号量闸门与两条容量失败码随 v0.2.0 异步化（ADR-0016）失效：API 进程不再执行用户 SQL，`QY_CAPACITY_EXCEEDED`/`QY_ANALYTICS_UNAVAILABLE` 提交侧失败路径随之删除；全局并发闸门（数据库为唯一事实源）与执行侧容量语义由 #10/#11 重新落地。
+> **状态：游标与有界池部分仍有效（执行器随迁 worker 进程）。** 信号量闸门与两条容量失败码随 v0.2.0 异步化（ADR-0016）失效：API 进程不再执行用户 SQL，`QY_CAPACITY_EXCEEDED`/`QY_ANALYTICS_UNAVAILABLE` 提交侧失败路径随之删除；全局并发闸门（数据库为唯一事实源、跨实例生效）已由 ADR-0019 落地，`QY_ANALYTICS_UNAVAILABLE` 在其中复用为连接类基础设施错误码。
 
 ## 被否方案
 

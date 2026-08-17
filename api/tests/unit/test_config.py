@@ -23,6 +23,10 @@ from app.config import Settings
         ("WORKER_POLL_INTERVAL_MS", "20000"),
         ("RESULT_RETENTION_HOURS", "0"),
         ("RESULT_RETENTION_HOURS", "721"),
+        ("GLOBAL_QUERY_CONCURRENCY", "0"),
+        ("GLOBAL_QUERY_CONCURRENCY", "65"),
+        ("WORKER_MAX_CONCURRENCY", "0"),
+        ("WORKER_MAX_CONCURRENCY", "17"),
     ],
 )
 def test_out_of_range_values_rejected(env_name, value, monkeypatch):
@@ -36,12 +40,16 @@ def test_defaults_and_valid_overrides(monkeypatch):
     assert defaults.query_max_rows == 1_000
     assert defaults.worker_lease_seconds == 30
     assert defaults.result_retention_hours == 24
+    assert defaults.global_query_concurrency == 4
+    assert defaults.worker_max_concurrency == 2
 
     monkeypatch.setenv("WORKER_LEASE_SECONDS", "60")
     monkeypatch.setenv("QUERY_STATEMENT_TIMEOUT_MS", "2500")
+    monkeypatch.setenv("GLOBAL_QUERY_CONCURRENCY", "8")
     settings = Settings()
     assert settings.worker_lease_seconds == 60
     assert settings.query_statement_timeout_ms == 2_500
+    assert settings.global_query_concurrency == 8
 
 
 def test_non_integer_values_rejected(monkeypatch):

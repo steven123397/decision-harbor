@@ -150,7 +150,7 @@ def test_history_pages_stably_by_creation_order():
                 assert r.status_code == 202
                 created.append(r.json()["run"]["id"])
 
-            seen: list[int] = []
+            seen: list[dict] = []
             cursor = None
             while True:
                 url = "/api/v1/query-runs?limit=10"
@@ -160,14 +160,23 @@ def test_history_pages_stably_by_creation_order():
                 assert page.status_code == 200
                 body = page.json()
                 assert {"id", "state", "created_at", "attempt"} <= set(body["runs"][0])
-                seen.extend(run["id"] for run in body["runs"])
+                seen.extend(
+                    {"id": run["id"], "created_at": run["created_at"]}
+                    for run in body["runs"]
+                )
                 cursor = body["next_cursor"]
                 if cursor is None:
                     break
 
-            # created_at 事务时间戳单调不减，双键降序等价于 id 全局降序。
-            assert seen == sorted(set(seen), reverse=True)
-            ours = [run_id for run_id in seen if run_id in set(created)]
+            # 合同是 (created_at, id) 双键降序的稳定分页：无重复、无遗漏、
+            # 键序非升。id 全局降序只是 created_at 单调时的推论——并发
+            # 提交会让事务时间戳与 id 分配交错（created_at 倒挂），持久
+            # 测试库里真实存在这种行，不能作为断言。
+            ids = [run["id"] for run in seen]
+            assert len(ids) == len(set(ids)), "分页不得重复返回同一运行"
+            keys = [(run["created_at"], run["id"]) for run in seen]
+            assert keys == sorted(keys, reverse=True), "分页必须按双键降序稳定推进"
+            ours = [run_id for run_id in ids if run_id in set(created)]
             assert ours == sorted(created, reverse=True)
 
             # 默认 limit 不超过 20

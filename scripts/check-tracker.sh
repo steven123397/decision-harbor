@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# 校验 GitHub Issues 的结构一致性：正文声明的依赖必须有原生 blocked-by 边，
-# sub-issue 的 Parent 必须真实挂载。/to-tickets、/wayfinder 发布后运行本脚本。
+# 校验 GitHub Issues 的结构一致性：正文 "## Blocked by" 声明与原生 blocked-by 边
+# 双向一致，sub-issue 的 Parent 必须真实挂载。/to-tickets、/wayfinder 发布后运行本脚本。
 # 用法：scripts/check-tracker.sh [issue 编号...]（缺省检查全部 open issue）
 set -uo pipefail
 
@@ -46,8 +46,13 @@ for n in "${issues[@]}"; do
       [[ ",$v," == *",$x,"* ]] || ok="缺边 #$n←#$x"
     done
   fi
-  # 原生有、正文没有 → 信息漂移（警告级）
-  if [ -n "$v" ] && [ -z "$d" ]; then ok="$ok (正文未声明但有原生边)"; fi
+  # 反向逐项比对：每条原生边都应在正文声明，否则正文已过期（信息漂移）
+  if [ -n "$v" ]; then
+    for y in ${v//,/ }; do
+      [ -n "$y" ] || continue
+      [[ ",$d," == *",$y,"* ]] || ok="$ok; 正文缺 #$y"
+    done
+  fi
   echo "#$n | ${d:--} | ${v:--} | $ok"
   [ "$ok" != yes ] && fail=1
 done

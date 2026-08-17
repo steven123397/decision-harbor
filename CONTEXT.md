@@ -10,9 +10,36 @@
 一次查询提交的完整生命周期，从系统收到 SQL 到落入终态。
 _Avoid_: 查询任务、执行记录
 
-**终态（succeeded / rejected / failed）**:
-succeeded 指策略通过且执行成功；rejected 指策略判定不通过；failed 指策略通过但执行出错。三者互斥且不可再转移。
-_Avoid_: 把 rejected 与 failed 混称「失败」
+**中间态（received / queued / running / cancelling）**:
+received 指已受理未入队；queued 指已进入后台执行队列；running 指执行者已认领并执行；cancelling 指取消请求已受理、正在与执行结果竞争终态。中间态可被接管与取消，不是可观察的稳定状态。
+_Avoid_: 把 received 与 queued 混称「排队」
+
+**终态（succeeded / rejected / failed / cancelled）**:
+succeeded 指策略通过且执行成功；rejected 指策略判定不通过；failed 指策略通过但执行出错；cancelled 指取消事实在终态发布前获胜。四者互斥且不可再转移。
+_Avoid_: 把 rejected 与 failed 混称「失败」、把 cancelled 混入执行失败
+
+**尝试（attempt）**:
+单次运行内第几次实际执行，从 1 计数；执行者崩溃被接管后的重新执行同样递增，硬上界 3。
+_Avoid_: 重试次数（retry 是用户动作）
+
+**重试关系（retry_of）**:
+用户对 failed 或 cancelled 运行发起重试时，新运行指向原运行的关系；重试创建新运行，不复活原运行。
+
+**执行租约（lease）**:
+执行者认领运行时写入的 ownership 凭据（worker_id + lease_expires_at），到期未续期即视为失去所有权，其他执行者可接管。
+_Avoid_: 锁
+
+**代（generation）**:
+随认领/接管递增的运行版本号；终态发布与取消生效都携带它做 fencing，失去所有权的旧执行者因代过期无法发布结果。
+_Avoid_: 版本号（泛指时）
+
+**结果快照（result snapshot）**:
+成功终态发布时与终态同事务写入的有限结果（列、行、行数、截断标记）；读取快照不重新执行 SQL。
+_Avoid_: 结果缓存
+
+**保留期（retention window）**:
+结果快照自终态发布时间起保存 24 小时；过期后快照不可读，运行审计继续保留。
+_Avoid_: TTL（泛指时）
 
 **拒绝码（rejection code）**:
 策略判定不通过时给出的稳定标识，回答「为什么不允许这样查」。
@@ -23,7 +50,7 @@ _Avoid_: 错误码
 _Avoid_: 拒绝码
 
 **截断（truncated）**:
-结果达到行数上限时停止取数并显式标记的部分结果语义；截断结果不是完整结果。
+结果达到行数或字节上限时停止取数并显式标记的部分结果语义；截断结果不是完整结果。
 _Avoid_: 限流、部分失败
 
 ### 治理与执行

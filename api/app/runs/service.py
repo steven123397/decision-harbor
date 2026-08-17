@@ -30,7 +30,7 @@ class QueryRunService:
     def submit(self, sql: str, idempotency_key: str | None = None) -> dict:
         """受理提交，outcome ∈ accepted / rejected / replayed / conflict。
 
-        键的判定先于策略判定（ADR-0017）：唯一索引保证一个键终身只绑定
+        键的判定先于策略判定（ADR-0018）：唯一索引保证一个键终身只绑定
         一条运行记录，重放与冲突是「键已绑定什么」的事实问题——被拒绝
         的原运行同样按重放返回，不存在「同键再建一条」的路径。
         """

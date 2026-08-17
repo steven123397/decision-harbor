@@ -67,7 +67,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
 
 def invalid_query_param_handler(_: Request, exc: InvalidQueryParam) -> JSONResponse:
-    """查询参数非法与请求体非法共用 {"error": ...} 400 信封（ADR-0017）。"""
+    """查询参数非法与请求体非法共用 {"error": ...} 400 信封（ADR-0018）。"""
     return JSONResponse(status_code=400, content={"error": exc.detail})
 
 

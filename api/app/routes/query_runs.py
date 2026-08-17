@@ -1,4 +1,4 @@
-"""HTTP 端点。状态码语义见 ADR-0017：读 200 携带 outcome、202 受理、
+"""HTTP 端点。状态码语义见 ADR-0018：读 200 携带 outcome、202 受理、
 422 策略拒绝、409 生命周期转移冲突（幂等冲突、结果未就绪）。"""
 
 from __future__ import annotations
@@ -45,7 +45,7 @@ class QueryRunCreate(BaseModel):
 @router.post("/api/v1/query-runs")
 def create_query_run(payload: QueryRunCreate, request: Request):
     """合法输入立即受理（202）；策略拒绝同步落定（422），不入队；同键同
-    SQL 重放返回原运行（200）；同键异 SQL 是转移冲突（409，ADR-0017）。"""
+    SQL 重放返回原运行（200）；同键异 SQL 是转移冲突（409，ADR-0018）。"""
     service: QueryRunService = request.app.state.runs
     outcome = service.submit(payload.sql, idempotency_key=payload.idempotency_key)
     if outcome["outcome"] == "rejected":

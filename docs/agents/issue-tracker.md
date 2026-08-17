@@ -11,6 +11,7 @@
 - **评论**：`gh issue comment <number> --body "..."`
 - **加 / 去标签**：`gh issue edit <number> --add-label "..."` / `--remove-label "..."`
 - **关闭**：`gh issue close <number> --comment "..."`
+- **关票三步（必做）**：工单关闭前 ① 把正文 `## Acceptance criteria` 选框逐条勾选（`gh issue view --json body` 拉原文改 `[ ]` → `[x]` 后 `--body-file` 写回）；② 运行 `scripts/check-tracker.sh <number>` 确认无 FAIL（含已关闭工单的选框核对——评论里的证据不能替代正文选框，正文才是事实源）；③ 再 `gh issue close`。顺序不可倒置：先关票后补选框会被脚本判 FAIL，也曾真实漏过（#8）。
 - **评论是通知，不是修订**：范围收窄、结论更新等事实变更必须用 `edit` 落到标题与正文；评论区可留决策过程，issue 的事实状态以正文为准。
 
 仓库从 `git remote -v` 推断；`gh` 在 clone 内自动生效。

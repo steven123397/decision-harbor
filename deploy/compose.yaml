@@ -55,14 +55,14 @@ services:
       - "${API_PORT:-8081}:8000"
     restart: unless-stopped
 
-  # 后台执行组件：认领 queued 运行，以只读身份执行，原子发布终态+快照。
-  # 与 API 同镜像不同入口（ADR-0016）；串行执行，多实例协同见 #10/#11。
-  worker:
+  # 后台执行组件 ×2：SKIP LOCKED 协同消费同一队列，租约过期互相接管（ADR-0017）。
+  # 与 API 同镜像不同入口（ADR-0016）；全局并发闸门与自动重试见 #11。
+  worker-1: &worker
     build:
       context: ..
       dockerfile: api/Dockerfile
     command: ["python", "-m", "app.worker"]
-    environment:
+    environment: &worker-env
       PLATFORM_APP_URL: postgresql+psycopg://platform_app:platform_app@db:5432/platform
       ANALYTICS_READONLY_DSN: postgresql://analytics_readonly:analytics_readonly@db:5432/analytics
       WORKER_ID: worker-1
@@ -72,13 +72,22 @@ services:
       init:
         condition: service_completed_successfully
     # worker 无 HTTP 端口：健康 = platform 库里的心跳标记仍新鲜。
-    healthcheck:
+    healthcheck: &worker-healthcheck
       test: ["CMD", "python", "-m", "app.worker_healthcheck", "worker-1", "60"]
       interval: 5s
       timeout: 3s
       retries: 12
       start_period: 15s
     restart: unless-stopped
+
+  worker-2:
+    <<: *worker
+    environment:
+      <<: *worker-env
+      WORKER_ID: worker-2
+    healthcheck:
+      <<: *worker-healthcheck
+      test: ["CMD", "python", "-m", "app.worker_healthcheck", "worker-2", "60"]
 
   web:
     build:

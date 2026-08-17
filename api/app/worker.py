@@ -1,8 +1,10 @@
 """后台执行组件入口：认领 queued 运行，以只读身份执行，原子发布终态+快照。
 
-单进程串行执行（一次一条）；多实例协同、租约接管与全局并发闸门在
-后继工单（#10/#11）落地。治理已在受理时同步完成，worker 信任队列
-里的 SQL 均通过策略判定，但仍只持分析只读身份执行。
+多实例协同：SKIP LOCKED 认领互不重复，租约过期后被其他执行者接管
+（ADR-0017）；执行期间由守护线程心跳续期，健康执行者的长查询不会
+因租约到期被误接管。全局并发闸门与自动重试在后继工单（#11）落地。
+治理已在受理时同步完成，worker 信任队列里的 SQL 均通过策略判定，
+但仍只持分析只读身份执行。
 """
 
 from __future__ import annotations
@@ -10,6 +12,7 @@ from __future__ import annotations
 import logging
 import os
 import signal
+import threading
 import time
 import uuid
 
@@ -42,18 +45,17 @@ def main() -> None:
         statement_timeout_ms=settings.query_statement_timeout_ms,
     )
 
-    stop = False
+    stop = threading.Event()
 
     def request_stop(signum, frame) -> None:
-        nonlocal stop
-        stop = True
+        stop.set()
 
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
     logger.info("worker %s 启动", worker_id)
 
     def beat() -> None:
-        # 心跳写入 platform 库：healthcheck 与后续租约续期（#10）共用。
+        # 心跳写入 platform 库：healthcheck 与租约续期共用（ADR-0016/0017）。
         with session_factory() as session:
             session.execute(
                 text(
@@ -64,13 +66,46 @@ def main() -> None:
             )
             session.commit()
 
-    last_beat = 0.0
-    try:
-        while not stop:
-            now = time.monotonic()
-            if now - last_beat >= settings.worker_heartbeat_seconds:
+    # 当前执行中的认领；仅 keeper 线程读、主线程写（单槽引用赋值原子）。
+    active: list[queue.Claim | None] = [None]
+
+    def keeper() -> None:
+        """心跳 + 活动租约续期。主线程串行执行会阻塞在查询上，
+        续期必须独立于执行路径，否则长查询期间租约必然过期。"""
+        interval = min(
+            settings.worker_heartbeat_seconds,
+            max(1, settings.worker_lease_seconds // 3),
+        )
+        while not stop.is_set():
+            stop.wait(interval)
+            if stop.is_set():
+                return
+            try:
                 beat()
-                last_beat = now
+                claim = active[0]
+                if claim is None:
+                    continue
+                if not queue.renew_lease(
+                    session_factory,
+                    claim,
+                    worker_id=worker_id,
+                    lease_seconds=settings.worker_lease_seconds,
+                ):
+                    # 所有权已被接管：停止续期，结果发布自会被 fencing 拒绝。
+                    # 仅在槽内仍是该认领时清空——主线程可能已换入新认领。
+                    logger.warning(
+                        "运行 #%s 租约续期被拒绝（已失去所有权）", claim.run_id
+                    )
+                    if active[0] is claim:
+                        active[0] = None
+            except Exception:
+                # 单次心跳失败不退出：租约到期前仍有后续续期机会。
+                logger.exception("keeper 心跳/续期失败")
+
+    threading.Thread(target=keeper, name="keeper", daemon=True).start()
+
+    try:
+        while not stop.is_set():
             if queue.worker_paused(session_factory):
                 time.sleep(settings.worker_poll_interval_ms / 1000)
                 continue
@@ -82,7 +117,9 @@ def main() -> None:
             if claim is None:
                 time.sleep(settings.worker_poll_interval_ms / 1000)
                 continue
+            active[0] = claim
             _run_claim(session_factory, pool, settings, claim)
+            active[0] = None
     finally:
         pool.close()
         engine.dispose()

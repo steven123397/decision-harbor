@@ -74,10 +74,12 @@ def claim_next(
     lease_seconds: int,
     run_id: int | None = None,
 ) -> Claim | None:
-    """认领最早的 queued 运行：写租约、递增 generation、转入 running。
+    """认领最早的可执行运行：写租约、递增 generation、转入 running。
 
-    FOR UPDATE SKIP LOCKED 使多个执行者并发认领时不争抢同一行；
-    run_id 过滤仅供测试定位特定运行。未认领到则返回 None。
+    可执行 = queued，或 running 且租约已过期（接管：原执行者失去
+    所有权，接管者递增 attempt 重新执行）。FOR UPDATE SKIP LOCKED 使
+    多个执行者并发认领时不争抢同一行；run_id 过滤仅供测试定位特定
+    运行。未认领到则返回 None。
     """
     with session_factory() as session:
         # run_id 过滤在客户端拼接：参数化 NULL 判断会触发
@@ -85,26 +87,70 @@ def claim_next(
         filter_clause = "AND id = :rid" if run_id is not None else ""
         row = session.execute(
             text(
-                "SELECT id, sql, attempt, generation FROM query_runs "
-                f"WHERE state = 'queued' {filter_clause} "
+                "SELECT id, sql, attempt, generation, state FROM query_runs "
+                "WHERE (state = 'queued' OR (state = 'running' "
+                f"AND lease_expires_at <= now())) {filter_clause} "
                 "ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED"
             ),
             {"rid": run_id} if run_id is not None else {},
         ).fetchone()
         if row is None:
             return None
+        # 接管（原 state=running）按 CONTEXT.md「尝试」语义递增 attempt；
+        # 首次认领保持 attempt 不变。行已被锁定，state 不会并发漂移。
+        takeover_bump = 1 if row.state == "running" else 0
         session.execute(
             text(
                 "UPDATE query_runs SET state = 'running', worker_id = :worker, "
                 "lease_expires_at = now() + make_interval(secs => :lease), "
-                "generation = generation + 1, started_at = now() WHERE id = :id"
+                "generation = generation + 1, attempt = attempt + :bump, "
+                "started_at = now() WHERE id = :id"
             ),
-            {"worker": worker_id, "lease": lease_seconds, "id": row.id},
+            {
+                "worker": worker_id,
+                "lease": lease_seconds,
+                "bump": takeover_bump,
+                "id": row.id,
+            },
         )
         session.commit()
         return Claim(
-            run_id=row.id, sql=row.sql, attempt=row.attempt, generation=row.generation + 1
+            run_id=row.id,
+            sql=row.sql,
+            attempt=row.attempt + takeover_bump,
+            generation=row.generation + 1,
         )
+
+
+def renew_lease(
+    session_factory: sessionmaker[Session],
+    claim: Claim,
+    *,
+    worker_id: str,
+    lease_seconds: int,
+) -> bool:
+    """租约心跳续期：仍持有所有权（worker + generation + running）才生效。
+
+    返回 False 表示执行者已失去所有权（租约过期被接管），调用方应
+    停止续期；其后的终态发布同样会被 generation fencing 拒绝。
+    """
+    with session_factory() as session:
+        updated = session.execute(
+            text(
+                "UPDATE query_runs SET "
+                "lease_expires_at = now() + make_interval(secs => :lease) "
+                "WHERE id = :id AND state = 'running' AND worker_id = :worker "
+                "AND generation = :gen"
+            ),
+            {
+                "id": claim.run_id,
+                "gen": claim.generation,
+                "worker": worker_id,
+                "lease": lease_seconds,
+            },
+        ).rowcount
+        session.commit()
+        return updated == 1
 
 
 def publish_success(

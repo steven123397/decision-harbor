@@ -13,6 +13,10 @@
 
 仓库从 `git remote -v` 推断；`gh` 在 clone 内自动生效。
 
+## 发布校验（必做）
+
+`/to-tickets`、`/wayfinder` 或任何批量创建 ticket 的操作完成后，**必须**运行 `scripts/check-tracker.sh` 校验结构一致性：正文 `## Blocked by` 段声明的每条依赖都要有原生 blocked-by 边，`## Parent` 声明的父 issue 必须真实挂载 sub-issue。脚本退出码非 0 即有缺失，按输出补边（注意 `dependencies/blocked_by` 端点要的是数据库 id，不是 issue 编号）。正文写了边而原生边缺失是已知风险——写正文总会成功，建边调用可能静默失败。
+
 ## Pull request 作为分流入口
 
 **PR 作为请求入口：否。**（若今后要把外部 PR 当作功能请求进入分流队列，把此项改为 `yes`，`/triage` 会读取该标志。）

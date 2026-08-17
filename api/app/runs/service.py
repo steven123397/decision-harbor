@@ -39,7 +39,14 @@ class QueryRunService:
         self._session_factory = session_factory
         self._readonly_dsn = readonly_dsn
         self._statement_timeout_ms = statement_timeout_ms
-        self._pool: ReadOnlyPool | None = None
+        # 池在构造时创建：池对象本身不建立连接（连接在首次 acquire 时
+        # 才惰性建立，单元测试不触库），却消除多线程首请求的竞态——
+        # 惰性赋值会让并发请求各自建池、acquire/release 落到不同实例。
+        self._pool = ReadOnlyPool(
+            readonly_dsn,
+            max_size=max_concurrency,
+            statement_timeout_ms=statement_timeout_ms,
+        )
         self._max_rows = max_rows
         self._limits = PolicyLimits(sql_max_length=sql_max_length)
         self._allowed_tables = allowed_tables
@@ -47,21 +54,9 @@ class QueryRunService:
         self._capacity_wait_seconds = capacity_wait_seconds
         self.max_concurrency = max_concurrency
 
-    @property
-    def _readonly_pool(self) -> ReadOnlyPool:
-        # 惰性建立：集成环境首次执行时才连数据库，单元测试可整体绕开。
-        if self._pool is None:
-            self._pool = ReadOnlyPool(
-                self._readonly_dsn,
-                max_size=self.max_concurrency,
-                statement_timeout_ms=self._statement_timeout_ms,
-            )
-        return self._pool
-
     # 供测试与 main 关闭时调用
     def close(self) -> None:
-        if self._pool is not None:
-            self._pool.close()
+        self._pool.close()
 
     def submit(self, sql: str) -> dict:
         """同步执行完整链路，返回统一 envelope（见 docs/design/api.md）。"""
@@ -89,8 +84,9 @@ class QueryRunService:
             return {"outcome": STATE_FAILED, "run": run_to_dict(run)}
 
         try:
+            pool = self._pool  # 固定实例：acquire 与 release 必须落在同一个池上
             try:
-                conn = self._readonly_pool.acquire()
+                conn = pool.acquire()
             except Exception:
                 run = self._finalize(
                     run_id,
@@ -119,7 +115,7 @@ class QueryRunService:
                 )
                 return {"outcome": STATE_FAILED, "run": run_to_dict(run)}
             finally:
-                self._readonly_pool.release(conn)
+                pool.release(conn)
         finally:
             self._capacity.release()
 

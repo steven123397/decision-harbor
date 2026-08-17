@@ -57,14 +57,13 @@ class ReadOnlyPool:
                 conn.rollback()
             except psycopg.Error:
                 healthy = False
-        with self._cond:
-            try:
-                if healthy:
-                    self._idle.append(conn)
-                else:
-                    self._created -= 1
-            finally:
+        if healthy:
+            with self._cond:
+                self._idle.append(conn)
                 self._cond.notify()
+        else:
+            # 不健康的连接必须关闭底层 socket，只减计数会泄漏连接。
+            self.discard(conn)
 
     def discard(self, conn: psycopg.Connection) -> None:
         try:

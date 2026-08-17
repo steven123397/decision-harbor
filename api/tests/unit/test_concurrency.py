@@ -129,6 +129,78 @@ def test_submit_rejects_when_capacity_exhausted():
     assert pool.acquired == 2
 
 
+def test_pool_created_once_and_shared_under_concurrency():
+    """并发首请求只创建一个池，acquire/release 全部落在同一实例上。
+
+    回归：惰性赋值会让多个线程各自建池，acquire 与 release 读到
+    不同实例，导致计数失真与 close() 遗漏。
+    """
+    created = []
+
+    class _TrackingPool:
+        def __init__(self, *args, **kwargs):
+            created.append(self)
+            self.acquires = 0
+            self.releases = 0
+
+        def acquire(self):
+            self.acquires += 1
+            return object()
+
+        def release(self, conn):
+            self.releases += 1
+
+        def close(self):
+            pass
+
+    class _FakeResult:
+        columns = []
+        rows = []
+        row_count = 0
+        truncated = False
+        duration_ms = 1
+
+    def fake_finalize(self, run_id, **fields):
+        class R:
+            pass
+
+        r = R()
+        r.id = run_id
+        r.state = fields.get("state")
+        r.sql = "SELECT"
+        r.rejection_code = fields.get("rejection_code")
+        r.rejection_message = fields.get("rejection_message")
+        r.row_count = fields.get("row_count")
+        r.truncated = False
+        r.duration_ms = fields.get("duration_ms")
+        r.error_code = fields.get("error_code")
+        r.error_message = fields.get("error_message")
+        r.created_at = None
+        r.finished_at = None
+        return r
+
+    with (
+        patch("app.runs.service.ReadOnlyPool", _TrackingPool),
+        patch.object(QueryRunService, "_evaluate", lambda self, sql: _Decision()),
+        patch.object(QueryRunService, "_create_run", lambda self, sql: 1),
+        patch.object(QueryRunService, "_finalize", fake_finalize),
+        patch.object(QueryRunService, "_execute", lambda self, sql, conn: _FakeResult()),
+    ):
+        service = _make_service(max_concurrency=4, capacity_wait_seconds=0.5)
+        threads = [
+            threading.Thread(target=lambda i=i: service.submit(f"SELECT {i}"))
+            for i in range(8)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
+
+    assert len(created) == 1
+    assert created[0].acquires == 8
+    assert created[0].releases == 8
+
+
 def test_submit_maps_acquire_failure_to_stable_failed():
     """连接建立失败映射为稳定失败码，不抛异常、不留 running 记录。"""
     service = _make_service(max_concurrency=2, capacity_wait_seconds=0.1)

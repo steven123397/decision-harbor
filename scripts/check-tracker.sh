@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # 校验 GitHub Issues 的结构一致性：正文 "## Blocked by" 声明与原生 blocked-by 边
-# 双向一致，sub-issue 的 Parent 必须真实挂载。/to-tickets、/wayfinder 发布后运行本脚本。
-# 用法：scripts/check-tracker.sh [issue 编号...]（缺省检查全部 open issue）
+# 双向一致，sub-issue 的 Parent 必须真实挂载，已关闭工单的验收选框必须全部勾选。
+# /to-tickets、/wayfinder 发布后与工单关闭后运行本脚本。
+# 用法：scripts/check-tracker.sh [issue 编号...]（缺省检查全部 open issue；
+# 关闭工单验收选框核对始终覆盖全部 closed issue，不受编号参数影响）
 set -uo pipefail
 
 REPO=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
@@ -67,5 +69,29 @@ for n in "${issues[@]}"; do
   subs=$(retry gh api "repos/$REPO/issues/$parent/sub_issues" --jq '[.[].number] | index('"$n"') != null')
   [ "$subs" = true ] && echo "#$n → parent #$parent : OK" || { echo "#$n → parent #$parent : 未挂载"; fail=1; }
 done
+
+# 已关闭工单的验收选框：状态说完成、正文却说未完成，即结构不一致。
+# wontfix / duplicate / invalid 关闭的票没做工作是正常结局，豁免。
+echo
+echo "已关闭工单验收选框核对："
+mapfile -t closed_rows < <(retry gh issue list --repo "$REPO" --state closed --limit 200 --json number,labels --jq '.[] | "\(.number)\t\([.labels[].name] | join(","))"' || true)
+if [ ${#closed_rows[@]} -eq 0 ]; then
+  echo "no closed issues"
+else
+  for row in "${closed_rows[@]}"; do
+    n=${row%%$'\t'*}
+    labels=${row#*$'\t'}
+    [[ ",$labels," == *",wontfix,"* || ",$labels," == *",duplicate,"* || ",$labels," == *",invalid,"* ]] \
+      && { echo "#$n | 豁免（$labels）"; continue; }
+    body=$(retry gh issue view "$n" --repo "$REPO" --json body --jq .body) || { echo "ERR: 无法读取 #$n"; fail=1; continue; }
+    unticked=$(awk '/^## Acceptance criteria/{f=1;next} /^## /{f=0} f' <<<"$body" | grep -cE '^[[:space:]]*- \[ \]' || true)
+    if [ "${unticked:-0}" -gt 0 ]; then
+      echo "#$n | ${unticked} 个未勾选 | FAIL"
+      fail=1
+    else
+      echo "#$n | OK"
+    fi
+  done
+fi
 
 exit $fail

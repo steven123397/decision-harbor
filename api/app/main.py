@@ -6,13 +6,14 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from app.config import Settings, get_settings
 from app.db import create_platform_engine, create_platform_session_factory
 from app.readiness import Readiness
+from app.routes.query_runs import InvalidQueryParam
 from app.routes.query_runs import (
     invalid_request_handler as invalid_request,
 )
@@ -49,6 +50,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="DecisionHarbor API", lifespan=lifespan)
     app.include_router(query_runs_router)
     app.add_exception_handler(RequestValidationError, invalid_request)
+    app.add_exception_handler(InvalidQueryParam, invalid_query_param_handler)
 
     @app.get("/health")
     def health():
@@ -62,6 +64,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {"status": "ready"}
 
     return app
+
+
+def invalid_query_param_handler(_: Request, exc: InvalidQueryParam) -> JSONResponse:
+    """查询参数非法与请求体非法共用 {"error": ...} 400 信封（ADR-0018）。"""
+    return JSONResponse(status_code=400, content={"error": exc.detail})
 
 
 app = create_app()

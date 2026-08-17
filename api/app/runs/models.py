@@ -92,6 +92,8 @@ def run_to_dict(run: QueryRun) -> dict:
         "id": run.id,
         "state": run.state,
         "sql": run.sql,
+        "attempt": run.attempt,
+        "idempotency_key": run.idempotency_key,
         "rejection_code": run.rejection_code,
         "rejection_message": run.rejection_message,
         "row_count": run.row_count,

@@ -1,17 +1,37 @@
-import { useState } from "react";
-import { submitSql, ViewState } from "./api";
+import { useEffect, useRef, useState } from "react";
+import { pollOnce, submitSql, ViewState } from "./api";
+
+const POLL_INTERVAL_MS = 500;
 
 export default function Workbench() {
   const [sql, setSql] = useState("");
   const [view, setView] = useState<ViewState>({ kind: "idle" });
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const busy = view.kind === "running";
+
+  useEffect(() => () => {
+    if (timer.current) clearTimeout(timer.current);
+  }, []);
 
   async function onSubmit(event: React.FormEvent) {
     event.preventDefault();
     if (!sql.trim() || busy) return;
+    if (timer.current) clearTimeout(timer.current);
     setView({ kind: "running" });
-    setView(await submitSql(sql));
+    const { view: afterSubmit, runId } = await submitSql(sql);
+    setView(afterSubmit);
+    if (runId !== null && afterSubmit.kind === "running") {
+      schedulePoll(runId);
+    }
+  }
+
+  function schedulePoll(runId: number) {
+    timer.current = setTimeout(async () => {
+      const next = await pollOnce(runId);
+      setView(next);
+      if (next.kind === "running") schedulePoll(runId);
+    }, POLL_INTERVAL_MS);
   }
 
   return (

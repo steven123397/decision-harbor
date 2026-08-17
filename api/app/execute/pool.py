@@ -1,7 +1,7 @@
 """只读执行连接池：有界、复用、带会话级超时设置。
 
-设计承诺（docs/design/query-governance.md）：
-只读执行使用独立小连接池（默认上限 5），与平台写入隔离。
+设计承诺（ADR-0005/0007）：
+只读执行使用独立小连接池，与平台写入隔离。
 """
 
 from __future__ import annotations

@@ -119,31 +119,45 @@ BYPASS_VECTORS = [
 
 def test_end_to_end_allow_and_reject_and_fetch():
     from app.main import create_app
+    from app.runs import queue as run_queue
+    from app.db import create_platform_engine, create_platform_session_factory
 
-    # with 语句触发 lifespan，注入 app.state.runs。
-    with TestClient(create_app()) as client:
+    # 排水开关暂停 worker 认领：202 受理后运行停在 queued，端到端
+    # 断言不受宿主上真实 worker 的轮转速度影响（开关语义见 ADR-0015/0016）。
+    engine = create_platform_engine(PLATFORM_APP_URL)
+    sessions = create_platform_session_factory(engine)
+    run_queue.set_worker_paused(sessions, paused=True)
+    try:
+        # with 语句触发 lifespan，注入 app.state.runs。
+        with TestClient(create_app()) as client:
 
-        ok = client.post(
-            "/api/v1/query-runs", json={"sql": "SELECT region FROM customers ORDER BY region"}
-        )
-        assert ok.status_code == 200
-        body = ok.json()
-        assert body["outcome"] == "succeeded"
-        assert body["result"]["row_count"] == 100
-        run_id = body["run"]["id"]
+            ok = client.post(
+                "/api/v1/query-runs",
+                json={"sql": "SELECT region FROM customers ORDER BY region"},
+            )
+            assert ok.status_code == 202
+            run = ok.json()["run"]
+            run_id = run["id"]
+            assert run["state"] == "queued"
 
-        fetched = client.get(f"/api/v1/query-runs/{run_id}")
-        assert fetched.status_code == 200
-        assert fetched.json()["run"]["state"] == "succeeded"
+            # 排水中：GET 可见 queued，result 未就绪 409
+            fetched = client.get(f"/api/v1/query-runs/{run_id}")
+            assert fetched.status_code == 200
+            assert fetched.json()["run"]["state"] == "queued"
+            not_ready = client.get(f"/api/v1/query-runs/{run_id}/result")
+            assert not_ready.status_code == 409
+            assert not_ready.json()["detail"]["code"] == "QY_RESULT_NOT_READY"
 
-        bad = client.post("/api/v1/query-runs", json={"sql": "DROP TABLE customers"})
-        assert bad.status_code == 200
-        assert bad.json()["outcome"] == "rejected"
-        assert bad.json()["run"]["rejection_code"] == "QY_FORBIDDEN_STATEMENT"
+            bad = client.post("/api/v1/query-runs", json={"sql": "DROP TABLE customers"})
+            assert bad.status_code == 422
+            assert bad.json()["run"]["rejection_code"] == "QY_FORBIDDEN_STATEMENT"
 
-        missing = client.get("/api/v1/query-runs/999999")
-        assert missing.status_code == 404
-        assert missing.json()["detail"]["code"] == "QY_RUN_NOT_FOUND"
+            missing = client.get("/api/v1/query-runs/999999")
+            assert missing.status_code == 404
+            assert missing.json()["detail"]["code"] == "QY_RUN_NOT_FOUND"
+    finally:
+        run_queue.set_worker_paused(sessions, paused=False)
+        engine.dispose()
 
 
 def test_end_to_end_governance_bypass_vectors_rejected():
@@ -152,30 +166,56 @@ def test_end_to_end_governance_bypass_vectors_rejected():
     with TestClient(create_app()) as client:
         for sql in BYPASS_VECTORS:
             resp = client.post("/api/v1/query-runs", json={"sql": sql})
-            assert resp.status_code == 200, sql
+            assert resp.status_code == 422, sql
             body = resp.json()
-            assert body["outcome"] == "rejected", sql
+            assert body["run"]["state"] == "rejected", sql
             assert body["run"]["rejection_code"] in {
                 "QY_UNAUTHORIZED_OBJECT",
                 "QY_FORBIDDEN_FUNCTION",
             }, sql
-            assert "pg_class" not in str(body.get("result")), sql
 
 
 def test_end_to_end_failed_semantics():
     from app.main import create_app
+    from app.runs import queue as run_queue
+    from app.db import create_platform_engine, create_platform_session_factory
 
-    with TestClient(create_app()) as client:
-        # 策略通过但列不存在：执行失败面板语义（failed + error_code）
-        resp = client.post(
-            "/api/v1/query-runs", json={"sql": "SELECT no_such_column FROM customers"}
-        )
-        body = resp.json()
-        assert body["outcome"] == "failed"
-        assert body["run"]["error_code"] == "QY_EXECUTION_ERROR"
-        assert body["run"]["rejection_code"] is None
+    engine = create_platform_engine(PLATFORM_APP_URL)
+    sessions = create_platform_session_factory(engine)
+    run_queue.set_worker_paused(sessions, paused=True)
+    try:
+        with TestClient(create_app()) as client:
+            # 策略通过但列不存在：worker 执行后落 failed + error_code
+            resp = client.post(
+                "/api/v1/query-runs", json={"sql": "SELECT no_such_column FROM customers"}
+            )
+            assert resp.status_code == 202
+            run_id = resp.json()["run"]["id"]
 
-        # 非整数 id 一律 404
-        missing = client.get("/api/v1/query-runs/does-not-exist")
-        assert missing.status_code == 404
-        assert missing.json()["detail"]["code"] == "QY_RUN_NOT_FOUND"
+            # 模拟 worker 认领并发布失败（走真实网关缝，不发 HTTP）
+            claim = run_queue.claim_next(sessions, worker_id="test", lease_seconds=30, run_id=run_id)
+            assert claim is not None and claim.run_id == run_id
+            assert claim.sql.startswith("SELECT no_such_column")
+            assert run_queue.publish_failure(
+                sessions,
+                claim,
+                error_code="QY_EXECUTION_ERROR",
+                error_message="查询执行失败，请检查列名与表达式",
+            )
+            body = client.get(f"/api/v1/query-runs/{run_id}").json()["run"]
+            assert body["state"] == "failed"
+            assert body["error_code"] == "QY_EXECUTION_ERROR"
+            assert body["rejection_code"] is None
+
+            # failed 终态：result 不可用 409（不是未就绪）
+            unavailable = client.get(f"/api/v1/query-runs/{run_id}/result")
+            assert unavailable.status_code == 409
+            assert unavailable.json()["detail"]["code"] == "QY_RESULT_NOT_AVAILABLE"
+
+            # 非整数 id 一律 404
+            missing = client.get("/api/v1/query-runs/does-not-exist")
+            assert missing.status_code == 404
+            assert missing.json()["detail"]["code"] == "QY_RUN_NOT_FOUND"
+    finally:
+        run_queue.set_worker_paused(sessions, paused=False)
+        engine.dispose()

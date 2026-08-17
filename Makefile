@@ -1,4 +1,4 @@
-# DecisionHarbor 本地运行与测试入口（语义见 docs/design/testing.md）。
+# DecisionHarbor 本地运行与测试入口（测试分层语义见 ADR-0004）。
 
 COMPOSE_FILE := deploy/compose.yaml
 API_PORT ?= 8081

@@ -2,7 +2,7 @@
 
 迁移与 seed 使用高权限身份，但只存在于一次性 init 服务中；
 API 服务进程自始至终只持有 platform_app 与 analytics_readonly
-（见 docs/design/architecture.md 引导决策）。
+（引导决策见 ADR-0002）。
 """
 
 from __future__ import annotations

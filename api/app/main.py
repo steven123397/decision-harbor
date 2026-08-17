@@ -37,17 +37,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             platform_engine, settings.analytics_readonly_dsn, facts.marker_key, facts.tables
         )
         app.state.readiness = readiness
+        # API 进程只受理与读状态，不执行用户 SQL（ADR-0016）。
         app.state.runs = QueryRunService(
             session_factory,
-            readonly_dsn=settings.analytics_readonly_dsn,
-            statement_timeout_ms=settings.query_statement_timeout_ms,
-            max_rows=settings.query_max_rows,
-            sql_max_length=settings.query_sql_max_length,
             allowed_tables=contract_tables(dataset_dir),
-            max_concurrency=settings.query_max_concurrency,
+            sql_max_length=settings.query_sql_max_length,
         )
         yield
-        app.state.runs.close()
         platform_engine.dispose()
 
     app = FastAPI(title="DecisionHarbor API", lifespan=lifespan)

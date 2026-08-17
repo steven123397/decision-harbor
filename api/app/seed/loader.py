@@ -1,6 +1,6 @@
 """固定数据 seed：从契约派生 DDL，COPY 加载权威 CSV，幂等标记存 platform。
 
-流程语义见 docs/design/data-and-seeding.md：
+流程语义见 ADR-0012/0013：
 标记匹配且行数符合 → 跳过；表不存在 → 建表并单事务加载；其他不一致 → 失败。
 """
 

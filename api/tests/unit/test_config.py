@@ -1,4 +1,4 @@
-"""配置解析与上下界校验（design/query-governance.md 资源限制）。"""
+"""配置解析与上下界校验（ADR-0005/0016 资源限制）。"""
 
 from __future__ import annotations
 
@@ -17,8 +17,12 @@ from app.config import Settings
         ("QUERY_STATEMENT_TIMEOUT_MS", "120000"),
         ("QUERY_MAX_ROWS", "0"),
         ("QUERY_MAX_ROWS", "100000"),
-        ("QUERY_MAX_CONCURRENCY", "0"),
-        ("QUERY_MAX_CONCURRENCY", "100"),
+        ("WORKER_LEASE_SECONDS", "0"),
+        ("WORKER_LEASE_SECONDS", "601"),
+        ("WORKER_POLL_INTERVAL_MS", "10"),
+        ("WORKER_POLL_INTERVAL_MS", "20000"),
+        ("RESULT_RETENTION_HOURS", "0"),
+        ("RESULT_RETENTION_HOURS", "721"),
     ],
 )
 def test_out_of_range_values_rejected(env_name, value, monkeypatch):
@@ -29,13 +33,14 @@ def test_out_of_range_values_rejected(env_name, value, monkeypatch):
 
 def test_defaults_and_valid_overrides(monkeypatch):
     defaults = Settings()
-    assert defaults.query_max_concurrency == 5
     assert defaults.query_max_rows == 1_000
+    assert defaults.worker_lease_seconds == 30
+    assert defaults.result_retention_hours == 24
 
-    monkeypatch.setenv("QUERY_MAX_CONCURRENCY", "8")
+    monkeypatch.setenv("WORKER_LEASE_SECONDS", "60")
     monkeypatch.setenv("QUERY_STATEMENT_TIMEOUT_MS", "2500")
     settings = Settings()
-    assert settings.query_max_concurrency == 8
+    assert settings.worker_lease_seconds == 60
     assert settings.query_statement_timeout_ms == 2_500
 
 

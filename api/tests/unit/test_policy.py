@@ -1,6 +1,6 @@
 """策略模块单元测试。
 
-判定规则与拒绝码以 docs/design/query-governance.md 为准。
+判定规则与拒绝码以 ADR-0005/0006 为准。
 allowed_tables 模拟由 contract.json 派生的五张契约表。
 """
 

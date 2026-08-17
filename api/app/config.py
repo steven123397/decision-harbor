@@ -29,12 +29,18 @@ class Settings(BaseSettings):
 
     dataset_dir: str = "datasets/sales-analytics-v1"
 
-    # 查询治理资源限制，语义见 docs/design/query-governance.md。
+    # 查询治理资源限制，语义见 CONTEXT.md「治理与执行」与 ADR-0005/0007。
     # 上下界在配置层拒绝明显失控的取值，而不是等运行期才失败。
     query_sql_max_length: int = Field(default=100_000, ge=1, le=1_000_000)
     query_statement_timeout_ms: int = Field(default=10_000, ge=100, le=60_000)
     query_max_rows: int = Field(default=1_000, ge=1, le=50_000)
-    query_max_concurrency: int = Field(default=5, ge=1, le=32)
+
+    # 后台执行组件（ADR-0016）：租约时长内未续期即视为失去所有权；
+    # 轮询间隔决定空转频率；结果快照保留期从终态发布时间起算。
+    worker_lease_seconds: int = Field(default=30, ge=1, le=600)
+    worker_poll_interval_ms: int = Field(default=500, ge=50, le=10_000)
+    worker_heartbeat_seconds: int = Field(default=10, ge=1, le=120)
+    result_retention_hours: int = Field(default=24, ge=1, le=24 * 30)
 
 
 @lru_cache

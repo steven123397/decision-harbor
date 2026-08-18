@@ -16,7 +16,7 @@ from app.config import Settings
         ("QUERY_STATEMENT_TIMEOUT_MS", "10"),
         ("QUERY_STATEMENT_TIMEOUT_MS", "120000"),
         ("QUERY_MAX_ROWS", "0"),
-        ("QUERY_MAX_ROWS", "100000"),
+        ("QUERY_MAX_ROWS", "501"),
         ("WORKER_LEASE_SECONDS", "0"),
         ("WORKER_LEASE_SECONDS", "601"),
         ("WORKER_POLL_INTERVAL_MS", "10"),
@@ -37,7 +37,7 @@ def test_out_of_range_values_rejected(env_name, value, monkeypatch):
 
 def test_defaults_and_valid_overrides(monkeypatch):
     defaults = Settings()
-    assert defaults.query_max_rows == 1_000
+    assert defaults.query_max_rows == 500, "500 行是统一硬上限（ADR-0011 扩展）"
     assert defaults.worker_lease_seconds == 30
     assert defaults.result_retention_hours == 24
     assert defaults.global_query_concurrency == 4

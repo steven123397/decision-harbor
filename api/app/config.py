@@ -29,11 +29,13 @@ class Settings(BaseSettings):
 
     dataset_dir: str = "datasets/sales-analytics-v1"
 
-    # 查询治理资源限制，语义见 CONTEXT.md「治理与执行」与 ADR-0005/0007。
+    # 查询治理资源限制，语义见 CONTEXT.md「治理与执行」与 ADR-0005/0007/0011。
     # 上下界在配置层拒绝明显失控的取值，而不是等运行期才失败。
     query_sql_max_length: int = Field(default=100_000, ge=1, le=1_000_000)
     query_statement_timeout_ms: int = Field(default=10_000, ge=100, le=60_000)
-    query_max_rows: int = Field(default=1_000, ge=1, le=50_000)
+    # 500 行是取数与快照的统一硬上限（ADR-0011 扩展）：不开放上调，
+    # 更大取值在配置层直接拒绝。
+    query_max_rows: int = Field(default=500, ge=1, le=500)
 
     # 后台执行组件（ADR-0016）：租约时长内未续期即视为失去所有权；
     # 轮询间隔决定空转频率；结果快照保留期从终态发布时间起算。

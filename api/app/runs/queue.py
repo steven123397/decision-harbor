@@ -13,7 +13,6 @@ query_runs 表即队列（ADR-0015）。所有状态转移都是带条件的原�
 
 from __future__ import annotations
 
-import json
 from collections.abc import Collection
 from dataclasses import dataclass
 from typing import Literal
@@ -21,7 +20,13 @@ from typing import Literal
 from sqlalchemy import text
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.execute.executor import QY_ANALYTICS_UNAVAILABLE, QY_TIMEOUT
+from app.execute.executor import (
+    QY_ANALYTICS_UNAVAILABLE,
+    QY_TIMEOUT,
+    SNAPSHOT_MAX_BYTES,
+    column_dicts,
+    snapshot_json,
+)
 from app.runs.models import TERMINAL_STATES
 
 WORKER_PAUSED_FLAG = "worker.paused"
@@ -53,12 +58,14 @@ CLAIM_GATE_LOCK_KEY = 7011
 
 def build_snapshot(result) -> dict:
     """执行结果 → 快照字段（列定义、行、字节数）；worker 与测试共用，
-    序列化口径只有这一处。"""
-    columns = [{"name": c.name, "type": c.type} for c in result.columns]
+    序列化口径只有这一处（executor.snapshot_json，取数期的字节累积
+    同源，ADR-0011 扩展）。"""
+    columns = column_dicts(result.columns)
+    rows = result.rows
     size_bytes = len(
-        json.dumps({"columns": columns, "rows": result.rows}, ensure_ascii=False).encode("utf-8")
+        snapshot_json({"columns": columns, "rows": rows}).encode("utf-8")
     )
-    return {"columns": columns, "rows": result.rows, "size_bytes": size_bytes}
+    return {"columns": columns, "rows": rows, "size_bytes": size_bytes}
 
 
 @dataclass(frozen=True)
@@ -334,8 +341,8 @@ def publish_success(
                 ),
                 {
                     "rid": claim.run_id,
-                    "cols": _json(columns),
-                    "rows": _json(rows),
+                    "cols": snapshot_json(columns),
+                    "rows": snapshot_json(rows),
                     "rc": row_count,
                     "tr": truncated,
                     "size": size_bytes,
@@ -498,7 +505,3 @@ def worker_paused(session_factory: sessionmaker[Session]) -> bool:
             {"flag": WORKER_PAUSED_FLAG},
         ).fetchone()
         return row is not None
-
-
-def _json(value) -> str:
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))

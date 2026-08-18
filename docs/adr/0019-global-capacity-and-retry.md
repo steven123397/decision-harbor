@@ -33,6 +33,13 @@
 的运行（自接管排除——ADR-0017 预告的进程内排除）；keeper 对多条
 活动租约逐一续期。
 
+取消与自动重跑的交互（#12）：取消请求把 running 转入 cancelling 后，
+续期（要求 running）自然失败、终态发布与回队的 CAS 同样只认
+running——基础设施类失败的中止形态到达时若运行已在 cancelling，
+处置被 fencing 拒绝、不消耗自动重跑；keeper 检测到 cancelling 对
+执行连接调用 cancel()（best effort 中止），执行者以 finalize_cancelled
+收尾，崩溃遗孤由过期清扫兜底。
+
 ## 理由
 
 - **数据库是唯一事实源是规格硬约束**：任何进程内信号量都只能管住

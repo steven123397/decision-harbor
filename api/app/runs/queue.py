@@ -22,11 +22,16 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.execute.executor import QY_ANALYTICS_UNAVAILABLE, QY_TIMEOUT
+from app.runs.models import TERMINAL_STATES
 
 WORKER_PAUSED_FLAG = "worker.paused"
 
 # 失败处置结果：回队 / 终态 / 失去所有权（CAS 未命中，含被接管、被取消）。
 RetryOutcome = Literal["requeued", "failed", "fenced"]
+
+# 取消处置结果：确定生效（排队取消）/ 已受理（运行中取消，best effort
+# 中止进行中）/ 幂等重复 / 不可取消（已落入其他终态）。
+CancelOutcome = Literal["cancelled", "cancelling", "already_cancelled", "not_cancellable"]
 
 # 单次运行总执行次数硬上界（规格 #6：attempt 1→3，接管重跑同样计数）。
 MAX_ATTEMPTS = 3
@@ -157,7 +162,7 @@ def claim_next(
             session.rollback()
             return None
         # 认领即递增 attempt，除非是全新排队行的首次认领（generation=0）。
-        # 接管（原 state=running）与失败回队重跑（retry_or_fail 落回
+        # 接管（原 state=running）与失败回队重跑（requeue_or_fail 落回
         # queued 但 generation ≥ 1）都算重新执行，统一递增（CONTEXT.md
         # 「尝试」）。行已被锁定，值不会并发漂移。
         bump = 1 if row.generation >= 1 else 0
@@ -368,6 +373,100 @@ def publish_failure(
         ).rowcount
         session.commit()
         return updated == 1
+
+
+def request_cancel(session_factory: sessionmaker[Session], run_id: int) -> CancelOutcome:
+    """取消请求的状态机裁决（#12，ADR-0018）。
+
+    queued → cancelled（终态）：取消确定生效，行不再是可执行候选；
+    running → cancelling：取消事实已登记，终态发布与回队的 CAS 都要求
+    state='running'，此后任何执行结果都发布不出去——「取消事实在终态
+    发布前获胜时不得再发布查询结果」由 fencing 保证；执行者检测到
+    cancelling 后 best effort 中止底层查询并经 finalize_cancelled 收尾。
+    cancelled / cancelling 重复取消幂等；其余终态（succeeded/failed/
+    rejected）不可取消。
+
+    两条 CAS 都未命中时可能只是状态正在迁移（认领 queued→running、
+    回队 running→queued）而非真的不可取消——重试裁决而不是拿瞬时
+    状态定论，「排队中的取消确定生效」不受竞态影响。
+    """
+    with session_factory() as session:
+        for _ in range(3):
+            swept = session.execute(
+                text(
+                    "UPDATE query_runs SET state = 'cancelled', finished_at = now() "
+                    "WHERE id = :id AND state = 'queued'"
+                ),
+                {"id": run_id},
+            ).rowcount
+            if swept == 1:
+                session.commit()
+                return "cancelled"
+            swept = session.execute(
+                text(
+                    "UPDATE query_runs SET state = 'cancelling' "
+                    "WHERE id = :id AND state IN ('running', 'cancelling')"
+                ),
+                {"id": run_id},
+            ).rowcount
+            if swept == 1:
+                session.commit()
+                return "cancelling"
+            state = session.execute(
+                text("SELECT state FROM query_runs WHERE id = :id"), {"id": run_id}
+            ).scalar_one_or_none()
+            if state is None or state in TERMINAL_STATES:
+                session.rollback()
+                if state == "cancelled":
+                    return "already_cancelled"
+                return "not_cancellable"
+            # 非终态且两条 CAS 都未命中：状态正在迁移，回滚快照重试
+            session.rollback()
+        # 迁移竞态持续三轮仍未命中：按当前事实返回不可取消的稳定结论
+        session.rollback()
+        return "not_cancellable"
+
+
+def finalize_cancelled(session_factory: sessionmaker[Session], claim: Claim) -> bool:
+    """cancelling → cancelled（终态），携带 generation 做 fencing。
+
+    执行者的查询中止/结束后调用：只有仍持有所有权（generation 未变）
+    且运行仍在 cancelling 的执行者能落终态；被清扫或被接管返回 False。
+    """
+    with session_factory() as session:
+        updated = session.execute(
+            text(
+                "UPDATE query_runs SET state = 'cancelled', finished_at = now() "
+                "WHERE id = :id AND generation = :gen AND state = 'cancelling'"
+            ),
+            {"id": claim.run_id, "gen": claim.generation},
+        ).rowcount
+        session.commit()
+        return updated == 1
+
+
+def finalize_expired_cancelling(
+    session_factory: sessionmaker[Session], *, grace_seconds: int = 30
+) -> int:
+    """清扫：cancelling 且租约过期超过宽限的运行落 cancelled 终态。
+
+    执行者登记 cancelling 后停止续期（续期要求 running），正常路径由
+    执行者自己 finalize_cancelled 收尾；执行者在收尾前崩溃则行永远停在
+    cancelling——这里补上终态。宽限与耗尽清扫同语义：给执行者留收尾
+    窗口，避免与还在跑的 finalize 竞争（CAS 使竞争本身无害）。幂等，
+    返回清扫行数。
+    """
+    with session_factory() as session:
+        swept = session.execute(
+            text(
+                "UPDATE query_runs SET state = 'cancelled', finished_at = now() "
+                "WHERE state = 'cancelling' "
+                "AND lease_expires_at <= now() - make_interval(secs => :grace)"
+            ),
+            {"grace": grace_seconds},
+        ).rowcount
+        session.commit()
+        return swept
 
 
 def set_worker_paused(session_factory: sessionmaker[Session], *, paused: bool) -> None:

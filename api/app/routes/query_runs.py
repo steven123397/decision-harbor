@@ -19,6 +19,8 @@ router = APIRouter()
 QY_RESULT_NOT_READY = "QY_RESULT_NOT_READY"
 QY_RESULT_NOT_AVAILABLE = "QY_RESULT_NOT_AVAILABLE"
 IDEMPOTENCY_CONFLICT = "idempotency_conflict"
+RUN_NOT_CANCELLABLE = "run_not_cancellable"
+RUN_NOT_RETRYABLE = "run_not_retryable"
 
 DEFAULT_PAGE_LIMIT = 20
 MAX_PAGE_LIMIT = 100
@@ -125,6 +127,46 @@ def get_query_run_result(run_id: str, request: Request):
             "expires_at": snap.expires_at.isoformat(),
         }
     }
+
+
+@router.post("/api/v1/query-runs/{run_id}/cancel")
+def cancel_query_run(run_id: str, request: Request):
+    """取消：排队中确定生效（200 + cancelled）；运行中受理为 cancelling
+    （202，best effort 中止底层查询）；已 cancelled 幂等 200；其余终态
+    409 run_not_cancellable（ADR-0018）。"""
+    parsed_id = _parse_run_id(run_id)
+    service: QueryRunService = request.app.state.runs
+    result = service.cancel(parsed_id)
+    if result is None:
+        raise _run_not_found()
+    outcome, run = result["outcome"], result["run"]
+    if outcome == "not_cancellable":
+        raise HTTPException(
+            status_code=409,
+            detail={"code": RUN_NOT_CANCELLABLE, "message": result["message"]},
+        )
+    if outcome == "cancelling":
+        # 转移已受理、终态尚未落定：与受理语义同层的 202
+        return JSONResponse(status_code=202, content={"run": run})
+    return JSONResponse(status_code=200, content={"run": run})
+
+
+@router.post("/api/v1/query-runs/{run_id}/retry")
+def retry_query_run(run_id: str, request: Request):
+    """重试：仅 failed / cancelled → 202 + 新运行（retry_of 指向原运行）；
+    rejected 的 409 附「修改 SQL 后重新提交」指引；其余状态一律 409
+    run_not_retryable（ADR-0018）。"""
+    parsed_id = _parse_run_id(run_id)
+    service: QueryRunService = request.app.state.runs
+    result = service.retry(parsed_id)
+    if result is None:
+        raise _run_not_found()
+    if result["outcome"] == "not_retryable":
+        raise HTTPException(
+            status_code=409,
+            detail={"code": RUN_NOT_RETRYABLE, "message": result["message"]},
+        )
+    return JSONResponse(status_code=202, content={"run": result["run"]})
 
 
 def _parse_run_id(run_id: str) -> int:

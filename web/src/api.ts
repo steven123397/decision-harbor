@@ -9,6 +9,7 @@ export interface RunRecord {
   id: number;
   state: string;
   sql: string;
+  attempt: number;
   rejection_code: string | null;
   rejection_message: string | null;
   row_count: number | null;
@@ -16,10 +17,6 @@ export interface RunRecord {
   duration_ms: number | null;
   error_code: string | null;
   error_message: string | null;
-}
-
-export interface AcceptedResponse {
-  run: RunRecord;
 }
 
 export interface SnapshotResult {
@@ -30,27 +27,55 @@ export interface SnapshotResult {
   expires_at: string;
 }
 
-/** 非终态统一呈现为「执行中」；终态细分由 pollOnce 合并快照得出。 */
+/** 中间态逐个可辨（CONTEXT.md：received 与 queued 不混称「排队」）；
+ * 终态四者互斥，cancelled 不并入失败面板。 */
 export type ViewState =
   | { kind: "idle" }
-  | { kind: "running" }
-  | { kind: "succeeded"; columns: RunColumn[]; rows: string[][]; rowCount: number; truncated: boolean; durationMs: number }
-  | { kind: "rejected"; code: string; message: string }
-  | { kind: "failed"; code: string; message: string }
+  | { kind: "in-progress"; runId: number; state: string; label: string; attempt: number }
+  | {
+      kind: "succeeded";
+      runId: number;
+      columns: RunColumn[];
+      rows: string[][];
+      rowCount: number;
+      truncated: boolean;
+      durationMs: number;
+    }
+  | { kind: "rejected"; runId: number; code: string; message: string }
+  | { kind: "failed"; runId: number; code: string; message: string; attempt: number }
+  | { kind: "cancelled"; runId: number; message: string }
   | { kind: "network-error"; message: string };
 
 export const TERMINAL_STATES = ["succeeded", "rejected", "failed", "cancelled"] as const;
+
+const IN_PROGRESS_LABELS: Record<string, string> = {
+  received: "已受理",
+  queued: "排队中",
+  running: "执行中",
+  cancelling: "取消中",
+};
 
 export function isTerminal(state: string): boolean {
   return (TERMINAL_STATES as readonly string[]).includes(state);
 }
 
-/** 终态运行 → 视图状态；结果细节在 succeeded 时由快照补充。 */
-export function terminalToViewState(run: RunRecord, snapshot?: SnapshotResult | null): ViewState {
+/** 运行记录 → 视图状态；succeeded 的结果细节由快照补充。 */
+export function runToViewState(run: RunRecord, snapshot?: SnapshotResult | null): ViewState {
+  const attempt = run.attempt ?? 1;
+  if (!isTerminal(run.state)) {
+    return {
+      kind: "in-progress",
+      runId: run.id,
+      state: run.state,
+      label: IN_PROGRESS_LABELS[run.state] ?? run.state,
+      attempt,
+    };
+  }
   switch (run.state) {
     case "succeeded":
       return {
         kind: "succeeded",
+        runId: run.id,
         columns: snapshot?.columns ?? [],
         rows: snapshot?.rows ?? [],
         rowCount: snapshot?.row_count ?? 0,
@@ -60,17 +85,19 @@ export function terminalToViewState(run: RunRecord, snapshot?: SnapshotResult | 
     case "rejected":
       return {
         kind: "rejected",
+        runId: run.id,
         code: run.rejection_code ?? "QY_UNKNOWN",
         message: run.rejection_message ?? "查询被策略拒绝",
       };
     case "cancelled":
-      // 取消不是执行侧失败：不占用错误码命名空间，纯本地呈现
-      return { kind: "failed", code: "已取消", message: "查询已取消，未产生结果" };
+      return { kind: "cancelled", runId: run.id, message: "查询已取消，未产生结果" };
     default:
       return {
         kind: "failed",
+        runId: run.id,
         code: run.error_code ?? "QY_UNKNOWN",
         message: run.error_message ?? "查询执行失败",
+        attempt,
       };
   }
 }
@@ -100,7 +127,8 @@ function networkFailure(status?: number): ViewState {
   };
 }
 
-/** 提交 → 立即受理（202）或同步拒绝（422）；随后由调用方轮询。 */
+/** 提交 → 立即受理（202，响应已含 queued 运行记录）或同步拒绝（422）；
+ * 随后由调用方轮询。 */
 export async function submitSql(
   sql: string
 ): Promise<{ view: ViewState; runId: number | null }> {
@@ -114,16 +142,14 @@ export async function submitSql(
   } catch {
     return { view: networkFailure(), runId: null };
   }
-  if (resp.status === 202 && resp.body?.run) {
-    return { view: { kind: "running" }, runId: resp.body.run.id };
-  }
-  if (resp.status === 422 && resp.body?.run) {
-    return { view: terminalToViewState(resp.body.run), runId: resp.body.run.id };
+  const run = resp.body?.run;
+  if ((resp.status === 202 || resp.status === 422) && run) {
+    return { view: runToViewState(run), runId: run.id };
   }
   return { view: networkFailure(resp.status), runId: null };
 }
 
-/** 轮询一次：非终态继续 running；终态合并快照（succeeded）落定视图。 */
+/** 轮询一次：非终态继续推进中间态；终态合并快照（succeeded）落定视图。 */
 export async function pollOnce(runId: number): Promise<ViewState> {
   let got: { status: number; body: { run?: RunRecord } | null };
   try {
@@ -133,17 +159,17 @@ export async function pollOnce(runId: number): Promise<ViewState> {
   }
   const run = got.status === 200 ? got.body?.run : undefined;
   if (!run) return networkFailure(got.status);
-  if (!isTerminal(run.state)) return { kind: "running" };
+  if (!isTerminal(run.state)) return runToViewState(run);
 
   if (run.state === "succeeded") {
     try {
       const snap = await fetchJson<{ result?: SnapshotResult }>(
         `/api/v1/query-runs/${runId}/result`
       );
-      return terminalToViewState(run, snap.status === 200 ? snap.body?.result : null);
+      return runToViewState(run, snap.status === 200 ? snap.body?.result : null);
     } catch {
-      return terminalToViewState(run, null);
+      return runToViewState(run, null);
     }
   }
-  return terminalToViewState(run);
+  return runToViewState(run);
 }

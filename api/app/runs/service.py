@@ -10,7 +10,18 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.policy import PolicyLimits, evaluate
 from app.runs import queue
-from app.runs.models import STATE_REJECTED, QueryRun, run_to_dict
+from app.runs.models import (
+    STATE_CANCELLED,
+    STATE_FAILED,
+    STATE_REJECTED,
+    QueryRun,
+    run_to_dict,
+)
+
+# 取消/重试的 409 detail 消息（ADR-0018 生命周期冲突族）。
+NOT_CANCELLABLE_MESSAGE = "该运行已处于终态，无法取消"
+NOT_RETRYABLE_MESSAGE = "只有 failed 或 cancelled 的运行可以重试"
+NOT_RETRYABLE_REJECTED_MESSAGE = "策略拒绝的运行不能重试，请修改 SQL 后重新提交"
 
 
 class QueryRunService:
@@ -56,6 +67,40 @@ class QueryRunService:
                 return None
             return run_to_dict(run)
 
+    def cancel(self, run_id: int) -> dict | None:
+        """取消请求：queue.request_cancel 裁决状态机，返回路由所需的
+        outcome、409 文案（与重试同源，冲突族消息归服务层）与最新运行
+        记录。None = 运行不存在。"""
+        with self._session_factory() as session:
+            run = session.get(QueryRun, run_id)
+            if run is None:
+                return None
+        outcome = queue.request_cancel(self._session_factory, run_id)
+        if outcome == "not_cancellable":
+            return {
+                "outcome": outcome,
+                "message": NOT_CANCELLABLE_MESSAGE,
+                "run": self.get(run_id),
+            }
+        return {"outcome": outcome, "run": self.get(run_id)}
+
+    def retry(self, run_id: int) -> dict | None:
+        """重试请求：仅 failed / cancelled 可重试，创建带 retry_of 关系的
+        新运行（新 attempt 预算、重新过策略判定）。None = 运行不存在。"""
+        with self._session_factory() as session:
+            original = session.get(QueryRun, run_id)
+            if original is None:
+                return None
+            if original.state not in (STATE_FAILED, STATE_CANCELLED):
+                hint = (
+                    NOT_RETRYABLE_REJECTED_MESSAGE
+                    if original.state == STATE_REJECTED
+                    else NOT_RETRYABLE_MESSAGE
+                )
+                return {"outcome": "not_retryable", "message": hint}
+        created = self._create(original.sql, None, retry_of=run_id)
+        return {"outcome": "retried", "run": created["run"]}
+
     def list_runs(
         self, *, limit: int, cursor: tuple[datetime, int] | None
     ) -> dict:
@@ -94,12 +139,17 @@ class QueryRunService:
             ).fetchone()
             return {"run": run_to_dict(run), "snapshot": snap}
 
-    def _create(self, sql: str, idempotency_key: str | None) -> dict:
+    def _create(
+        self, sql: str, idempotency_key: str | None, *, retry_of: int | None = None
+    ) -> dict:
         """创建新运行。受理与入队/拒绝在同一事务内落定：进程在受理中途
-        崩溃不会留下永远停在 received 的孤儿行。"""
+        崩溃不会留下永远停在 received 的孤儿行。retry_of 仅由重试路径
+        传入（重试创建新运行，不复活原运行，CONTEXT.md「重试关系」）。"""
         decision = self._evaluate(sql)
         with self._session_factory() as session:
-            run = QueryRun(state="received", sql=sql, idempotency_key=idempotency_key)
+            run = QueryRun(
+                state="received", sql=sql, idempotency_key=idempotency_key, retry_of=retry_of
+            )
             session.add(run)
             session.flush()  # 取得 id，转移语句与插入同事务
             if decision.allowed:

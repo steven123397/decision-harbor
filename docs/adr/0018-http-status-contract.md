@@ -5,7 +5,7 @@
 v0.2.0 异步生命周期下，状态码按「请求说了什么」分层，取代 ADR-0009 的「业务结果一律 200」：
 
 - **读操作成功一律 200**，响应携带运行记录本身（state / attempt / 时间戳 / 错误摘要）；未终态运行被读到不是错误，是当前事实，客户端按 state 分支。
-- **生命周期转移冲突 409**：请求意图与运行当前状态竞争失败——同键异 SQL 的 `idempotency_conflict`、结果未就绪/不可读（QY_RESULT_NOT_READY / QY_RESULT_NOT_AVAILABLE），以及后续取消与重试的 `run_not_cancellable` / `run_not_retryable`（#12 落地）。冲突是稳定事实，携带稳定错误码与可读说明。
+- **生命周期转移冲突 409**：请求意图与运行当前状态竞争失败——同键异 SQL 的 `idempotency_conflict`、结果未就绪/不可读（QY_RESULT_NOT_READY / QY_RESULT_NOT_AVAILABLE），以及取消与重试的 `run_not_cancellable` / `run_not_retryable`（#12 已落地：取消与终态发布的竞态由状态机 CAS 裁决，只有一个结局能发布）。冲突是稳定事实，携带稳定错误码与可读说明。
 - **策略拒绝 422**：POST 的同步治理判定不通过，响应携带 rejected 运行记录（拒绝码与说明）。拒绝针对输入本身，与运行状态竞争无关。
 - **协议层维持原位**：400 请求不合法（请求体或查询参数 limit / cursor），404 记录不存在（含非整数路径 id），503 仅 `/ready` 未就绪。
 
@@ -22,7 +22,8 @@ v0.2.0 异步生命周期下，状态码按「请求说了什么」分层，取�
 | `GET /api/v1/query-runs` | 200 + 游标分页历史（`created_at`、`id` 双键降序，游标不透明；`limit` 默认 20、上限 100） |
 | `GET /api/v1/query-runs/{id}` | 200 + 运行记录（任意状态） |
 | `GET /{id}/result` | 200 快照；409 未终态/无可读快照；410 过期（#14 落地） |
-| `POST /{id}/cancel`、`POST /{id}/retry` | #12 落地：409 `run_not_cancellable` / `run_not_retryable`；cancel 对已 cancelled 200 幂等 |
+| `POST /{id}/cancel` | 200 取消确定生效（queued → cancelled）或对已 cancelled 幂等；202 运行中取消已受理（running → cancelling，best effort 中止底层查询）；409 `run_not_cancellable`（succeeded / failed / rejected） |
+| `POST /{id}/retry` | 202 + 新运行（仅 failed / cancelled，`retry_of` 指向原运行，attempt 预算独立）；409 `run_not_retryable`（其余状态；rejected 的 409 附「修改 SQL 后重新提交」指引） |
 
 ## 幂等语义细节
 

@@ -3,7 +3,7 @@ import json
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine, Row
 
-from decisionharbor.domain import QueryRun
+from decisionharbor.domain import QueryRun, ResultSnapshot
 
 
 class StateConflict(RuntimeError):
@@ -94,22 +94,26 @@ class QueryRunRepository:
             ).one_or_none()
         return _row_to_query_run(row) if row else None
 
-    def recover_interrupted(self) -> int:
-        with self._engine.begin() as connection:
-            result = connection.execute(
-                text(
-                    """
-                    UPDATE query_runs
-                    SET status = 'failed',
-                        error_code = 'execution_interrupted',
-                        error_summary = 'Execution was interrupted before completion.',
-                        finished_at = now(),
-                        duration_ms = GREATEST(0, (EXTRACT(EPOCH FROM (now() - created_at)) * 1000)::integer)
-                    WHERE status IN ('received', 'running')
-                    """
-                )
-            )
-        return result.rowcount
+    def get_result_snapshot(self, run_id: str) -> ResultSnapshot | None:
+        with self._engine.connect() as connection:
+            row = connection.execute(
+                text("SELECT * FROM result_snapshots WHERE run_id = CAST(:id AS uuid)"),
+                {"id": run_id},
+            ).one_or_none()
+        return _row_to_result_snapshot(row) if row else None
+
+
+def _row_to_result_snapshot(row: Row) -> ResultSnapshot:
+    values = row._mapping
+    return ResultSnapshot(
+        run_id=str(values["run_id"]),
+        payload=values["payload"],
+        truncated=values["truncated"],
+        row_count=values["row_count"],
+        byte_size=values["byte_size"],
+        created_at=values["created_at"],
+    )
+
 
 def _row_to_query_run(row: Row) -> QueryRun:
     values = row._mapping

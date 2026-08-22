@@ -2,7 +2,7 @@
 
 DecisionHarbor 是一个面向企业内部业务人员的受治理数据分析平台。它让用户提交显式 SQL，并在受控规则内完成校验、只读执行、结果展示与查询审计。
 
-当前仓库已实现首轮受治理 SQL 查询链路，包括 React 查询工作台、FastAPI、两个 PostgreSQL 逻辑数据库、SQLGlot AST 策略、查询审计、迁移、固定数据 seed 和容器化测试。
+当前仓库实现受治理 SQL 查询链路，包括 React 查询工作台、FastAPI、独立 Worker、两个 PostgreSQL 逻辑数据库、SQLGlot AST 策略、持久查询队列与执行租约、有界结果快照、查询审计、迁移、固定数据 seed 和容器化测试。提交后查询异步执行：API 同步完成策略判定并入队，Worker 领取并以 analytics 只读身份执行，客户端轮询读取状态与结果。
 
 协作入口见 [Agent 工作规则](AGENTS.md)，规范术语见 [领域上下文](CONTEXT.md)。长期技术取舍记录在 [ADR](docs/adr/README.md)，当前功能规格和 tickets 记录在 `.scratch/`。
 
@@ -63,7 +63,7 @@ API_HOST_PORT=18080 \
 
 ## 查询 API
 
-提交一条同步只读查询：
+提交一条受治理查询：策略允许时返回 HTTP 202 和 `queued` 查询运行，策略拒绝返回 HTTP 422 和 `rejected` 运行：
 
 ```bash
 curl -H 'content-type: application/json' \
@@ -71,13 +71,19 @@ curl -H 'content-type: application/json' \
   http://127.0.0.1:8000/api/v1/query-runs
 ```
 
-读取持久化审计事实：
+轮询查询运行状态：
 
 ```bash
 curl http://127.0.0.1:8000/api/v1/query-runs/<query-run-id>
 ```
 
-历史读取不返回结果单元格；结果只随成功的 POST 即时返回。
+读取成功运行的有限结果快照（未完成返回 409 `result_not_ready`，终态无可读快照返回 409 `result_unavailable`）：
+
+```bash
+curl http://127.0.0.1:8000/api/v1/query-runs/<query-run-id>/result
+```
+
+用户 SQL 只由独立 Worker 以 analytics 只读身份执行；API 进程不持有 analytics 查询凭据。结果读取永远不重新执行 SQL。
 
 ## 测试
 

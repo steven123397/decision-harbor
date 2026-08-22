@@ -7,6 +7,8 @@ from decisionharbor.dataset import DatasetContract
 
 READINESS_CONNECT_TIMEOUT_SECONDS = 1
 READINESS_STATEMENT_TIMEOUT_MS = 1_000
+PLATFORM_MIGRATION_VERSION = "platform_0002"
+ANALYTICS_MIGRATION_VERSION = "analytics_0002"
 
 
 def _readiness_engine(database_url: str) -> Engine:
@@ -29,7 +31,7 @@ class PlatformReadinessProbe:
             with self._engine.connect() as connection:
                 return (
                     connection.execute(text("SELECT version_num FROM public.alembic_version")).scalar_one()
-                    == "platform_0001"
+                    == PLATFORM_MIGRATION_VERSION
                 )
         except Exception:
             return False
@@ -61,7 +63,7 @@ class AnalyticsReadinessProbe:
                 ).one_or_none()
                 return bool(
                     read_only == "on"
-                    and migration == "analytics_0002"
+                    and migration == ANALYTICS_MIGRATION_VERSION
                     and marker
                     and marker[0].strip() == dataset.contract_sha256
                     and marker[1].strip() == dataset.manifest_sha256

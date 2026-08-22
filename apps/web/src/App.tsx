@@ -1,6 +1,7 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
   AlertTriangle,
+  Ban,
   CheckCircle2,
   Database,
   LoaderCircle,
@@ -10,10 +11,10 @@ import {
   XCircle,
 } from 'lucide-react'
 
-import { httpApi, type ApiClient, type QueryResponse, type QueryRun } from './api'
+import { httpApi, type ApiClient, type ApiError, type QueryResult, type QueryRun, type QueryRunStatus } from './api'
 import './styles.css'
 
-export type { ApiClient, QueryResponse } from './api'
+export type { ApiClient, QueryResponse, ResultResponse } from './api'
 
 const DEFAULT_SQL = `SELECT
   c.region,
@@ -44,19 +45,49 @@ const ERROR_MESSAGES: Record<string, string> = {
   policy_internal_error: 'The query policy could not complete.',
   internal_error: 'The query could not be completed.',
   unsupported_result_type: 'The query returned a result type that is not supported.',
+  result_too_large: 'The query result exceeds the supported size limit.',
+  result_not_ready: 'The query result is not ready yet.',
+  result_unavailable: 'The query result is not available for this run.',
   query_run_not_found: 'The query run was not found.',
-  execution_interrupted: 'The query execution was interrupted before completion.',
 }
+
+const TERMINAL_STATUSES: ReadonlySet<QueryRunStatus> = new Set([
+  'succeeded',
+  'failed',
+  'rejected',
+  'cancelled',
+])
+
+const STATUS_LABELS: Partial<Record<QueryRunStatus, string>> = {
+  queued: 'Queued',
+  running: 'Running',
+  cancelling: 'Cancelling',
+}
+
+const STATUS_HINTS: Partial<Record<QueryRunStatus, string>> = {
+  queued: 'The query is waiting for an available worker.',
+  running: 'The worker is executing the query against the analytics database.',
+  cancelling: 'The cancellation request is being applied.',
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+const ACTIVE_RUN_KEY = 'decisionharbor.active-run'
 
 type ViewState =
   | { kind: 'idle' }
-  | { kind: 'running' }
-  | { kind: 'complete'; response: QueryResponse }
+  | { kind: 'submitting' }
+  | { kind: 'restoring' }
+  | { kind: 'active'; run: QueryRun }
+  | { kind: 'complete'; run: QueryRun | null; result: QueryResult | null; error: ApiError | null }
 
-export function App({ api = httpApi }: { api?: ApiClient }) {
+export function App({ api = httpApi, pollIntervalMs = 1000 }: { api?: ApiClient; pollIntervalMs?: number }) {
   const [sql, setSql] = useState(DEFAULT_SQL)
   const [readiness, setReadiness] = useState<'checking' | 'ready' | 'unavailable'>('checking')
   const [view, setView] = useState<ViewState>({ kind: 'idle' })
+  const pollTokenRef = useRef(0)
 
   useEffect(() => {
     let active = true
@@ -68,15 +99,76 @@ export function App({ api = httpApi }: { api?: ApiClient }) {
     }
   }, [api])
 
-  const runQuery = async () => {
-    if (!sql.trim() || view.kind === 'running' || readiness !== 'ready') return
-    setView({ kind: 'running' })
-    const response = await api.runQuery(sql)
-    setView({ kind: 'complete', response })
-    if (response.error?.code === 'service_not_ready') setReadiness('unavailable')
+  // 卸载（含页面刷新前）使轮询令牌失效：停止一切在途轮询。
+  useEffect(() => () => {
+    pollTokenRef.current += 1
+  }, [])
+
+  // 页面刷新后按运行标识恢复未完成运行的轮询；浏览器会话不是查询生命周期的所有者。
+  useEffect(() => {
+    const savedRunId = sessionStorage.getItem(ACTIVE_RUN_KEY)
+    if (!savedRunId) return
+    const token = ++pollTokenRef.current
+    setView({ kind: 'restoring' })
+    void poll(savedRunId, token)
+  }, [])
+
+  const finish = async (run: QueryRun, token: number) => {
+    sessionStorage.removeItem(ACTIVE_RUN_KEY)
+    if (run.status !== 'succeeded') {
+      setView({ kind: 'complete', run, result: null, error: null })
+      return
+    }
+    const response = await api.getQueryResult(run.id)
+    if (pollTokenRef.current !== token) return
+    setView({
+      kind: 'complete',
+      run,
+      result: response.data?.result ?? null,
+      error: response.data ? null : response.error,
+    })
   }
 
-  const running = view.kind === 'running'
+  const poll = async (runId: string, token: number) => {
+    await delay(pollIntervalMs)
+    if (pollTokenRef.current !== token) return
+    const response = await api.getQueryRun(runId)
+    if (pollTokenRef.current !== token) return
+    const run = response.data?.query_run
+    if (!run) {
+      setView({ kind: 'complete', run: null, result: null, error: response.error })
+      return
+    }
+    if (TERMINAL_STATUSES.has(run.status)) {
+      await finish(run, token)
+      return
+    }
+    setView({ kind: 'active', run })
+    void poll(runId, token)
+  }
+
+  const runQuery = async () => {
+    if (!sql.trim() || busy || readiness !== 'ready') return
+    const token = ++pollTokenRef.current
+    setView({ kind: 'submitting' })
+    const response = await api.submitQuery(sql)
+    if (pollTokenRef.current !== token) return
+    if (response.error?.code === 'service_not_ready') setReadiness('unavailable')
+    const run = response.data?.query_run
+    if (!run) {
+      setView({ kind: 'complete', run: null, result: null, error: response.error })
+      return
+    }
+    if (TERMINAL_STATUSES.has(run.status)) {
+      await finish(run, token)
+      return
+    }
+    sessionStorage.setItem(ACTIVE_RUN_KEY, run.id)
+    setView({ kind: 'active', run })
+    void poll(run.id, token)
+  }
+
+  const busy = view.kind === 'submitting' || view.kind === 'active'
   const checkReadiness = async () => {
     setReadiness('checking')
     setReadiness((await api.checkReady()) ? 'ready' : 'unavailable')
@@ -124,9 +216,9 @@ export function App({ api = httpApi }: { api?: ApiClient }) {
               type="button"
               className="run-button"
               onClick={runQuery}
-              disabled={running || readiness !== 'ready' || !sql.trim()}
+              disabled={busy || readiness !== 'ready' || !sql.trim()}
             >
-              {running ? <LoaderCircle className="spin" size={17} /> : <Play size={17} fill="currentColor" />}
+              {busy ? <LoaderCircle className="spin" size={17} /> : <Play size={17} fill="currentColor" />}
               Run query
             </button>
           </div>
@@ -135,14 +227,30 @@ export function App({ api = httpApi }: { api?: ApiClient }) {
             value={sql}
             onChange={(event) => setSql(event.target.value)}
             spellCheck={false}
-            disabled={running}
+            disabled={busy}
           />
         </section>
 
         <section className="output" aria-live="polite">
           {view.kind === 'idle' && <IdleState />}
-          {view.kind === 'running' && <RunningState />}
-          {view.kind === 'complete' && <CompletedState response={view.response} />}
+          {view.kind === 'submitting' && (
+            <ProgressState label="Submitting" hint="The governance policy is evaluating the SQL." />
+          )}
+          {view.kind === 'restoring' && (
+            <ProgressState
+              label="Restoring run"
+              hint="Recovering the query run state after the page reloaded."
+            />
+          )}
+          {view.kind === 'active' && (
+            <ProgressState
+              label={STATUS_LABELS[view.run.status] ?? 'Submitted'}
+              hint={STATUS_HINTS[view.run.status] ?? 'The query run is being processed.'}
+            />
+          )}
+          {view.kind === 'complete' && (
+            <CompletedState run={view.run} result={view.result} error={view.error} />
+          )}
         </section>
       </main>
     </div>
@@ -158,27 +266,56 @@ function IdleState() {
   )
 }
 
-function RunningState() {
+function ProgressState({ label, hint }: { label: string; hint: string }) {
   return (
     <div className="run-state running-state">
       <LoaderCircle className="spin" size={21} />
-      <div><strong>Running</strong><span>Policy and database checks are in progress.</span></div>
+      <div><strong>{label}</strong><span>{hint}</span></div>
     </div>
   )
 }
 
-function CompletedState({ response }: { response: QueryResponse }) {
-  const run = response.data?.query_run
-  if (run?.status === 'succeeded' && response.data?.result) {
-    return <SuccessState run={run} result={response.data.result} />
+function CompletedState({
+  run,
+  result,
+  error,
+}: {
+  run: QueryRun | null
+  result: QueryResult | null
+  error: ApiError | null
+}) {
+  if (run?.status === 'succeeded' && result) {
+    return <SuccessState run={run} result={result} />
   }
   if (run?.status === 'rejected') {
     return (
       <ErrorState
         kind="rejected"
         title="Query rejected"
-        code={response.error?.code ?? run.error_code ?? 'unsupported_sql'}
-        message={safeMessage(response)}
+        code={error?.code ?? run.error_code ?? 'unsupported_sql'}
+        message={messageFor(error, run)}
+        run={run}
+      />
+    )
+  }
+  if (run?.status === 'cancelled') {
+    return (
+      <ErrorState
+        kind="cancelled"
+        title="Query cancelled"
+        code={run.error_code ?? 'cancelled'}
+        message="The query run was cancelled and will not produce a result."
+        run={run}
+      />
+    )
+  }
+  if (run) {
+    return (
+      <ErrorState
+        kind="failed"
+        title="Execution failed"
+        code={error?.code ?? run.error_code ?? 'internal_error'}
+        message={messageFor(error, run)}
         run={run}
       />
     )
@@ -186,16 +323,14 @@ function CompletedState({ response }: { response: QueryResponse }) {
   return (
     <ErrorState
       kind="failed"
-      title="Execution failed"
-      code={response.error?.code ?? run?.error_code ?? 'internal_error'}
-      message={safeMessage(response)}
-      run={run}
+      title="Submission failed"
+      code={error?.code ?? 'internal_error'}
+      message={messageFor(error, null)}
     />
   )
 }
 
-function SuccessState({ run, result }: { run: QueryRun; result: NonNullable<QueryResponse['data']>['result'] }) {
-  if (!result) return null
+function SuccessState({ run, result }: { run: QueryRun; result: QueryResult }) {
   return (
     <>
       <div className="result-summary">
@@ -221,8 +356,8 @@ function SuccessState({ run, result }: { run: QueryRun; result: NonNullable<Quer
   )
 }
 
-function ErrorState({ kind, title, code, message, run }: { kind: 'rejected' | 'failed'; title: string; code: string; message: string; run?: QueryRun }) {
-  const Icon = kind === 'rejected' ? AlertTriangle : XCircle
+function ErrorState({ kind, title, code, message, run }: { kind: 'rejected' | 'failed' | 'cancelled'; title: string; code: string; message: string; run?: QueryRun }) {
+  const Icon = kind === 'rejected' ? AlertTriangle : kind === 'cancelled' ? Ban : XCircle
   return (
     <div className={`error-state error-${kind}`}>
       <div className="error-heading"><Icon size={22} /><div><strong>{title}</strong><code>{code}</code></div></div>
@@ -242,7 +377,7 @@ function AuditFacts({ run }: { run: QueryRun }) {
   )
 }
 
-function safeMessage(response: QueryResponse): string {
-  const code = response.error?.code ?? response.data?.query_run.error_code
+function messageFor(error: ApiError | null, run: QueryRun | null): string {
+  const code = error?.code ?? run?.error_code
   return (code && ERROR_MESSAGES[code]) ?? 'The query could not be completed.'
 }

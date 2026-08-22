@@ -22,6 +22,16 @@ class QueryResult:
 
 
 @dataclass(frozen=True)
+class ResultSnapshot:
+    run_id: str
+    payload: str
+    truncated: bool
+    row_count: int
+    byte_size: int
+    created_at: datetime
+
+
+@dataclass(frozen=True)
 class QueryRun:
     id: str
     raw_sql: str

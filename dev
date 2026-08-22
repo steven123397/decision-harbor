@@ -19,7 +19,10 @@ case "$command" in
   test)
     docker compose up -d --build --wait
     docker compose --profile test build api-test web-test e2e
+    # api-test 在测试内直接驱动 Worker 接缝，先停掉常驻 Worker 避免抢占队列。
+    docker compose stop worker
     docker compose --profile test run --rm api-test
+    docker compose start worker
     docker compose --profile test run --rm web-test
     docker compose --profile test run --rm e2e
     ;;

@@ -72,9 +72,11 @@ tbody tr:hover { background: #fafbf8; }
 .error-state { border-left: 3px solid; padding: 16px 18px; background: #fff; }
 .error-rejected { border-color: #b56c22; }
 .error-failed { border-color: #b34b35; }
+.error-cancelled { border-color: #6b7280; }
 .error-heading { display: flex; align-items: flex-start; gap: 10px; }
 .error-rejected .error-heading { color: #9a581c; }
 .error-failed .error-heading { color: #a43e2b; }
+.error-cancelled .error-heading { color: #555e58; }
 .error-heading div { display: grid; gap: 5px; }
 .error-heading code { color: #626a65; font-size: 11px; }
 .error-state p { margin: 12px 0 18px 32px; color: #555e58; font-size: 14px; }

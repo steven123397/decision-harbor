@@ -2,17 +2,19 @@ from dataclasses import replace
 
 import pytest
 
-from decisionharbor.domain import QueryColumn, QueryResult, QueryRun
-from decisionharbor.executor import ExecutionFailure
+from decisionharbor.domain import QueryRun
 from decisionharbor.policy import PolicyDecision
 from decisionharbor.service import QueryRunService, ServiceFailure
 
 
 class FakePolicy:
-    def __init__(self, decision: PolicyDecision) -> None:
+    def __init__(self, decision: PolicyDecision, *, fail: bool = False) -> None:
         self.decision = decision
+        self.fail = fail
 
     def evaluate(self, raw_sql: str) -> PolicyDecision:
+        if self.fail:
+            raise RuntimeError("sqlglot internals must not escape")
         return self.decision
 
 
@@ -41,51 +43,26 @@ class FakeRepository:
         return self.run
 
 
-class FakeExecutor:
-    def __init__(self, events: list[str], failure: ExecutionFailure | None = None) -> None:
-        self.events = events
-        self.failure = failure
-
-    def execute(self, raw_sql: str, statement_timeout_ms: int, max_rows: int) -> QueryResult:
-        self.events.append("execute")
-        if self.failure:
-            raise self.failure
-        return QueryResult(
-            columns=(QueryColumn(name="answer", type="integer"),),
-            rows=((1,),),
-            truncated=False,
-        )
-
-
-def build_service(
-    repository: FakeRepository,
-    executor: FakeExecutor,
-    decision: PolicyDecision,
-) -> QueryRunService:
+def build_service(repository: FakeRepository, decision: PolicyDecision, *, policy_fails: bool = False) -> QueryRunService:
     return QueryRunService(
         repository=repository,
-        policy=FakePolicy(decision),
-        executor=executor,
+        policy=FakePolicy(decision, fail=policy_fails),
         policy_version="policy-v1",
         statement_timeout_ms=5_000,
         max_rows=500,
-        max_concurrency=1,
-        capacity_wait_ms=0,
     )
 
 
-def test_audit_must_exist_before_policy_or_execution() -> None:
+ALLOWED = PolicyDecision(True, None, None, ("analytics.customers",))
+
+
+def test_audit_must_exist_before_policy_or_queueing() -> None:
     events: list[str] = []
     repository = FakeRepository(events, fail_create=True)
-    executor = FakeExecutor(events)
-    service = build_service(
-        repository,
-        executor,
-        PolicyDecision(True, None, None, ("analytics.customers",)),
-    )
+    service = build_service(repository, ALLOWED)
 
     with pytest.raises(ServiceFailure) as caught:
-        service.run("SELECT 1")
+        service.submit("SELECT 1")
 
     assert caught.value.code == "audit_unavailable"
     assert caught.value.query_run is None
@@ -93,84 +70,65 @@ def test_audit_must_exist_before_policy_or_execution() -> None:
     assert "DSN" not in caught.value.message
 
 
-def test_policy_rejection_is_audited_without_executing() -> None:
+def test_allowed_submission_is_enqueued_with_policy_facts() -> None:
     events: list[str] = []
     repository = FakeRepository(events)
-    executor = FakeExecutor(events)
+    service = build_service(repository, ALLOWED)
+
+    run = service.submit("SELECT 1")
+
+    assert run.status == "queued"
+    assert run.policy_decision == "allowed"
+    assert run.referenced_objects == ("analytics.customers",)
+    assert run.error_code is None
+    assert events == ["create", "transition:queued"]
+
+
+def test_policy_rejection_is_audited_without_queueing() -> None:
+    events: list[str] = []
+    repository = FakeRepository(events)
     service = build_service(
         repository,
-        executor,
         PolicyDecision(False, "sql_object_not_allowed", "Object is not allowed.", ()),
     )
 
     with pytest.raises(ServiceFailure) as caught:
-        service.run("SELECT * FROM secrets")
+        service.submit("SELECT * FROM secrets")
 
     assert caught.value.code == "sql_object_not_allowed"
     assert caught.value.query_run is not None
     assert caught.value.query_run.status == "rejected"
+    assert caught.value.query_run.policy_decision == "rejected"
     assert events == ["create", "transition:rejected"]
 
 
-def test_success_is_returned_only_after_terminal_audit() -> None:
+def test_policy_internal_error_closes_the_run_as_failed() -> None:
     events: list[str] = []
     repository = FakeRepository(events)
-    executor = FakeExecutor(events)
-    service = build_service(
-        repository,
-        executor,
-        PolicyDecision(True, None, None, ("analytics.customers",)),
-    )
-
-    outcome = service.run("SELECT 1")
-
-    assert outcome.query_run.status == "succeeded"
-    assert outcome.query_run.returned_row_count == 1
-    assert outcome.result.rows == ((1,),)
-    assert events == ["create", "transition:running", "execute", "transition:succeeded"]
-
-
-def test_execution_failure_is_safely_mapped_and_audited() -> None:
-    events: list[str] = []
-    repository = FakeRepository(events)
-    executor = FakeExecutor(
-        events,
-        ExecutionFailure("query_semantic_error", "The query is not valid for this dataset."),
-    )
-    service = build_service(
-        repository,
-        executor,
-        PolicyDecision(True, None, None, ("analytics.customers",)),
-    )
+    service = build_service(repository, ALLOWED, policy_fails=True)
 
     with pytest.raises(ServiceFailure) as caught:
-        service.run("SELECT missing_column")
+        service.submit("SELECT 1")
 
-    assert caught.value.code == "query_semantic_error"
+    assert caught.value.code == "policy_internal_error"
     assert caught.value.query_run is not None
     assert caught.value.query_run.status == "failed"
-    assert caught.value.query_run.error_summary == "The query is not valid for this dataset."
-    assert events == ["create", "transition:running", "execute", "transition:failed"]
-
-
-def test_capacity_exhaustion_fails_before_running_or_execution() -> None:
-    events: list[str] = []
-    repository = FakeRepository(events)
-    executor = FakeExecutor(events)
-    service = build_service(
-        repository,
-        executor,
-        PolicyDecision(True, None, None, ("analytics.customers",)),
-    )
-    assert service._capacity.acquire(blocking=False) is True
-
-    with pytest.raises(ServiceFailure) as caught:
-        service.run("SELECT 1")
-
-    service._capacity.release()
-    assert caught.value.code == "query_capacity_exceeded"
-    assert caught.value.query_run is not None
-    assert caught.value.query_run.status == "failed"
-    assert caught.value.query_run.policy_decision == "allowed"
-    assert caught.value.query_run.referenced_objects == ("analytics.customers",)
+    assert caught.value.query_run.error_code == "policy_internal_error"
+    assert "sqlglot" not in caught.value.message
     assert events == ["create", "transition:failed"]
+
+
+def test_transition_failure_maps_to_audit_unavailable() -> None:
+    repository = FakeRepository([])
+
+    def broken_transition(run_id: str, expected_status: str, **changes: object) -> QueryRun:
+        raise RuntimeError("connection reset with DSN")
+
+    repository.transition = broken_transition  # type: ignore[method-assign]
+    service = build_service(repository, ALLOWED)
+
+    with pytest.raises(ServiceFailure) as caught:
+        service.submit("SELECT 1")
+
+    assert caught.value.code == "audit_unavailable"
+    assert "DSN" not in caught.value.message

@@ -1,5 +1,15 @@
 import { describe, expect, it } from "vitest";
-import { isTerminal, runToViewState } from "./api";
+import {
+  canCancel,
+  canRetry,
+  cancelOutcome,
+  historyOutcome,
+  isTerminal,
+  resultOutcome,
+  retryOutcome,
+  runToViewState,
+  stateLabel,
+} from "./api";
 
 describe("isTerminal", () => {
   it("四终态为 true，中间态为 false", () => {
@@ -151,5 +161,150 @@ describe("runToViewState 终态", () => {
       runId: 6,
       message: "查询已取消，未产生结果",
     });
+  });
+});
+
+describe("stateLabel", () => {
+  it("八个状态逐个可辨，终态与中间态共用一套文案", () => {
+    expect(stateLabel("received")).toBe("已受理");
+    expect(stateLabel("queued")).toBe("排队中");
+    expect(stateLabel("running")).toBe("执行中");
+    expect(stateLabel("cancelling")).toBe("取消中");
+    expect(stateLabel("succeeded")).toBe("成功");
+    expect(stateLabel("rejected")).toBe("策略拒绝");
+    expect(stateLabel("failed")).toBe("失败");
+    expect(stateLabel("cancelled")).toBe("已取消");
+  });
+
+  it("未知状态退回原始值", () => {
+    expect(stateLabel("mystery")).toBe("mystery");
+  });
+});
+
+describe("canCancel / canRetry", () => {
+  it("中间态可取消，终态不可取消", () => {
+    for (const state of ["received", "queued", "running", "cancelling"]) {
+      expect(canCancel({ state })).toBe(true);
+    }
+    for (const state of ["succeeded", "rejected", "failed", "cancelled"]) {
+      expect(canCancel({ state })).toBe(false);
+    }
+  });
+
+  it("仅 failed / cancelled 可重试；rejected 不给重试入口", () => {
+    expect(canRetry({ state: "failed" })).toBe(true);
+    expect(canRetry({ state: "cancelled" })).toBe(true);
+    expect(canRetry({ state: "succeeded" })).toBe(false);
+    expect(canRetry({ state: "rejected" })).toBe(false);
+    expect(canRetry({ state: "queued" })).toBe(false);
+  });
+});
+
+describe("cancelOutcome", () => {
+  it("202 受理为取消中（in-progress），轮询继续推进", () => {
+    const outcome = cancelOutcome(202, {
+      run: { id: 21, state: "cancelling", attempt: 1 } as never,
+    });
+    expect(outcome).toEqual({
+      kind: "accepted",
+      view: { kind: "in-progress", runId: 21, state: "cancelling", label: "取消中", attempt: 1 },
+    });
+  });
+
+  it("200 是确定生效或幂等重复：cancelled 终态视图", () => {
+    const outcome = cancelOutcome(200, {
+      run: { id: 22, state: "cancelled", attempt: 1 } as never,
+    });
+    expect(outcome.kind).toBe("accepted");
+    expect(outcome.kind === "accepted" && outcome.view.kind).toBe("cancelled");
+  });
+
+  it("409 冲突透传服务端文案", () => {
+    const outcome = cancelOutcome(409, {
+      detail: { code: "run_not_cancellable", message: "该运行已处于终态，无法取消" },
+    });
+    expect(outcome).toEqual({
+      kind: "conflict",
+      message: "该运行已处于终态，无法取消",
+    });
+  });
+
+  it("缺 detail 的 409 与其他状态码按兜底文案处理", () => {
+    expect(cancelOutcome(409, null)).toEqual({ kind: "conflict", message: "该运行无法取消" });
+    expect(cancelOutcome(500, null).kind).toBe("error");
+  });
+});
+
+describe("retryOutcome", () => {
+  it("202 携带新运行（retry_of 关系），进入新运行的中间态视图", () => {
+    const outcome = retryOutcome(202, {
+      run: { id: 31, state: "queued", attempt: 1, retry_of: 30 } as never,
+    });
+    expect(outcome).toEqual({
+      kind: "accepted",
+      view: { kind: "in-progress", runId: 31, state: "queued", label: "排队中", attempt: 1 },
+    });
+  });
+
+  it("409 冲突透传指引文案（如策略拒绝不可重试）", () => {
+    const outcome = retryOutcome(409, {
+      detail: { code: "run_not_retryable", message: "策略拒绝的运行不能重试，请修改 SQL 后重新提交" },
+    });
+    expect(outcome).toEqual({
+      kind: "conflict",
+      message: "策略拒绝的运行不能重试，请修改 SQL 后重新提交",
+    });
+  });
+
+  it("其他状态码按错误处理", () => {
+    expect(retryOutcome(502, null).kind).toBe("error");
+  });
+});
+
+describe("resultOutcome", () => {
+  const snapshot = {
+    columns: [{ name: "region", type: "varchar" }],
+    rows: [["East"]],
+    row_count: 1,
+    truncated: false,
+    expires_at: "2026-08-23T00:00:00+00:00",
+  };
+
+  it("200 携带快照", () => {
+    expect(resultOutcome(200, { result: snapshot })).toEqual({
+      kind: "snapshot",
+      result: snapshot,
+    });
+  });
+
+  it("410 是过期：与 409 不可读分开反馈", () => {
+    expect(resultOutcome(410, null)).toEqual({ kind: "expired" });
+    expect(resultOutcome(409, null)).toEqual({ kind: "unavailable" });
+  });
+
+  it("其他状态码按错误透传", () => {
+    expect(resultOutcome(500, null)).toEqual({ kind: "error", status: 500 });
+  });
+});
+
+describe("historyOutcome", () => {
+  it("200 解析运行列表与不透明游标", () => {
+    const outcome = historyOutcome(200, {
+      runs: [{ id: 1, state: "succeeded", attempt: 1 } as never],
+      next_cursor: "Y3Vyc29y",
+    });
+    expect(outcome).toEqual({
+      kind: "page",
+      page: { runs: [{ id: 1, state: "succeeded", attempt: 1 }], nextCursor: "Y3Vyc29y" },
+    });
+  });
+
+  it("末页 next_cursor 为 null", () => {
+    const outcome = historyOutcome(200, { runs: [], next_cursor: null });
+    expect(outcome.kind === "page" && outcome.page.nextCursor).toBeNull();
+  });
+
+  it("非 200 按错误处理", () => {
+    expect(historyOutcome(500, null).kind).toBe("error");
   });
 });

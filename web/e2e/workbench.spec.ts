@@ -13,11 +13,31 @@ async function cancelActiveRuns(request: APIRequestContext) {
   const { runs } = (await resp.json()) as {
     runs: { id: number; state: string }[];
   };
-  for (const run of runs) {
-    if (!["succeeded", "rejected", "failed", "cancelled"].includes(run.state)) {
-      await request.post(`/api/v1/query-runs/${run.id}/cancel`);
-    }
+  const active = runs.filter(
+    (run) => !["succeeded", "rejected", "failed", "cancelled"].includes(run.state)
+  );
+  for (const run of active) {
+    await request.post(`/api/v1/query-runs/${run.id}/cancel`);
   }
+  // 等取消真正落定：运行中取消的 best effort 中止要等 keeper 周期，
+  // 期间执行线程仍占用 worker 本地并发槽——不等待会让下一个用例
+  // 排队，撞上 5 秒默认断言超时。
+  await expect
+    .poll(
+      async () => {
+        const states = await Promise.all(
+          active.map(async (run) => {
+            const r = await request.get(`/api/v1/query-runs/${run.id}`);
+            return ((await r.json()) as { run: { state: string } }).run.state;
+          })
+        );
+        return states.every((state) =>
+          ["succeeded", "rejected", "failed", "cancelled"].includes(state)
+        );
+      },
+      { timeout: 30_000 }
+    )
+    .toBe(true);
 }
 
 test.describe("查询工作台异步主流程", () => {

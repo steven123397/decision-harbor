@@ -1,5 +1,6 @@
 """HTTP 端点。状态码语义见 ADR-0018：读 200 携带 outcome、202 受理、
-422 策略拒绝、409 生命周期转移冲突（幂等冲突、结果未就绪）。"""
+422 策略拒绝、409 生命周期转移冲突（幂等冲突、结果未就绪）、
+410 结果超过保留期。"""
 
 from __future__ import annotations
 
@@ -18,6 +19,7 @@ router = APIRouter()
 
 QY_RESULT_NOT_READY = "QY_RESULT_NOT_READY"
 QY_RESULT_NOT_AVAILABLE = "QY_RESULT_NOT_AVAILABLE"
+QY_RESULT_EXPIRED = "QY_RESULT_EXPIRED"
 IDEMPOTENCY_CONFLICT = "idempotency_conflict"
 RUN_NOT_CANCELLABLE = "run_not_cancellable"
 RUN_NOT_RETRYABLE = "run_not_retryable"
@@ -96,7 +98,11 @@ def get_query_run(run_id: str, request: Request):
 
 @router.get("/api/v1/query-runs/{run_id}/result")
 def get_query_run_result(run_id: str, request: Request):
-    """读取结果快照，不重新执行 SQL（CONTEXT.md「结果快照」）。"""
+    """读取结果快照，不重新执行 SQL（CONTEXT.md「结果快照」）。
+
+    过期是 410 而非 409：快照曾经存在且发布过，只是超出了保留期——
+    与「从未有过可读结果」不同层；响应明确告知审计记录仍在。
+    """
     parsed_id = _parse_run_id(run_id)
     service: QueryRunService = request.app.state.runs
     data = service.snapshot(parsed_id)
@@ -108,16 +114,22 @@ def get_query_run_result(run_id: str, request: Request):
             status_code=409,
             detail={"code": QY_RESULT_NOT_READY, "message": "查询尚未完成，结果未就绪"},
         )
-    if run["state"] != "succeeded" or snap is None:
-        # 成功终态与快照同事务发布（ADR-0015）：succeeded 无快照属于
-        # 不变量破坏，与 rejected/failed/cancelled 一样按不可用处理。
+    if run["state"] != "succeeded":
+        # 只有 succeeded 有过结果：failed/rejected/cancelled 无论多久
+        # 都是「无可读结果」，不因运行变旧而改口径成过期。
+        raise _result_not_available()
+    if data["expired"]:
         raise HTTPException(
-            status_code=409,
+            status_code=410,
             detail={
-                "code": QY_RESULT_NOT_AVAILABLE,
-                "message": "该运行没有可读取的结果",
+                "code": QY_RESULT_EXPIRED,
+                "message": "结果已超过保留期，无法读取；运行审计记录仍保留",
             },
         )
+    if snap is None:
+        # 成功终态与快照同事务发布（ADR-0015）：保留期内 succeeded 无
+        # 快照属于不变量破坏，按不可用处理。
+        raise _result_not_available()
     return {
         "result": {
             "columns": snap.columns,
@@ -212,6 +224,13 @@ def _run_not_found() -> HTTPException:
     return HTTPException(
         status_code=404,
         detail={"code": "QY_RUN_NOT_FOUND", "message": "查询记录不存在"},
+    )
+
+
+def _result_not_available() -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail={"code": QY_RESULT_NOT_AVAILABLE, "message": "该运行没有可读取的结果"},
     )
 
 

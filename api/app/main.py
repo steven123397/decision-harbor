@@ -43,6 +43,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             session_factory,
             allowed_tables=contract_tables(dataset_dir),
             sql_max_length=settings.query_sql_max_length,
+            result_retention_hours=settings.result_retention_hours,
         )
         yield
         platform_engine.dispose()

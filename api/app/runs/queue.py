@@ -476,6 +476,22 @@ def finalize_expired_cancelling(
         return swept
 
 
+def purge_expired_snapshots(session_factory: sessionmaker[Session]) -> int:
+    """过期清理：删除保留期已过的快照行（expires_at <= now()）。
+
+    只删快照、不动 query_runs——审计行永久保留（CONTEXT.md「保留期」）。
+    快照独立成表使清理是整行删除（ADR-0015）。幂等：重复执行对已清空
+    的行集是空操作；保留期内（expires_at 在未来）的快照永不命中。
+    返回本次删除行数。
+    """
+    with session_factory() as session:
+        purged = session.execute(
+            text("DELETE FROM query_run_snapshots WHERE expires_at <= now()")
+        ).rowcount
+        session.commit()
+        return purged
+
+
 def set_worker_paused(session_factory: sessionmaker[Session], *, paused: bool) -> None:
     """运维排水开关：暂停时执行者不再认领新运行（已在执行的跑完为止）。
 

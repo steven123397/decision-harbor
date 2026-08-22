@@ -33,10 +33,13 @@ class QueryRunService:
         *,
         allowed_tables: frozenset[str],
         sql_max_length: int,
+        result_retention_hours: int,
     ):
         self._session_factory = session_factory
         self._limits = PolicyLimits(sql_max_length=sql_max_length)
         self._allowed_tables = allowed_tables
+        # 保留期数值的单一事实源是配置（config.result_retention_hours）。
+        self._retention_hours = result_retention_hours
 
     def submit(self, sql: str, idempotency_key: str | None = None) -> dict:
         """受理提交，outcome ∈ accepted / rejected / replayed / conflict。
@@ -125,19 +128,37 @@ class QueryRunService:
         return {"runs": [run_to_dict(r) for r in page], "next_cursor": next_cursor}
 
     def snapshot(self, run_id: int) -> dict | None:
-        """读取运行与快照。None = 运行不存在；其余由路由层区分 409/200。"""
+        """读取运行与快照。None = 运行不存在；其余由路由层区分 409/410/200。
+
+        过期在数据库侧判定（避免 Python 拼比较时区）：锚点是终态发布时间
+        ——快照行在时 expires_at（发布时已固化的截止时刻），行被清理后
+        回退到 finished_at + 当前配置的保留期（CONTEXT.md「保留期」；
+        被清理行本就因固化截止时刻已过而被删，回退口径的偏差仅在
+        事后改配置时出现）。
+        """
         with self._session_factory() as session:
             run = session.get(QueryRun, run_id)
             if run is None:
                 return None
             snap = session.execute(
                 text(
-                    "SELECT columns, rows, row_count, truncated, expires_at "
-                    "FROM query_run_snapshots WHERE run_id = :rid"
+                    "SELECT s.run_id AS snap_run_id, s.columns, s.rows, "
+                    "s.row_count, s.truncated, s.expires_at, "
+                    "COALESCE(s.expires_at, r.finished_at "
+                    "+ make_interval(hours => :retention)) <= now() AS expired "
+                    "FROM query_runs r "
+                    "LEFT JOIN query_run_snapshots s ON s.run_id = r.id "
+                    "WHERE r.id = :rid"
                 ),
-                {"rid": run_id},
+                {"rid": run_id, "retention": self._retention_hours},
             ).fetchone()
-            return {"run": run_to_dict(run), "snapshot": snap}
+            # LEFT JOIN 在快照缺失时返回全 NULL 行而非缺行；run_id 是快照
+            # 主键，以它作存在性标记。
+            return {
+                "run": run_to_dict(run),
+                "snapshot": snap if snap.snap_run_id is not None else None,
+                "expired": snap.expired,
+            }
 
     def _create(
         self, sql: str, idempotency_key: str | None, *, retry_of: int | None = None

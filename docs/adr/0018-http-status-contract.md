@@ -6,13 +6,14 @@ v0.2.0 异步生命周期下，状态码按「请求说了什么」分层，取�
 
 - **读操作成功一律 200**，响应携带运行记录本身（state / attempt / 时间戳 / 错误摘要）；未终态运行被读到不是错误，是当前事实，客户端按 state 分支。
 - **生命周期转移冲突 409**：请求意图与运行当前状态竞争失败——同键异 SQL 的 `idempotency_conflict`、结果未就绪/不可读（QY_RESULT_NOT_READY / QY_RESULT_NOT_AVAILABLE），以及取消与重试的 `run_not_cancellable` / `run_not_retryable`（#12 已落地：取消与终态发布的竞态由状态机 CAS 裁决，只有一个结局能发布）。冲突是稳定事实，携带稳定错误码与可读说明。
+- **保留期届满 410**（#14）：快照曾随成功终态发布、但已超过保留期（自终态发布时间起 24 小时）——与 409 的「从未有可读结果」不同层；响应携带 `QY_RESULT_EXPIRED` 并告知审计记录仍可读取。过期判定不依赖清理任务执行与否：快照行在时看 `expires_at`，行已被清理则回退到 `finished_at + 保留期`。
 - **策略拒绝 422**：POST 的同步治理判定不通过，响应携带 rejected 运行记录（拒绝码与说明）。拒绝针对输入本身，与运行状态竞争无关。
 - **协议层维持原位**：400 请求不合法（请求体或查询参数 limit / cursor），404 记录不存在（含非整数路径 id），503 仅 `/ready` 未就绪。
 
 ## 错误码与信封
 
-- 稳定错误码分两个家族：**协议族 `QY_` 大写前缀**（QY_INVALID_REQUEST / QY_RUN_NOT_FOUND / QY_RESULT_NOT_READY / QY_RESULT_NOT_AVAILABLE）回答「请求或读取本身有什么问题」；**生命周期冲突族小写蛇形**（`idempotency_conflict`，以及 #12 的 `run_not_cancellable` / `run_not_retryable`）回答「请求意图与运行状态机的竞争结果」。后者的小写命名由规格 #6 的 HTTP 合同直接点名，不迁就协议族前缀。
-- 错误响应两种信封：**400 一律 `{"error": {"code", "message"}}`**——请求体与查询参数共用同一形状，客户端不需要为 400 写两种解析；**404 / 409 / 5xx 用 FastAPI 惯例的 `{"detail": {...}}`**（HTTPException 默认渲染），与 v0.1.0 起的既有行为连续。
+- 稳定错误码分两个家族：**协议族 `QY_` 大写前缀**（QY_INVALID_REQUEST / QY_RUN_NOT_FOUND / QY_RESULT_NOT_READY / QY_RESULT_NOT_AVAILABLE / QY_RESULT_EXPIRED）回答「请求或读取本身有什么问题」；**生命周期冲突族小写蛇形**（`idempotency_conflict`，以及 #12 的 `run_not_cancellable` / `run_not_retryable`）回答「请求意图与运行状态机的竞争结果」。后者的小写命名由规格 #6 的 HTTP 合同直接点名，不迁就协议族前缀。
+- 错误响应两种信封：**400 一律 `{"error": {"code", "message"}}`**——请求体与查询参数共用同一形状，客户端不需要为 400 写两种解析；**404 / 409 / 410 / 5xx 用 FastAPI 惯例的 `{"detail": {...}}`**（HTTPException 默认渲染），与 v0.1.0 起的既有行为连续。
 
 ## 端点合同
 
@@ -21,7 +22,7 @@ v0.2.0 异步生命周期下，状态码按「请求说了什么」分层，取�
 | `POST /api/v1/query-runs` | 202 受理入队；422 策略拒绝；200 同键同 SQL 重放（返回原运行，含其终态）；409 `idempotency_conflict`（同键异 SQL） |
 | `GET /api/v1/query-runs` | 200 + 游标分页历史（`created_at`、`id` 双键降序，游标不透明；`limit` 默认 20、上限 100） |
 | `GET /api/v1/query-runs/{id}` | 200 + 运行记录（任意状态） |
-| `GET /{id}/result` | 200 快照；409 未终态/无可读快照；410 过期（#14 落地） |
+| `GET /{id}/result` | 200 快照（含 `expires_at`）；409 未终态/无可读快照；410 `QY_RESULT_EXPIRED` 超过保留期（24 小时，自终态发布时间起算；审计记录仍可经 `GET /{id}` 读取） |
 | `POST /{id}/cancel` | 200 取消确定生效（queued → cancelled）或对已 cancelled 幂等；202 运行中取消已受理（running → cancelling，best effort 中止底层查询）；409 `run_not_cancellable`（succeeded / failed / rejected） |
 | `POST /{id}/retry` | 202 + 新运行（仅 failed / cancelled，`retry_of` 指向原运行，attempt 预算独立）；409 `run_not_retryable`（其余状态；rejected 的 409 附「修改 SQL 后重新提交」指引） |
 

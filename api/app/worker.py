@@ -9,6 +9,10 @@
 执行的运行（自接管排除）；基础设施类失败经 queue.requeue_or_fail 回队
 重跑，attempt 硬上界 3；租约过期且耗尽的运行由 keeper 周期清扫终态。
 
+保留期清理（#14）：keeper 每周期删除保留期已过的结果快照行（幂等，
+只删超期快照，审计行永久保留）；读取路径独立判定过期（410），
+清理只负责收回存储。
+
 取消协同（#12）：续期要求 running，取消请求把运行转入 cancelling 后
 续期自然失败；keeper 据此识别取消并对执行连接调用 cancel()（best
 effort 中止底层查询），执行线程的处置被 fencing 拒绝时以
@@ -159,6 +163,16 @@ def main() -> None:
                 queue.finalize_expired_cancelling(
                     session_factory, grace_seconds=settings.worker_lease_seconds
                 )
+                # 过期快照清理（#14）：只删超期快照行，审计行不动；
+                # 幂等，通常 0 行。读取路径自带过期判定，漏扫不影响
+                # 410 语义，这里只负责收回存储。单独捕获：失败不混入
+                # 心跳/续期的诊断日志。
+                try:
+                    purged = queue.purge_expired_snapshots(session_factory)
+                    if purged:
+                        logger.info("过期快照清理：%s 行", purged)
+                except Exception:
+                    logger.exception("过期快照清理失败（不影响读取路径）")
             except Exception:
                 # 单次心跳失败不退出：租约到期前仍有后续续期机会。
                 logger.exception("keeper 心跳/续期失败")

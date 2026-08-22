@@ -73,7 +73,7 @@ _Avoid_: 权限、RBAC
 _Avoid_: 校验、过滤
 
 **只读执行器（read-only executor）**:
-以只读数据库身份在 analytics 库执行通过策略判定的 SQL 的 API 内部模块。
+以只读数据库身份在 analytics 库执行通过策略判定的 SQL 的执行侧模块；v0.2.0 起随后台执行组件运行，API 进程不执行用户 SQL。
 _Avoid_: 查询引擎
 
 ### 数据与边界

@@ -2,7 +2,7 @@
 
 DecisionHarbor 是一个面向企业内部业务人员的受治理数据分析平台。它让用户提交显式 SQL，并在受控规则内完成校验、只读执行、结果展示与查询审计。
 
-当前仓库提供首轮可运行的受治理 SQL 查询链路：Web 查询工作台、FastAPI 查询服务、PostgreSQL 双数据库（审计与固定分析数据），以及 Docker Compose 本地运行与测试命令。
+当前仓库提供可恢复的异步受治理 SQL 查询链路：Web 查询工作台、FastAPI 查询服务、后台执行组件、PostgreSQL 双数据库（审计与固定分析数据），以及 Docker Compose 本地运行与测试命令。
 
 ## 架构一览
 

@@ -21,11 +21,13 @@
 - [Design 目录说明与模板](design/README.md)：设计文档的职责、边界和最小结构。
 - [规范术语](design/CONTEXT.md)：查询运行、状态、审计事实、数据库和身份的规范语言。
 - [首轮受治理 SQL 查询链路设计](design/first-release-system-design.md)：首轮模块、数据流、安全边界、API、运行环境和测试接缝。
+- [异步查询运行生命周期设计](design/async-query-lifecycle-design.md)：v0.2.0 的状态、持久队列、Worker、结果和恢复边界。
 
 ## Plan：执行计划
 
 - [Plan 目录说明与模板](plan/README.md)：阶段计划和垂直任务的最小结构。
 - [首轮实现计划](plan/first-release-implementation-plan.md)：首轮 Web、API、数据库、查询治理与验证的执行事实源。
+- [v0.2.0 异步查询执行计划](plan/async-query-lifecycle-plan.md)：异步执行、恢复、结果和冻结验证的阶段顺序。
 
 ## Status：当前状态
 

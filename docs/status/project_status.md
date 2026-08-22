@@ -1,8 +1,11 @@
 # 项目状态
 
-更新日期：2026-07-27
+更新日期：2026-08-16
 
 ## 当前结论
+
+- v0.1.0 同步查询基座已完成冻结前回归：固定数据校验通过，API 87 项、Web 单测 26 项、Playwright 4 项全部通过。
+- 已确认 v0.2.0 采用 PostgreSQL 持久队列与独立 Worker 的异步查询生命周期；正式边界见 `docs/design/async-query-lifecycle-design.md`，执行顺序见 `docs/plan/async-query-lifecycle-plan.md`。
 
 - 首轮受治理 SQL 查询链路已实现，可通过 `./dev up` 启动 Web、API、PostgreSQL 18 和一次性初始化服务。
 - SQLGlot AST 的对象、函数与 CAST/DataType 允许模型，以及分析查询身份和显式只读事务共同约束用户 SQL；对象标识类型不能在无表引用时解析 relation、role、function、namespace 或 type catalog。
@@ -30,4 +33,5 @@
 
 ## 下一步
 
-- 对首轮实现进行合并前审查；任何范围扩展先更新正式 design，再建立新的执行计划。
+- 按 v0.2.0 计划实现异步执行、持久任务、取消、恢复、结果持久化和历史列表；每个行为切片先补失败测试，再实现和回归。
+- 完成双 Worker、故障恢复、结果保留和浏览器主链验证后，冻结 `baseline-v0.2.0`。

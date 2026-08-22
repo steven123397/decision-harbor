@@ -105,6 +105,8 @@ services:
     command: ["npm", "run", "test:e2e"]
     environment:
       PLAYWRIGHT_BASE_URL: http://web:4173
+      NO_PROXY: web,api,postgres,localhost,127.0.0.1,::1
+      no_proxy: web,api,postgres,localhost,127.0.0.1,::1
     depends_on:
       web:
         condition: service_healthy

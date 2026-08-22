@@ -4,11 +4,11 @@
 
 本文档将以下固定输入编译为可实现的首轮系统设计：
 
-- [产品需求](../background/product-requirements.md)
-- [技术约束](../background/technical-constraints.md)
-- [销售分析数据集 v1](../../datasets/sales-analytics-v1/README.md)
-- [机器可读数据契约](../../datasets/sales-analytics-v1/contract.json)
-- [数据集 manifest](../../datasets/sales-analytics-v1/manifest.json)
+- [产品需求](../../background/product-requirements.md)
+- [技术约束](../../background/technical-constraints.md)
+- [销售分析数据集 v1](../../../datasets/sales-analytics-v1/README.md)
+- [机器可读数据契约](../../../datasets/sales-analytics-v1/contract.json)
+- [数据集 manifest](../../../datasets/sales-analytics-v1/manifest.json)
 
 数据契约、公开 CSV、生成器、校验器和 manifest 仍是产品输入。本设计只规定应用如何消费这些输入，不复制或重新解释表结构、字段语义、行数和业务口径。
 
@@ -34,7 +34,7 @@
 
 ## 术语与核心场景
 
-规范术语见 [DecisionHarbor 规范术语](CONTEXT.md)。
+当前规范术语见 [DecisionHarbor 规范术语](../../../CONTEXT.md)。
 
 ### 成功查询
 

@@ -4,7 +4,7 @@ DecisionHarbor 是一个面向企业内部业务人员的受治理数据分析�
 
 当前仓库已实现首轮受治理 SQL 查询链路，包括 React 查询工作台、FastAPI、两个 PostgreSQL 逻辑数据库、SQLGlot AST 策略、查询审计、迁移、固定数据 seed 和容器化测试。
 
-项目文档的职责、阅读顺序和正式入口见 [文档索引](docs/index.md)。
+协作入口见 [Agent 工作规则](AGENTS.md)，规范术语见 [领域上下文](CONTEXT.md)。长期技术取舍记录在 [ADR](docs/adr/README.md)，当前功能规格和 tickets 记录在 `.scratch/`。
 
 ## 背景资料
 
@@ -87,4 +87,4 @@ curl http://127.0.0.1:8000/api/v1/query-runs/<query-run-id>
 ./dev test
 ```
 
-实现边界与错误语义见[首轮系统设计](docs/design/first-release-system-design.md)，当前验证状态见[项目状态](docs/status/project_status.md)。
+首轮实现的历史设计、计划和状态保存在 [历史文档](docs/archive/README.md)。v0.2.0 的异步查询生命周期以 [当前规格](.scratch/decisionharbor-v0.2.0/spec.md) 为准。

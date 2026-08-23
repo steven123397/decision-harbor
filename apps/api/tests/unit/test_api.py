@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import datetime, timezone
 from threading import Event
 from time import monotonic
@@ -7,7 +8,7 @@ from fastapi.testclient import TestClient
 import decisionharbor.api as api_module
 from decisionharbor.api import create_app
 from decisionharbor.domain import QueryColumn, QueryResult, QueryRun
-from decisionharbor.service import QueryOutcome, ServiceFailure
+from decisionharbor.service import ServiceFailure
 
 
 def terminal_run(status: str = "succeeded", code: str | None = None) -> QueryRun:
@@ -36,27 +37,40 @@ class FakeService:
     def __init__(self, failure: ServiceFailure | None = None) -> None:
         self.failure = failure
 
-    def run(self, raw_sql: str) -> QueryOutcome:
+    def submit(self, raw_sql: str) -> QueryRun:
         if self.failure:
             raise self.failure
-        return QueryOutcome(
-            query_run=terminal_run(),
-            result=QueryResult(
-                columns=(QueryColumn("answer", "integer"),),
-                rows=((1,),),
-                truncated=False,
-            ),
+        return replace(
+            terminal_run(),
+            status="queued",
+            started_at=None,
+            finished_at=None,
+            returned_row_count=None,
+            result_truncated=None,
+            duration_ms=None,
         )
 
 
 class FakeRepository:
-    def __init__(self, *, fail_get: bool = False) -> None:
+    def __init__(self, *, fail_get: bool = False, status: str = "succeeded") -> None:
         self.fail_get = fail_get
+        self.status = status
 
     def get(self, run_id: str) -> QueryRun | None:
         if self.fail_get:
             raise RuntimeError("database DSN must not escape")
-        return terminal_run() if run_id == "75e24c21-416c-4bd8-a37d-68667f4ec753" else None
+        return terminal_run(self.status) if run_id == "75e24c21-416c-4bd8-a37d-68667f4ec753" else None
+
+    def get_result(self, run_id: str) -> QueryResult | None:
+        if self.fail_get:
+            raise RuntimeError("database DSN must not escape")
+        if run_id != "75e24c21-416c-4bd8-a37d-68667f4ec753" or self.status != "succeeded":
+            return None
+        return QueryResult(
+            columns=(QueryColumn(name="answer", type="integer"),),
+            rows=((1,),),
+            truncated=False,
+        )
 
 
 def client(
@@ -68,7 +82,6 @@ def client(
         service=service or FakeService(),
         repository=repository or FakeRepository(),
         readiness_check=lambda: ready,
-        recover_on_startup=False,
     )
     return TestClient(app)
 
@@ -105,7 +118,6 @@ def test_ready_returns_promptly_when_a_dependency_probe_hangs(
         service=FakeService(),
         repository=FakeRepository(),
         readiness_check=blocked_readiness_check,
-        recover_on_startup=False,
     )
     try:
         with TestClient(app) as test_client:
@@ -121,15 +133,15 @@ def test_ready_returns_promptly_when_a_dependency_probe_hangs(
     assert response.json()["error"]["code"] == "service_not_ready"
 
 
-def test_post_returns_terminal_audit_and_immediate_result() -> None:
+def test_post_accepts_a_queued_run_without_an_immediate_result() -> None:
     with client() as test_client:
         response = test_client.post("/api/v1/query-runs", json={"sql": "SELECT 1"})
 
-    assert response.status_code == 200
+    assert response.status_code == 202
     payload = response.json()
     assert payload["error"] is None
-    assert payload["data"]["query_run"]["status"] == "succeeded"
-    assert payload["data"]["result"]["rows"] == [[1]]
+    assert payload["data"]["query_run"]["status"] == "queued"
+    assert set(payload["data"]) == {"query_run"}
 
 
 def test_policy_rejection_uses_stable_http_mapping_and_run_id() -> None:
@@ -172,6 +184,45 @@ def test_get_returns_audit_without_result_cells() -> None:
     assert set(found.json()["data"]) == {"query_run"}
     assert missing.status_code == 404
     assert missing.json()["error"]["code"] == "query_run_not_found"
+
+
+def test_get_result_returns_the_persisted_snapshot() -> None:
+    with client() as test_client:
+        response = test_client.get(
+            "/api/v1/query-runs/75e24c21-416c-4bd8-a37d-68667f4ec753/result"
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "data": {
+            "result": {
+                "columns": [{"name": "answer", "type": "integer"}],
+                "rows": [[1]],
+                "truncated": False,
+            }
+        },
+        "error": None,
+    }
+
+
+def test_get_result_reports_that_a_queued_run_is_not_ready() -> None:
+    with client(repository=FakeRepository(status="queued")) as test_client:
+        response = test_client.get(
+            "/api/v1/query-runs/75e24c21-416c-4bd8-a37d-68667f4ec753/result"
+        )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "result_not_ready"
+
+
+def test_get_result_reports_that_a_failed_run_has_no_snapshot() -> None:
+    with client(repository=FakeRepository(status="failed")) as test_client:
+        response = test_client.get(
+            "/api/v1/query-runs/75e24c21-416c-4bd8-a37d-68667f4ec753/result"
+        )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "result_unavailable"
 
 
 def test_get_maps_audit_store_failure_to_safe_envelope() -> None:

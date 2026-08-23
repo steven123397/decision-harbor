@@ -131,6 +131,7 @@ def test_runtime_database_identities_are_independently_bounded() -> None:
     analytics_url = psycopg_url("ANALYTICS_DATABASE_URL")
     readiness_url = psycopg_url("ANALYTICS_READINESS_DATABASE_URL")
     platform_url = psycopg_url("PLATFORM_DATABASE_URL")
+    platform_worker_url = psycopg_url("PLATFORM_WORKER_DATABASE_URL")
     with psycopg.connect(analytics_url) as connection:
         with connection.cursor() as cursor:
             cursor.execute("SHOW default_transaction_read_only")
@@ -163,6 +164,19 @@ def test_runtime_database_identities_are_independently_bounded() -> None:
 
     with psycopg.connect(platform_url) as connection:
         assert connection.execute("SELECT current_database()").fetchone()[0] == "platform"
+        assert connection.execute(
+            "SELECT has_table_privilege(current_user, 'query_results', 'INSERT')"
+        ).fetchone()[0] is False
+
+    with psycopg.connect(platform_worker_url) as connection:
+        privileges = connection.execute(
+            """
+            SELECT has_table_privilege(current_user, 'query_runs', 'INSERT'),
+                   has_table_privilege(current_user, 'query_runs', 'UPDATE'),
+                   has_table_privilege(current_user, 'query_results', 'INSERT')
+            """
+        ).fetchone()
+        assert privileges == (False, True, True)
 
     for statement in (
         "INSERT INTO analytics.customers (id, customer_code, display_name, region, created_at) VALUES (9999, 'X', 'X', 'East', now())",
@@ -177,6 +191,7 @@ def test_runtime_database_identities_are_independently_bounded() -> None:
         (analytics_url, ("platform", "postgres", "template1")),
         (readiness_url, ("platform", "postgres", "template1")),
         (platform_url, ("analytics", "postgres", "template1")),
+        (platform_worker_url, ("analytics", "postgres", "template1")),
     ):
         for database in forbidden_databases:
             with pytest.raises(psycopg.OperationalError):

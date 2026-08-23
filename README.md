@@ -2,7 +2,7 @@
 
 DecisionHarbor 是一个面向企业内部业务人员的受治理数据分析平台。它让用户提交显式 SQL，并在受控规则内完成校验、只读执行、结果展示与查询审计。
 
-当前仓库已实现首轮受治理 SQL 查询链路，包括 React 查询工作台、FastAPI、两个 PostgreSQL 逻辑数据库、SQLGlot AST 策略、查询审计、迁移、固定数据 seed 和容器化测试。
+当前仓库已实现持久异步 SQL 查询主链，包括 React 查询工作台、FastAPI、独立 Worker、两个 PostgreSQL 逻辑数据库、SQLGlot AST 策略、查询审计、结果快照、迁移、固定数据 seed 和容器化测试。
 
 协作入口见 [Agent 工作规则](AGENTS.md)，规范术语见 [领域上下文](CONTEXT.md)。长期技术取舍记录在 [ADR](docs/adr/README.md)，当前功能规格和 tickets 记录在 `.scratch/`。
 
@@ -63,7 +63,7 @@ API_HOST_PORT=18080 \
 
 ## 查询 API
 
-提交一条同步只读查询：
+提交一条只读查询。策略允许时，API 返回 HTTP 202 和状态为 `queued` 的查询运行；策略拒绝时，API 返回 HTTP 422 和持久化的 `rejected` 查询运行：
 
 ```bash
 curl -H 'content-type: application/json' \
@@ -71,13 +71,19 @@ curl -H 'content-type: application/json' \
   http://127.0.0.1:8000/api/v1/query-runs
 ```
 
-读取持久化审计事实：
+使用响应中的查询运行 ID 读取持久化状态。独立 Worker 会把允许的运行从 `queued` 推进到 `running`，再收敛为 `succeeded` 或 `failed`：
 
 ```bash
 curl http://127.0.0.1:8000/api/v1/query-runs/<query-run-id>
 ```
 
-历史读取不返回结果单元格；结果只随成功的 POST 即时返回。
+成功后读取持久化结果快照：
+
+```bash
+curl http://127.0.0.1:8000/api/v1/query-runs/<query-run-id>/result
+```
+
+结果尚未就绪时返回 HTTP 409 `result_not_ready`；运行已终结但没有可读快照时返回 HTTP 409 `result_unavailable`。结果读取不会重新执行 SQL。
 
 ## 测试
 

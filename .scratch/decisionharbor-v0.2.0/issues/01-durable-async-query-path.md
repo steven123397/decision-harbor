@@ -4,7 +4,7 @@
 
 **Blocked by:** None — can start immediately.
 
-**Status:** ready-for-agent
+**Status:** claimed
 
 - [ ] 合法 SQL 的首次提交同步完成请求校验与策略判定，返回 HTTP 202 和 `queued` 查询运行，不在提交请求内等待 analytics 执行或返回结果。
 - [ ] 策略拒绝返回 HTTP 422 和持久化的 `rejected` 查询运行，保留稳定策略事实且不会被 Worker 领取；既有 AST 默认拒绝、对象范围和对象标识类型转换边界保持不变。

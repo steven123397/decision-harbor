@@ -3,7 +3,7 @@ import json
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine, Row
 
-from decisionharbor.domain import QueryRun
+from decisionharbor.domain import QueryColumn, QueryResult, QueryRun
 
 
 class StateConflict(RuntimeError):
@@ -94,22 +94,116 @@ class QueryRunRepository:
             ).one_or_none()
         return _row_to_query_run(row) if row else None
 
-    def recover_interrupted(self) -> int:
+    def claim_next(self) -> QueryRun | None:
         with self._engine.begin() as connection:
-            result = connection.execute(
+            row = connection.execute(
+                text(
+                    """
+                    WITH next_run AS (
+                        SELECT id
+                        FROM query_runs
+                        WHERE status = 'queued'
+                        ORDER BY created_at, id
+                        FOR UPDATE SKIP LOCKED
+                        LIMIT 1
+                    )
+                    UPDATE query_runs AS run
+                    SET status = 'running', started_at = now()
+                    FROM next_run
+                    WHERE run.id = next_run.id AND run.status = 'queued'
+                    RETURNING run.*
+                    """
+                )
+            ).one_or_none()
+        return _row_to_query_run(row) if row else None
+
+    def publish_success(self, run_id: str, result: QueryResult) -> QueryRun:
+        columns_json = json.dumps(
+            [{"name": column.name, "type": column.type} for column in result.columns],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        rows_json = json.dumps(result.rows, ensure_ascii=False, separators=(",", ":"))
+        with self._engine.begin() as connection:
+            row = connection.execute(
+                text(
+                    """
+                    UPDATE query_runs
+                    SET status = 'succeeded',
+                        returned_row_count = :returned_row_count,
+                        result_truncated = :result_truncated,
+                        finished_at = now(),
+                        duration_ms = GREATEST(0, (EXTRACT(EPOCH FROM (now() - created_at)) * 1000)::integer)
+                    WHERE id = CAST(:id AS uuid) AND status = 'running'
+                    RETURNING *
+                    """
+                ),
+                {
+                    "id": run_id,
+                    "returned_row_count": len(result.rows),
+                    "result_truncated": result.truncated,
+                },
+            ).one_or_none()
+            if row is None:
+                raise StateConflict("query run success publication did not match running state")
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO query_results (query_run_id, columns_json, rows_json, truncated)
+                    VALUES (CAST(:id AS uuid), CAST(:columns_json AS jsonb), CAST(:rows_json AS jsonb), :truncated)
+                    """
+                ),
+                {
+                    "id": run_id,
+                    "columns_json": columns_json,
+                    "rows_json": rows_json,
+                    "truncated": result.truncated,
+                },
+            )
+        return _row_to_query_run(row)
+
+    def publish_failure(self, run_id: str, code: str, summary: str) -> QueryRun:
+        with self._engine.begin() as connection:
+            row = connection.execute(
                 text(
                     """
                     UPDATE query_runs
                     SET status = 'failed',
-                        error_code = 'execution_interrupted',
-                        error_summary = 'Execution was interrupted before completion.',
+                        error_code = :code,
+                        error_summary = :summary,
                         finished_at = now(),
                         duration_ms = GREATEST(0, (EXTRACT(EPOCH FROM (now() - created_at)) * 1000)::integer)
-                    WHERE status IN ('received', 'running')
+                    WHERE id = CAST(:id AS uuid) AND status = 'running'
+                    RETURNING *
                     """
-                )
-            )
-        return result.rowcount
+                ),
+                {"id": run_id, "code": code, "summary": summary},
+            ).one_or_none()
+        if row is None:
+            raise StateConflict("query run failure publication did not match running state")
+        return _row_to_query_run(row)
+
+    def get_result(self, run_id: str) -> QueryResult | None:
+        with self._engine.connect() as connection:
+            row = connection.execute(
+                text(
+                    """
+                    SELECT columns_json, rows_json, truncated
+                    FROM query_results
+                    WHERE query_run_id = CAST(:id AS uuid)
+                    """
+                ),
+                {"id": run_id},
+            ).one_or_none()
+        if row is None:
+            return None
+        values = row._mapping
+        return QueryResult(
+            columns=tuple(QueryColumn(name=column["name"], type=column["type"]) for column in values["columns_json"]),
+            rows=tuple(tuple(cell for cell in result_row) for result_row in values["rows_json"]),
+            truncated=values["truncated"],
+        )
+
 
 def _row_to_query_run(row: Row) -> QueryRun:
     values = row._mapping

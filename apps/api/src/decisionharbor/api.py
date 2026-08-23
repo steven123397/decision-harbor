@@ -12,9 +12,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 
-from decisionharbor.config import Settings
+from decisionharbor.config import ApiSettings
 from decisionharbor.dataset import load_dataset
-from decisionharbor.executor import PostgresQueryExecutor
 from decisionharbor.policy import SqlPolicy
 from decisionharbor.readiness import AnalyticsReadinessProbe, PlatformReadinessProbe
 from decisionharbor.repository import QueryRunRepository
@@ -53,13 +52,13 @@ class QueryRequest(BaseModel):
 
 
 class QueryService(Protocol):
-    def run(self, raw_sql: str): ...
+    def submit(self, raw_sql: str): ...
 
 
 class QueryRepository(Protocol):
     def get(self, run_id: str): ...
 
-    def recover_interrupted(self) -> int: ...
+    def get_result(self, run_id: str): ...
 
 
 def _envelope(data: object = None, error: object = None) -> dict[str, object]:
@@ -82,7 +81,6 @@ def create_app(
     service: QueryService,
     repository: QueryRepository,
     readiness_check: Callable[[], bool],
-    recover_on_startup: bool = True,
 ) -> FastAPI:
     readiness_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="readiness")
     readiness_lock = Lock()
@@ -104,8 +102,6 @@ def create_app(
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         try:
-            if recover_on_startup:
-                repository.recover_interrupted()
             yield
         finally:
             readiness_executor.shutdown(wait=False, cancel_futures=True)
@@ -156,7 +152,7 @@ def create_app(
     @app.post("/api/v1/query-runs", response_model=None)
     def create_query_run(query: QueryRequest):
         try:
-            outcome = service.run(query.sql)
+            run = service.submit(query.sql)
         except ServiceFailure as failure:
             run_id = failure.query_run.id if failure.query_run else None
             data = {"query_run": _run_payload(failure.query_run)} if failure.query_run else None
@@ -164,11 +160,9 @@ def create_app(
                 _envelope(data=data, error=_error(failure.code, failure.message, run_id)),
                 status_code=HTTP_STATUS_BY_CODE.get(failure.code, 500),
             )
-        return _envelope(
-            data={
-                "query_run": _run_payload(outcome.query_run),
-                "result": jsonable_encoder(asdict(outcome.result)),
-            }
+        return JSONResponse(
+            _envelope(data={"query_run": _run_payload(run)}),
+            status_code=202,
         )
 
     @app.get("/api/v1/query-runs/{run_id}", response_model=None)
@@ -187,26 +181,49 @@ def create_app(
             )
         return _envelope(data={"query_run": _run_payload(run)})
 
+    @app.get("/api/v1/query-runs/{run_id}/result", response_model=None)
+    def get_query_result(run_id: UUID):
+        try:
+            run = repository.get(str(run_id))
+            result = repository.get_result(str(run_id)) if run is not None else None
+        except Exception:
+            return JSONResponse(
+                _envelope(error=_error("audit_unavailable", "The audit store is unavailable.")),
+                status_code=503,
+            )
+        if run is None:
+            return JSONResponse(
+                _envelope(error=_error("query_run_not_found", "Query run was not found.")),
+                status_code=404,
+            )
+        if result is None:
+            if run.status in {"received", "queued", "running", "cancelling"}:
+                return JSONResponse(
+                    _envelope(error=_error("result_not_ready", "The query result is not ready.")),
+                    status_code=409,
+                )
+            return JSONResponse(
+                _envelope(error=_error("result_unavailable", "The query result is unavailable.")),
+                status_code=409,
+            )
+        return _envelope(data={"result": jsonable_encoder(asdict(result))})
+
     return app
 
 
 def create_runtime_app() -> FastAPI:
-    settings = Settings.from_env()
+    settings = ApiSettings.from_env()
     dataset = load_dataset(settings.dataset_root)
     repository = QueryRunRepository(settings.platform_database_url)
-    executor = PostgresQueryExecutor(settings.analytics_database_url, settings.max_concurrency)
     platform_readiness = PlatformReadinessProbe(settings.platform_database_url)
     analytics_readiness = AnalyticsReadinessProbe(settings.analytics_readiness_database_url)
     policy = SqlPolicy(dataset.allowed_tables)
     service = QueryRunService(
         repository=repository,
         policy=policy,
-        executor=executor,
         policy_version=dataset.policy_version,
         statement_timeout_ms=settings.statement_timeout_ms,
         max_rows=settings.max_rows,
-        max_concurrency=settings.max_concurrency,
-        capacity_wait_ms=settings.capacity_wait_ms,
     )
     return create_app(
         service=service,

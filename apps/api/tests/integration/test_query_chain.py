@@ -1,68 +1,73 @@
 import os
+from time import monotonic, sleep
 
-from fastapi.testclient import TestClient
+import httpx
 import pytest
-
-from decisionharbor.api import create_runtime_app
-from decisionharbor.config import Settings
-from decisionharbor.repository import QueryRunRepository
 
 
 pytestmark = pytest.mark.integration
 
+TERMINAL_STATUSES = {"rejected", "succeeded", "failed", "cancelled"}
 
-def test_real_api_success_rejection_failure_and_audit() -> None:
-    app = create_runtime_app()
-    with TestClient(app) as client:
+
+def wait_for_terminal(client: httpx.Client, run_id: str, timeout_seconds: float = 10) -> dict:
+    deadline = monotonic() + timeout_seconds
+    while monotonic() < deadline:
+        response = client.get(f"/api/v1/query-runs/{run_id}")
+        assert response.status_code == 200
+        run = response.json()["data"]["query_run"]
+        if run["status"] in TERMINAL_STATUSES:
+            return run
+        sleep(0.05)
+    pytest.fail(f"query run {run_id} did not reach a terminal state")
+
+
+def live_client() -> httpx.Client:
+    return httpx.Client(base_url=os.environ["API_BASE_URL"], timeout=5)
+
+
+def test_live_api_and_worker_complete_allowed_rejected_and_failed_runs() -> None:
+    with live_client() as client:
         assert client.get("/ready").status_code == 200
 
-        success = client.post(
+        accepted = client.post(
             "/api/v1/query-runs",
             json={"sql": "SELECT count(*) AS customer_count FROM customers"},
         )
-        assert success.status_code == 200
-        assert success.json()["data"]["result"]["rows"] == [["100"]]
-        success_run = success.json()["data"]["query_run"]
-        assert success_run["status"] == "succeeded"
-        assert success_run["referenced_objects"] == ["analytics.customers"]
+        assert accepted.status_code == 202
+        accepted_run = accepted.json()["data"]["query_run"]
+        assert accepted_run["status"] == "queued"
+        assert set(accepted.json()["data"]) == {"query_run"}
 
-        safe_casts = client.post(
-            "/api/v1/query-runs",
-            json={
-                "sql": (
-                    "SELECT customer_code::varchar(20), id::bigint, created_at::date "
-                    "FROM customers ORDER BY id LIMIT 1"
-                )
-            },
-        )
-        assert safe_casts.status_code == 200
-        assert safe_casts.json()["data"]["query_run"]["status"] == "succeeded"
-        assert safe_casts.json()["data"]["query_run"]["referenced_objects"] == ["analytics.customers"]
-        assert [column["type"] for column in safe_casts.json()["data"]["result"]["columns"]] == [
-            "character varying",
-            "bigint",
-            "date",
-        ]
+        succeeded = wait_for_terminal(client, accepted_run["id"])
+        assert succeeded["status"] == "succeeded"
+        assert succeeded["referenced_objects"] == ["analytics.customers"]
+        result = client.get(f"/api/v1/query-runs/{succeeded['id']}/result")
+        assert result.status_code == 200
+        assert result.json()["data"]["result"]["rows"] == [["100"]]
 
         rejected = client.post(
             "/api/v1/query-runs",
             json={"sql": "DELETE FROM customers"},
         )
         assert rejected.status_code == 422
+        rejected_run = rejected.json()["data"]["query_run"]
+        assert rejected_run["status"] == "rejected"
         assert rejected.json()["error"]["code"] == "sql_statement_not_allowed"
-        assert rejected.json()["data"]["query_run"]["status"] == "rejected"
+        rejected_result = client.get(f"/api/v1/query-runs/{rejected_run['id']}/result")
+        assert rejected_result.status_code == 409
+        assert rejected_result.json()["error"]["code"] == "result_unavailable"
 
-        failed = client.post(
+        accepted_failure = client.post(
             "/api/v1/query-runs",
             json={"sql": "SELECT missing_column FROM customers"},
         )
-        assert failed.status_code == 400
-        assert failed.json()["error"]["code"] == "query_semantic_error"
-        assert "column" not in failed.json()["error"]["message"].lower()
-
-        audit = client.get(f"/api/v1/query-runs/{success_run['id']}")
-        assert audit.status_code == 200
-        assert set(audit.json()["data"]) == {"query_run"}
+        assert accepted_failure.status_code == 202
+        failed = wait_for_terminal(client, accepted_failure.json()["data"]["query_run"]["id"])
+        assert failed["status"] == "failed"
+        assert failed["error_code"] == "query_semantic_error"
+        assert failed["error_summary"] == "The query is not valid for this dataset."
+        assert "column" not in failed["error_summary"].lower()
 
 
 @pytest.mark.parametrize(
@@ -78,9 +83,8 @@ def test_real_api_success_rejection_failure_and_audit() -> None:
         "SELECT 'pg_catalog.int4'::regtype::text",
     ],
 )
-def test_real_api_rejects_catalog_resolving_casts_before_execution(raw_sql: str) -> None:
-    app = create_runtime_app()
-    with TestClient(app) as client:
+def test_live_api_rejects_catalog_resolving_casts_before_execution(raw_sql: str) -> None:
+    with live_client() as client:
         response = client.post("/api/v1/query-runs", json={"sql": raw_sql})
 
     assert response.status_code == 422
@@ -89,45 +93,46 @@ def test_real_api_rejects_catalog_resolving_casts_before_execution(raw_sql: str)
     assert response.json()["data"]["query_run"]["referenced_objects"] == []
 
 
-def test_real_api_truncates_at_configured_row_limit(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("QUERY_MAX_ROWS", "2")
-    app = create_runtime_app()
-    with TestClient(app) as client:
-        response = client.post(
+def test_live_worker_preserves_explicit_result_types_and_row_bounds() -> None:
+    with live_client() as client:
+        accepted = client.post(
             "/api/v1/query-runs",
-            json={"sql": "SELECT id FROM orders ORDER BY id"},
+            json={
+                "sql": (
+                    "SELECT customer_code::varchar(20), id::bigint, created_at::date "
+                    "FROM customers ORDER BY id"
+                )
+            },
         )
-    assert response.status_code == 200
-    result = response.json()["data"]["result"]
-    assert result["rows"] == [["1"], ["2"]]
-    assert result["truncated"] is True
+        assert accepted.status_code == 202
+        run = wait_for_terminal(client, accepted.json()["data"]["query_run"]["id"])
+        assert run["status"] == "succeeded"
+        assert run["returned_row_count"] == 100
+        result = client.get(f"/api/v1/query-runs/{run['id']}/result").json()["data"]["result"]
+
+    assert [column["type"] for column in result["columns"]] == [
+        "character varying",
+        "bigint",
+        "date",
+    ]
+    assert result["truncated"] is False
 
 
-def test_real_api_maps_statement_timeout_to_a_safe_terminal_failure(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("QUERY_STATEMENT_TIMEOUT_MS", "1")
-    app = create_runtime_app()
-    with TestClient(app) as client:
-        response = client.post(
+def test_live_worker_maps_statement_timeout_to_a_safe_terminal_failure() -> None:
+    with live_client() as client:
+        accepted = client.post(
             "/api/v1/query-runs",
             json={
                 "sql": "SELECT count(*) FROM order_items a CROSS JOIN order_items b CROSS JOIN order_items c"
             },
         )
-    assert response.status_code == 504
-    assert response.json()["error"]["code"] == "query_timeout"
-    assert response.json()["data"]["query_run"]["status"] == "failed"
+        assert accepted.status_code == 202
+        failed = wait_for_terminal(
+            client,
+            accepted.json()["data"]["query_run"]["id"],
+            timeout_seconds=15,
+        )
 
-
-def test_startup_recovery_closes_interrupted_audit_records() -> None:
-    settings = Settings.from_env()
-    repository = QueryRunRepository(settings.platform_database_url)
-    received = repository.create("SELECT 1", "policy-v1", 5_000, 500)
-
-    assert repository.recover_interrupted() >= 1
-
-    recovered = repository.get(received.id)
-    assert recovered is not None
-    assert recovered.status == "failed"
-    assert recovered.error_code == "execution_interrupted"
+    assert failed["status"] == "failed"
+    assert failed["error_code"] == "query_timeout"
+    assert failed["error_summary"] == "The query exceeded its time limit."

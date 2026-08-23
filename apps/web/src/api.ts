@@ -1,6 +1,6 @@
 export type QueryRun = {
   id: string
-  status: 'received' | 'running' | 'succeeded' | 'rejected' | 'failed'
+  status: 'received' | 'queued' | 'running' | 'succeeded' | 'rejected' | 'failed'
   returned_row_count: number | null
   result_truncated: boolean | null
   duration_ms: number | null
@@ -25,9 +25,16 @@ export type QueryResponse = {
   error: ApiError | null
 }
 
+export type QueryResultResponse = {
+  data: { result: QueryResult } | null
+  error: ApiError | null
+}
+
 export type ApiClient = {
   checkReady(): Promise<boolean>
   runQuery(sql: string): Promise<QueryResponse>
+  getQueryRun(runId: string): Promise<QueryResponse>
+  getQueryResult(runId: string): Promise<QueryResultResponse>
 }
 
 export const httpApi: ApiClient = {
@@ -47,6 +54,28 @@ export const httpApi: ApiClient = {
         body: JSON.stringify({ sql }),
       })
       return (await response.json()) as QueryResponse
+    } catch {
+      return {
+        data: null,
+        error: { code: 'service_not_ready', message: 'The service is not ready.' },
+      }
+    }
+  },
+  async getQueryRun(runId) {
+    try {
+      const response = await fetch(`/api/v1/query-runs/${encodeURIComponent(runId)}`)
+      return (await response.json()) as QueryResponse
+    } catch {
+      return {
+        data: null,
+        error: { code: 'service_not_ready', message: 'The service is not ready.' },
+      }
+    }
+  },
+  async getQueryResult(runId) {
+    try {
+      const response = await fetch(`/api/v1/query-runs/${encodeURIComponent(runId)}/result`)
+      return (await response.json()) as QueryResultResponse
     } catch {
       return {
         data: null,

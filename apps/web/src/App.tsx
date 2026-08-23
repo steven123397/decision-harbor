@@ -46,17 +46,23 @@ const ERROR_MESSAGES: Record<string, string> = {
   unsupported_result_type: 'The query returned a result type that is not supported.',
   query_run_not_found: 'The query run was not found.',
   execution_interrupted: 'The query execution was interrupted before completion.',
+  result_not_ready: 'The query result is not ready yet.',
+  result_unavailable: 'This query run has no readable result.',
 }
 
 type ViewState =
   | { kind: 'idle' }
-  | { kind: 'running' }
+  | { kind: 'active'; run: QueryRun | null }
   | { kind: 'complete'; response: QueryResponse }
 
-export function App({ api = httpApi }: { api?: ApiClient }) {
+const CURRENT_RUN_KEY = 'decisionharbor.current-query-run'
+
+
+export function App({ api = httpApi, pollIntervalMs = 250 }: { api?: ApiClient; pollIntervalMs?: number }) {
   const [sql, setSql] = useState(DEFAULT_SQL)
   const [readiness, setReadiness] = useState<'checking' | 'ready' | 'unavailable'>('checking')
   const [view, setView] = useState<ViewState>({ kind: 'idle' })
+  const [currentRunId, setCurrentRunId] = useState<string | null>(() => localStorage.getItem(CURRENT_RUN_KEY))
 
   useEffect(() => {
     let active = true
@@ -68,15 +74,67 @@ export function App({ api = httpApi }: { api?: ApiClient }) {
     }
   }, [api])
 
+  useEffect(() => {
+    if (!currentRunId) return
+    let active = true
+    let timer: number | undefined
+
+    const poll = async () => {
+      const response = await api.getQueryRun(currentRunId)
+      if (!active) return
+      const run = response.data?.query_run
+      if (!run) {
+        setView({ kind: 'complete', response })
+        if (response.error?.code === 'service_not_ready') setReadiness('unavailable')
+        return
+      }
+      if (run.status === 'received' || run.status === 'queued' || run.status === 'running') {
+        setView({ kind: 'active', run })
+        timer = window.setTimeout(poll, pollIntervalMs)
+        return
+      }
+      if (run.status === 'succeeded') {
+        const resultResponse = await api.getQueryResult(run.id)
+        if (!active) return
+        setView({
+          kind: 'complete',
+          response: {
+            data: resultResponse.data ? { query_run: run, result: resultResponse.data.result } : { query_run: run },
+            error: resultResponse.error,
+          },
+        })
+        return
+      }
+      setView({ kind: 'complete', response: { data: { query_run: run }, error: response.error } })
+    }
+
+    void poll()
+    return () => {
+      active = false
+      if (timer !== undefined) window.clearTimeout(timer)
+    }
+  }, [api, currentRunId, pollIntervalMs])
+
   const runQuery = async () => {
-    if (!sql.trim() || view.kind === 'running' || readiness !== 'ready') return
-    setView({ kind: 'running' })
+    if (!sql.trim() || view.kind === 'active' || readiness !== 'ready') return
+    setView({ kind: 'active', run: null })
     const response = await api.runQuery(sql)
-    setView({ kind: 'complete', response })
+    const run = response.data?.query_run
+    if (run) {
+      localStorage.setItem(CURRENT_RUN_KEY, run.id)
+      if (run.status === 'received' || run.status === 'queued' || run.status === 'running') {
+        setView({ kind: 'active', run })
+        setCurrentRunId(run.id)
+      } else {
+        setView({ kind: 'complete', response })
+      }
+    } else {
+      setView({ kind: 'complete', response })
+    }
     if (response.error?.code === 'service_not_ready') setReadiness('unavailable')
   }
 
-  const running = view.kind === 'running'
+  const running = view.kind === 'active'
   const checkReadiness = async () => {
     setReadiness('checking')
     setReadiness((await api.checkReady()) ? 'ready' : 'unavailable')
@@ -141,7 +199,7 @@ export function App({ api = httpApi }: { api?: ApiClient }) {
 
         <section className="output" aria-live="polite">
           {view.kind === 'idle' && <IdleState />}
-          {view.kind === 'running' && <RunningState />}
+          {view.kind === 'active' && <RunningState run={view.run} />}
           {view.kind === 'complete' && <CompletedState response={view.response} />}
         </section>
       </main>
@@ -158,19 +216,32 @@ function IdleState() {
   )
 }
 
-function RunningState() {
+function RunningState({ run }: { run: QueryRun | null }) {
+  const queued = run?.status === 'queued' || run?.status === 'received'
   return (
     <div className="run-state running-state">
       <LoaderCircle className="spin" size={21} />
-      <div><strong>Running</strong><span>Policy and database checks are in progress.</span></div>
+      <div>
+        <strong>{run ? (queued ? 'Queued' : 'Running') : 'Submitting'}</strong>
+        <span>{queued ? 'Waiting for an available worker.' : 'The governed query is being processed.'}</span>
+      </div>
     </div>
   )
 }
 
 function CompletedState({ response }: { response: QueryResponse }) {
   const run = response.data?.query_run
-  if (run?.status === 'succeeded' && response.data?.result) {
-    return <SuccessState run={run} result={response.data.result} />
+  if (run?.status === 'succeeded') {
+    if (response.data?.result) return <SuccessState run={run} result={response.data.result} />
+    return (
+      <ErrorState
+        kind="failed"
+        title="Result unavailable"
+        code={response.error?.code ?? 'result_unavailable'}
+        message={safeMessage(response)}
+        run={run}
+      />
+    )
   }
   if (run?.status === 'rejected') {
     return (

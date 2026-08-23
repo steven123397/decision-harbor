@@ -1,6 +1,6 @@
-import { render, screen } from '@testing-library/react'
+import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { describe, expect, it, vi } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { App, type ApiClient, type QueryResponse } from './App'
 
@@ -31,6 +31,19 @@ const succeeded: QueryResponse = {
   error: null,
 }
 
+const queued: QueryResponse = {
+  data: {
+    query_run: {
+      ...succeeded.data!.query_run,
+      status: 'queued',
+      returned_row_count: null,
+      result_truncated: null,
+      duration_ms: null,
+    },
+  },
+  error: null,
+}
+
 const knownErrorMessages = {
   invalid_request: 'The request could not be accepted.',
   sql_empty: 'Enter a SQL query before running it.',
@@ -52,18 +65,32 @@ const knownErrorMessages = {
   unsupported_result_type: 'The query returned a result type that is not supported.',
   query_run_not_found: 'The query run was not found.',
   execution_interrupted: 'The query execution was interrupted before completion.',
+  result_not_ready: 'The query result is not ready yet.',
+  result_unavailable: 'This query run has no readable result.',
 } as const
 
 
-function api(runQuery = vi.fn().mockResolvedValue(succeeded)): ApiClient {
+function api(
+  runQuery = vi.fn().mockResolvedValue(succeeded),
+  getQueryRun = vi.fn().mockResolvedValue(succeeded),
+): ApiClient {
   return {
     checkReady: vi.fn().mockResolvedValue(true),
     runQuery,
+    getQueryRun,
+    getQueryResult: vi.fn().mockResolvedValue({
+      data: { result: succeeded.data!.result },
+      error: null,
+    }),
   }
 }
 
 
 describe('query workbench', () => {
+  beforeEach(() => {
+    localStorage.clear()
+  })
+
   it('opens directly on an editable workbench', async () => {
     render(<App api={api()} />)
 
@@ -81,7 +108,52 @@ describe('query workbench', () => {
     await userEvent.click(runButton)
 
     expect(runButton).toBeDisabled()
-    expect(screen.getByText('Running')).toBeInTheDocument()
+    expect(screen.getByText('Submitting')).toBeInTheDocument()
+  })
+
+  it('polls an accepted run and reads its persisted result after success', async () => {
+    const getQueryRun = vi.fn().mockResolvedValueOnce(queued).mockResolvedValueOnce(succeeded)
+    const pollingApi = api(vi.fn().mockResolvedValue(queued), getQueryRun)
+    render(<App api={pollingApi} pollIntervalMs={20} />)
+
+    await userEvent.click(await screen.findByRole('button', { name: 'Run query' }))
+
+    expect(await screen.findByText('Queued')).toBeInTheDocument()
+    expect(await screen.findByText('Query succeeded')).toBeInTheDocument()
+    expect(pollingApi.getQueryRun).toHaveBeenCalledTimes(2)
+    expect(pollingApi.getQueryResult).toHaveBeenCalledTimes(1)
+  })
+
+  it('restores the current run after a page refresh', async () => {
+    localStorage.setItem('decisionharbor.current-query-run', succeeded.data!.query_run.id)
+    const restoredApi = api()
+
+    render(<App api={restoredApi} pollIntervalMs={0} />)
+
+    expect(await screen.findByText('Query succeeded')).toBeInTheDocument()
+    expect(screen.getByText('East')).toBeInTheDocument()
+    expect(restoredApi.runQuery).not.toHaveBeenCalled()
+    expect(restoredApi.getQueryRun).toHaveBeenCalledWith(succeeded.data!.query_run.id)
+    expect(restoredApi.getQueryResult).toHaveBeenCalledWith(succeeded.data!.query_run.id)
+  })
+
+  it('does not overlap polling and stops after unmount', async () => {
+    let resolvePoll: ((response: QueryResponse) => void) | undefined
+    const pendingPoll = new Promise<QueryResponse>((resolve) => {
+      resolvePoll = resolve
+    })
+    const getQueryRun = vi.fn().mockReturnValue(pendingPoll)
+    const pollingApi = api(vi.fn().mockResolvedValue(queued), getQueryRun)
+    localStorage.setItem('decisionharbor.current-query-run', queued.data!.query_run.id)
+
+    const { unmount } = render(<App api={pollingApi} pollIntervalMs={0} />)
+    await waitFor(() => expect(getQueryRun).toHaveBeenCalledTimes(1))
+    expect(getQueryRun).toHaveBeenCalledWith(queued.data!.query_run.id)
+
+    unmount()
+    resolvePoll?.(queued)
+    await Promise.resolve()
+    expect(getQueryRun).toHaveBeenCalledTimes(1)
   })
 
   it('renders the result table, audit facts, and truncation warning', async () => {

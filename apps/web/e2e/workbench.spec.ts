@@ -10,7 +10,13 @@ test('runs an allowed query and renders its audit-backed result', async ({ page 
   await expect(page.getByRole('table')).toBeVisible()
   await expect(page.getByRole('columnheader', { name: /region/ })).toBeVisible()
   await expect(page.getByText(/rows$/)).toBeVisible()
-  await expect(page.getByText(/[0-9a-f]{8}-[0-9a-f-]{27}/)).toBeVisible()
+  const runId = await page.getByText(/[0-9a-f]{8}-[0-9a-f-]{27}/).textContent()
+  expect(runId).toBeTruthy()
+
+  await page.reload()
+  await expect(page.getByText('Query succeeded')).toBeVisible()
+  await expect(page.getByRole('table')).toBeVisible()
+  await expect(page.getByText(runId!)).toBeVisible()
 })
 
 

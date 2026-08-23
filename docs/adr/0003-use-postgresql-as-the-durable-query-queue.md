@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: implemented
 date: 2026-08-16
 ---
 
@@ -22,6 +22,10 @@ date: 2026-08-16
 ## Consequences
 
 任务状态与审计可以共享 PostgreSQL 事务和备份边界，本地环境无需新增基础设施。数据库同时承担队列轮询负载；Worker 的扩展能力受 platform PostgreSQL 的事务和协调能力约束。
+
+## Implementation and evidence
+
+[异步查询主链 ticket](../../.scratch/decisionharbor-v0.2.0/issues/01-durable-async-query-path.md) 落地了 `received → queued` 提交合同、基于 `FOR UPDATE SKIP LOCKED` 的独立 Worker 领取、持久结果读取和完整 Compose 链路。API 与 Worker 使用分离的最小权限身份；集成测试覆盖合法查询成功、策略同步拒绝、执行失败与结果快照读取。
 
 ## Revisit when
 

@@ -21,6 +21,7 @@ services:
     environment:
       ADMIN_DATABASE_URL: postgresql://harbor_admin:${POSTGRES_ADMIN_PASSWORD:-decisionharbor_admin_local}@postgres:5432/postgres
       PLATFORM_APP_PASSWORD: ${PLATFORM_APP_PASSWORD:-decisionharbor_platform_local}
+      PLATFORM_WORKER_PASSWORD: ${PLATFORM_WORKER_PASSWORD:-decisionharbor_worker_local}
       ANALYTICS_READER_PASSWORD: ${ANALYTICS_READER_PASSWORD:-decisionharbor_analytics_local}
       ANALYTICS_READINESS_PASSWORD: ${ANALYTICS_READINESS_PASSWORD:-decisionharbor_readiness_local}
       DATASET_ROOT: /app/datasets/sales-analytics-v1
@@ -35,13 +36,10 @@ services:
       dockerfile: apps/api/Dockerfile
     environment:
       PLATFORM_DATABASE_URL: postgresql+psycopg://platform_app:${PLATFORM_APP_PASSWORD:-decisionharbor_platform_local}@postgres:5432/platform
-      ANALYTICS_DATABASE_URL: postgresql+psycopg://analytics_reader:${ANALYTICS_READER_PASSWORD:-decisionharbor_analytics_local}@postgres:5432/analytics
       ANALYTICS_READINESS_DATABASE_URL: postgresql+psycopg://analytics_readiness:${ANALYTICS_READINESS_PASSWORD:-decisionharbor_readiness_local}@postgres:5432/analytics
       DATASET_ROOT: /app/datasets/sales-analytics-v1
       QUERY_STATEMENT_TIMEOUT_MS: ${QUERY_STATEMENT_TIMEOUT_MS:-5000}
       QUERY_MAX_ROWS: ${QUERY_MAX_ROWS:-500}
-      QUERY_MAX_CONCURRENCY: ${QUERY_MAX_CONCURRENCY:-4}
-      QUERY_CAPACITY_WAIT_MS: ${QUERY_CAPACITY_WAIT_MS:-250}
     depends_on:
       init:
         condition: service_completed_successfully
@@ -53,6 +51,21 @@ services:
     ports:
       - "${HOST_BIND_ADDRESS:-127.0.0.1}:${API_HOST_PORT:-8000}:8000"
 
+  worker:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    command: ["python", "-m", "decisionharbor.worker"]
+    environment:
+      PLATFORM_WORKER_DATABASE_URL: postgresql+psycopg://platform_worker:${PLATFORM_WORKER_PASSWORD:-decisionharbor_worker_local}@postgres:5432/platform
+      ANALYTICS_DATABASE_URL: postgresql+psycopg://analytics_reader:${ANALYTICS_READER_PASSWORD:-decisionharbor_analytics_local}@postgres:5432/analytics
+      QUERY_MAX_CONCURRENCY: ${QUERY_MAX_CONCURRENCY:-4}
+      WORKER_POLL_MS: ${WORKER_POLL_MS:-250}
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
   web:
     build:
       context: .
@@ -63,6 +76,8 @@ services:
     depends_on:
       api:
         condition: service_healthy
+      worker:
+        condition: service_started
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4173').then(r => { if (!r.ok) process.exit(1) }).catch(() => process.exit(1))"]
       interval: 2s
@@ -79,14 +94,19 @@ services:
     command: ["pytest", "-q"]
     environment:
       PLATFORM_DATABASE_URL: postgresql+psycopg://platform_app:${PLATFORM_APP_PASSWORD:-decisionharbor_platform_local}@postgres:5432/platform
+      PLATFORM_WORKER_DATABASE_URL: postgresql+psycopg://platform_worker:${PLATFORM_WORKER_PASSWORD:-decisionharbor_worker_local}@postgres:5432/platform
       ANALYTICS_DATABASE_URL: postgresql+psycopg://analytics_reader:${ANALYTICS_READER_PASSWORD:-decisionharbor_analytics_local}@postgres:5432/analytics
       ANALYTICS_READINESS_DATABASE_URL: postgresql+psycopg://analytics_readiness:${ANALYTICS_READINESS_PASSWORD:-decisionharbor_readiness_local}@postgres:5432/analytics
       TEST_ADMIN_DATABASE_URL: postgresql://harbor_admin:${POSTGRES_ADMIN_PASSWORD:-decisionharbor_admin_local}@postgres:5432/postgres
       API_BASE_URL: http://api:8000
       DATASET_ROOT: /app/datasets/sales-analytics-v1
+      NO_PROXY: web,api,worker,postgres,localhost,127.0.0.1,::1
+      no_proxy: web,api,worker,postgres,localhost,127.0.0.1,::1
     depends_on:
       api:
         condition: service_healthy
+      worker:
+        condition: service_started
 
   web-test:
     profiles: ["test"]

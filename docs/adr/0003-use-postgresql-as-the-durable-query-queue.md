@@ -25,7 +25,7 @@ date: 2026-08-16
 
 ## Implementation and evidence
 
-[异步查询主链 ticket](../../.scratch/decisionharbor-v0.2.0/issues/01-durable-async-query-path.md) 由提交 `771a3b6` 落地：`received → queued` 提交合同、基于 `FOR UPDATE SKIP LOCKED` 的独立 Worker 领取、持久结果读取和完整 Compose 链路。API 与 Worker 使用分离的最小权限身份；`apps/api/tests/integration/test_query_chain.py`、`apps/api/tests/integration/test_worker_repository.py` 和 `apps/web/e2e/workbench.spec.ts` 覆盖合法查询成功、策略同步拒绝、执行失败、结果快照读取与刷新恢复。
+[异步查询主链 ticket](../../.scratch/decisionharbor-v0.2.0/issues/01-durable-async-query-path.md) 由提交 `771a3b6` 落地，审查修复见 `68702bb`：`received → queued` 提交合同、基于 `FOR UPDATE SKIP LOCKED` 的独立 Worker 领取、持久结果读取和完整 Compose 链路。API 与 Worker 使用分离的最小权限身份；`apps/api/tests/integration/test_query_chain.py`、`apps/api/tests/integration/test_worker_repository.py` 和 `apps/web/e2e/workbench.spec.ts` 覆盖合法查询成功、策略同步拒绝、执行失败、结果快照读取与刷新恢复。
 
 ## Revisit when
 

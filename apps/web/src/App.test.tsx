@@ -166,6 +166,8 @@ describe('query workbench', () => {
     const { unmount } = renderApp(api({ getQueryRun }))
 
     await userEvent.click(await screen.findByRole('button', { name: 'Run query' }))
+    // 高负载下首次轮询可能在卸载前合法触发；本测试只约束卸载后不再轮询。
+    getQueryRun.mockClear()
     unmount()
 
     await new Promise((resolve) => setTimeout(resolve, 100))

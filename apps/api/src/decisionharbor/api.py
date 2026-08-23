@@ -13,6 +13,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 
+from decisionharbor.cleanup import is_expired
 from decisionharbor.config import Settings
 from decisionharbor.dataset import load_dataset
 from decisionharbor.domain import QueryRun, ResultSnapshot
@@ -41,6 +42,7 @@ HTTP_STATUS_BY_CODE = {
     "query_semantic_error": 400,
     "result_not_ready": 409,
     "result_unavailable": 409,
+    "result_expired": 410,
     "query_capacity_exceeded": 429,
     "query_timeout": 504,
     "analytics_unavailable": 503,
@@ -214,7 +216,31 @@ def create_app(
                 ),
                 status_code=409,
             )
-        if run.status != "succeeded" or snapshot is None:
+        if run.status != "succeeded":
+            return JSONResponse(
+                _envelope(
+                    error=_error(
+                        "result_unavailable",
+                        "The query result is not available for this run.",
+                        run.id,
+                    )
+                ),
+                status_code=409,
+            )
+        if run.finished_at is None or is_expired(run.finished_at):
+            # 已清理或未清理的过期快照统一明确过期；清理只删结果内容，
+            # succeeded 运行事实本身证明结果曾成功发布。
+            return JSONResponse(
+                _envelope(
+                    error=_error(
+                        "result_expired",
+                        "The query result has expired.",
+                        run.id,
+                    )
+                ),
+                status_code=410,
+            )
+        if snapshot is None:
             return JSONResponse(
                 _envelope(
                     error=_error(

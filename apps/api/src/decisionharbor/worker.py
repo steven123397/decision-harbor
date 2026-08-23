@@ -14,6 +14,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Connection, Engine
 import uvicorn
 
+from decisionharbor.cleanup import ResultRetentionCleaner
 from decisionharbor.config import WorkerSettings
 from decisionharbor.dataset import load_dataset
 from decisionharbor.executor import ExecutionFailure, PostgresQueryExecutor
@@ -47,6 +48,7 @@ class QueryWorker:
             settings.platform_database_url, pool_size=5, max_overflow=0, pool_pre_ping=True
         )
         self._executor = PostgresQueryExecutor(settings.analytics_database_url, settings.max_concurrency)
+        self._cleaner = ResultRetentionCleaner(self._platform)
         self._worker_id = worker_id or f"{socket.gethostname()}-{uuid4().hex[:8]}"
 
     @property
@@ -260,8 +262,19 @@ class QueryWorker:
                 except Exception:
                     logger.warning("lease renewal failed", exc_info=True)
 
+        def cleanup_loop() -> None:
+            while not stop.wait(self._settings.cleanup_interval_ms / 1_000):
+                try:
+                    removed = self._cleaner.cleanup_once()
+                    if removed:
+                        logger.info("retention cleanup removed %s expired snapshots", removed)
+                except Exception:
+                    logger.warning("retention cleanup failed", exc_info=True)
+
         heartbeat = threading.Thread(target=heartbeat_loop, name="worker-heartbeat", daemon=True)
+        cleanup = threading.Thread(target=cleanup_loop, name="worker-cleanup", daemon=True)
         heartbeat.start()
+        cleanup.start()
         logger.info("worker %s started", self._worker_id)
         try:
             while True:

@@ -22,6 +22,7 @@ def worker_settings(**overrides: int) -> WorkerSettings:
         "poll_ms": 250,
         "max_execution_attempts": 3,
         "http_port": 8001,
+        "cleanup_interval_ms": 300_000,
     }
     values.update(overrides)
     return WorkerSettings(**values)

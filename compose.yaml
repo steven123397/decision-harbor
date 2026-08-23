@@ -67,6 +67,7 @@ services:
       WORKER_POLL_MS: ${WORKER_POLL_MS:-250}
       WORKER_MAX_EXECUTION_ATTEMPTS: ${WORKER_MAX_EXECUTION_ATTEMPTS:-3}
       WORKER_HTTP_PORT: ${WORKER_HTTP_PORT:-8001}
+      WORKER_CLEANUP_INTERVAL_MS: ${WORKER_CLEANUP_INTERVAL_MS:-300000}
     depends_on:
       init:
         condition: service_completed_successfully

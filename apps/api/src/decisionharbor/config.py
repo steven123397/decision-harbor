@@ -49,6 +49,7 @@ class WorkerSettings:
     poll_ms: int
     max_execution_attempts: int
     http_port: int
+    cleanup_interval_ms: int
 
     @classmethod
     def from_env(cls) -> "WorkerSettings":
@@ -67,4 +68,5 @@ class WorkerSettings:
             poll_ms=_bounded_int("WORKER_POLL_MS", 250, 1, 60_000),
             max_execution_attempts=_bounded_int("WORKER_MAX_EXECUTION_ATTEMPTS", 3, 1, 10),
             http_port=_bounded_int("WORKER_HTTP_PORT", 8001, 1, 65_535),
+            cleanup_interval_ms=_bounded_int("WORKER_CLEANUP_INTERVAL_MS", 300_000, 1, 86_400_000),
         )

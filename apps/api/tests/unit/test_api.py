@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from threading import Event
 from time import monotonic
 
@@ -15,7 +15,11 @@ RUN_ID = "75e24c21-416c-4bd8-a37d-68667f4ec753"
 SNAPSHOT_PAYLOAD = '{"columns":[{"name":"answer","type":"integer"}],"rows":[[1]]}'
 
 
-def make_run(status: str = "succeeded", code: str | None = None) -> QueryRun:
+def make_run(
+    status: str = "succeeded",
+    code: str | None = None,
+    finished_at: datetime | None = None,
+) -> QueryRun:
     now = datetime.now(timezone.utc)
     terminal = status in ("succeeded", "rejected", "failed", "cancelled")
     allowed = status != "rejected"
@@ -34,7 +38,7 @@ def make_run(status: str = "succeeded", code: str | None = None) -> QueryRun:
         error_summary="Safe error summary." if code else None,
         created_at=now,
         started_at=now if status not in ("received", "rejected", "queued") else None,
-        finished_at=now if terminal else None,
+        finished_at=finished_at if finished_at is not None else (now if terminal else None),
         duration_ms=4 if terminal else None,
     )
 
@@ -269,3 +273,56 @@ def test_get_result_maps_audit_store_failure_to_safe_envelope() -> None:
     assert response.status_code == 503
     assert response.json()["error"]["code"] == "audit_unavailable"
     assert "DSN" not in response.text
+
+
+def test_get_result_within_the_retention_window_is_still_readable() -> None:
+    finished = datetime.now(timezone.utc) - timedelta(hours=23, minutes=59)
+    repository = FakeRepository(run=make_run("succeeded", finished_at=finished), snapshot=make_snapshot())
+    with client(repository=repository) as test_client:
+        response = test_client.get(f"/api/v1/query-runs/{RUN_ID}/result")
+
+    assert response.status_code == 200
+    assert response.json()["data"]["result"]["rows"] == [[1]]
+
+
+def test_get_result_after_the_retention_window_returns_410_result_expired() -> None:
+    finished = datetime.now(timezone.utc) - timedelta(hours=25)
+    repository = FakeRepository(run=make_run("succeeded", finished_at=finished), snapshot=make_snapshot())
+    with client(repository=repository) as test_client:
+        response = test_client.get(f"/api/v1/query-runs/{RUN_ID}/result")
+
+    assert response.status_code == 410
+    assert response.json()["error"]["code"] == "result_expired"
+    assert response.json()["error"]["query_run_id"] == RUN_ID
+
+
+def test_get_result_at_the_retention_boundary_is_still_readable() -> None:
+    finished = datetime.now(timezone.utc) - timedelta(hours=24) + timedelta(seconds=1)
+    repository = FakeRepository(run=make_run("succeeded", finished_at=finished), snapshot=make_snapshot())
+    with client(repository=repository) as test_client:
+        response = test_client.get(f"/api/v1/query-runs/{RUN_ID}/result")
+
+    assert response.status_code == 200
+
+
+def test_expired_run_missing_its_snapshot_still_reports_expired_not_unavailable() -> None:
+    finished = datetime.now(timezone.utc) - timedelta(hours=48)
+    repository = FakeRepository(run=make_run("succeeded", finished_at=finished), snapshot=None)
+    with client(repository=repository) as test_client:
+        response = test_client.get(f"/api/v1/query-runs/{RUN_ID}/result")
+
+    assert response.status_code == 410
+    assert response.json()["error"]["code"] == "result_expired"
+
+
+def test_expired_run_still_serves_full_audit_facts() -> None:
+    finished = datetime.now(timezone.utc) - timedelta(hours=25)
+    repository = FakeRepository(run=make_run("succeeded", finished_at=finished), snapshot=make_snapshot())
+    with client(repository=repository) as test_client:
+        response = test_client.get(f"/api/v1/query-runs/{RUN_ID}")
+
+    assert response.status_code == 200
+    facts = response.json()["data"]["query_run"]
+    assert facts["status"] == "succeeded"
+    assert facts["returned_row_count"] == 1
+    assert facts["raw_sql"] == "SELECT 1"

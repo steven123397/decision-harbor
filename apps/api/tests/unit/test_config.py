@@ -26,6 +26,7 @@ def test_worker_settings_defaults_match_the_spec(monkeypatch: pytest.MonkeyPatch
     assert settings.poll_ms == 250
     assert settings.max_execution_attempts == 3
     assert settings.http_port == 8001
+    assert settings.cleanup_interval_ms == 300_000
 
 
 @pytest.mark.parametrize(
@@ -37,6 +38,8 @@ def test_worker_settings_defaults_match_the_spec(monkeypatch: pytest.MonkeyPatch
         ("WORKER_HEARTBEAT_MS", "-1"),
         ("WORKER_POLL_MS", "0"),
         ("WORKER_MAX_EXECUTION_ATTEMPTS", "0"),
+        ("WORKER_CLEANUP_INTERVAL_MS", "0"),
+        ("WORKER_CLEANUP_INTERVAL_MS", "not-a-number"),
     ],
 )
 def test_non_positive_worker_configuration_is_rejected(

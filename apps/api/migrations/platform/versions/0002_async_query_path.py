@@ -49,12 +49,21 @@ def upgrade() -> None:
     )
     op.execute("REVOKE ALL ON TABLE query_results FROM PUBLIC")
     op.execute("GRANT SELECT ON TABLE query_results TO platform_app")
-    op.execute("GRANT SELECT, UPDATE ON TABLE query_runs TO platform_worker")
-    op.execute("GRANT SELECT, INSERT ON TABLE query_results TO platform_worker")
+    op.execute("GRANT SELECT ON TABLE query_runs TO platform_worker")
+    op.execute(
+        """
+        GRANT UPDATE (
+            status, returned_row_count, result_truncated,
+            error_code, error_summary, started_at, finished_at, duration_ms
+        ) ON TABLE query_runs TO platform_worker
+        """
+    )
+    op.execute("GRANT INSERT ON TABLE query_results TO platform_worker")
 
 
 def downgrade() -> None:
     op.execute("DROP TABLE query_results")
+    op.execute("REVOKE ALL ON TABLE query_runs FROM platform_worker")
     op.execute("DROP INDEX query_runs_queue_idx")
     op.execute("ALTER TABLE query_runs DROP CONSTRAINT query_runs_state_facts")
     op.execute("ALTER TABLE query_runs DROP CONSTRAINT query_runs_status_check")

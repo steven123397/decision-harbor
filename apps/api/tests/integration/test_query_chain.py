@@ -37,6 +37,7 @@ def test_live_api_and_worker_complete_allowed_rejected_and_failed_runs() -> None
         assert accepted.status_code == 202
         accepted_run = accepted.json()["data"]["query_run"]
         assert accepted_run["status"] == "queued"
+        assert "raw_sql" not in accepted_run
         assert set(accepted.json()["data"]) == {"query_run"}
 
         succeeded = wait_for_terminal(client, accepted_run["id"])
@@ -53,6 +54,7 @@ def test_live_api_and_worker_complete_allowed_rejected_and_failed_runs() -> None
         assert rejected.status_code == 422
         rejected_run = rejected.json()["data"]["query_run"]
         assert rejected_run["status"] == "rejected"
+        assert "raw_sql" not in rejected_run
         assert rejected.json()["error"]["code"] == "sql_statement_not_allowed"
         rejected_result = client.get(f"/api/v1/query-runs/{rejected_run['id']}/result")
         assert rejected_result.status_code == 409
@@ -68,6 +70,7 @@ def test_live_api_and_worker_complete_allowed_rejected_and_failed_runs() -> None
         assert failed["error_code"] == "query_semantic_error"
         assert failed["error_summary"] == "The query is not valid for this dataset."
         assert "column" not in failed["error_summary"].lower()
+        assert "raw_sql" not in failed
 
 
 @pytest.mark.parametrize(

@@ -57,6 +57,12 @@ type ViewState =
 
 const CURRENT_RUN_KEY = 'decisionharbor.current-query-run'
 
+const ACTIVE_RUN_STATUSES = new Set<QueryRun['status']>(['received', 'queued', 'running'])
+
+function isActiveRun(run: QueryRun): boolean {
+  return ACTIVE_RUN_STATUSES.has(run.status)
+}
+
 
 export function App({ api = httpApi, pollIntervalMs = 250 }: { api?: ApiClient; pollIntervalMs?: number }) {
   const [sql, setSql] = useState(DEFAULT_SQL)
@@ -88,7 +94,7 @@ export function App({ api = httpApi, pollIntervalMs = 250 }: { api?: ApiClient; 
         if (response.error?.code === 'service_not_ready') setReadiness('unavailable')
         return
       }
-      if (run.status === 'received' || run.status === 'queued' || run.status === 'running') {
+      if (isActiveRun(run)) {
         setView({ kind: 'active', run })
         timer = window.setTimeout(poll, pollIntervalMs)
         return
@@ -120,9 +126,20 @@ export function App({ api = httpApi, pollIntervalMs = 250 }: { api?: ApiClient; 
     setView({ kind: 'active', run: null })
     const response = await api.runQuery(sql)
     const run = response.data?.query_run
+    if (response.error) {
+      if (run && !isActiveRun(run)) {
+        localStorage.setItem(CURRENT_RUN_KEY, run.id)
+      } else {
+        localStorage.removeItem(CURRENT_RUN_KEY)
+        setCurrentRunId(null)
+      }
+      setView({ kind: 'complete', response })
+      if (response.error.code === 'service_not_ready') setReadiness('unavailable')
+      return
+    }
     if (run) {
       localStorage.setItem(CURRENT_RUN_KEY, run.id)
-      if (run.status === 'received' || run.status === 'queued' || run.status === 'running') {
+      if (isActiveRun(run)) {
         setView({ kind: 'active', run })
         setCurrentRunId(run.id)
       } else {
@@ -131,7 +148,6 @@ export function App({ api = httpApi, pollIntervalMs = 250 }: { api?: ApiClient; 
     } else {
       setView({ kind: 'complete', response })
     }
-    if (response.error?.code === 'service_not_ready') setReadiness('unavailable')
   }
 
   const running = view.kind === 'active'

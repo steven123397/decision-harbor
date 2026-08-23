@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict
 
 from decisionharbor.config import ApiSettings
 from decisionharbor.dataset import load_dataset
+from decisionharbor.domain import QueryRun
 from decisionharbor.policy import SqlPolicy
 from decisionharbor.readiness import AnalyticsReadinessProbe, PlatformReadinessProbe
 from decisionharbor.repository import QueryRunRepository
@@ -65,8 +66,26 @@ def _envelope(data: object = None, error: object = None) -> dict[str, object]:
     return {"data": data, "error": error}
 
 
-def _run_payload(run: object) -> dict:
-    return jsonable_encoder(asdict(run))
+def _run_payload(run: QueryRun) -> dict[str, object]:
+    return jsonable_encoder(
+        {
+            "id": run.id,
+            "status": run.status,
+            "policy_decision": run.policy_decision,
+            "policy_version": run.policy_version,
+            "referenced_objects": run.referenced_objects,
+            "statement_timeout_ms": run.statement_timeout_ms,
+            "max_rows": run.max_rows,
+            "returned_row_count": run.returned_row_count,
+            "result_truncated": run.result_truncated,
+            "error_code": run.error_code,
+            "error_summary": run.error_summary,
+            "created_at": run.created_at,
+            "started_at": run.started_at,
+            "finished_at": run.finished_at,
+            "duration_ms": run.duration_ms,
+        }
+    )
 
 
 def _error(code: str, message: str, query_run_id: str | None = None) -> dict[str, str]:

@@ -173,10 +173,14 @@ def test_runtime_database_identities_are_independently_bounded() -> None:
             """
             SELECT has_table_privilege(current_user, 'query_runs', 'INSERT'),
                    has_table_privilege(current_user, 'query_runs', 'UPDATE'),
-                   has_table_privilege(current_user, 'query_results', 'INSERT')
+                   has_column_privilege(current_user, 'query_runs', 'status', 'UPDATE'),
+                   has_column_privilege(current_user, 'query_runs', 'raw_sql', 'UPDATE'),
+                   has_column_privilege(current_user, 'query_runs', 'policy_decision', 'UPDATE'),
+                   has_table_privilege(current_user, 'query_results', 'INSERT'),
+                   has_table_privilege(current_user, 'query_results', 'SELECT')
             """
         ).fetchone()
-        assert privileges == (False, True, True)
+        assert privileges == (False, False, True, False, False, True, False)
 
     for statement in (
         "INSERT INTO analytics.customers (id, customer_code, display_name, region, created_at) VALUES (9999, 'X', 'X', 'East', now())",

@@ -157,6 +157,7 @@ def test_policy_rejection_uses_stable_http_mapping_and_run_id() -> None:
         "query_run_id": run.id,
     }
     assert response.json()["data"]["query_run"]["status"] == "rejected"
+    assert "raw_sql" not in response.json()["data"]["query_run"]
 
 
 def test_invalid_request_and_oversized_body_do_not_create_a_run() -> None:
@@ -182,6 +183,7 @@ def test_get_returns_audit_without_result_cells() -> None:
 
     assert found.status_code == 200
     assert set(found.json()["data"]) == {"query_run"}
+    assert "raw_sql" not in found.json()["data"]["query_run"]
     assert missing.status_code == 404
     assert missing.json()["error"]["code"] == "query_run_not_found"
 

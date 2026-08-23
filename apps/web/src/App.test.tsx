@@ -156,6 +156,29 @@ describe('query workbench', () => {
     expect(getQueryRun).toHaveBeenCalledTimes(1)
   })
 
+  it('stops without persisting a received run when submission cannot be completed', async () => {
+    const receivedFailure: QueryResponse = {
+      data: {
+        query_run: {
+          ...queued.data!.query_run,
+          status: 'received',
+        },
+      },
+      error: {
+        code: 'audit_unavailable',
+        message: 'Raw internal detail',
+      },
+    }
+    const getQueryRun = vi.fn()
+    render(<App api={api(vi.fn().mockResolvedValue(receivedFailure), getQueryRun)} pollIntervalMs={0} />)
+
+    await userEvent.click(await screen.findByRole('button', { name: 'Run query' }))
+
+    expect(await screen.findByText(knownErrorMessages.audit_unavailable)).toBeInTheDocument()
+    expect(getQueryRun).not.toHaveBeenCalled()
+    expect(localStorage.getItem('decisionharbor.current-query-run')).toBeNull()
+  })
+
   it('renders the result table, audit facts, and truncation warning', async () => {
     render(<App api={api()} />)
     await userEvent.click(await screen.findByRole('button', { name: 'Run query' }))

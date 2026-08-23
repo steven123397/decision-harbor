@@ -16,10 +16,9 @@ import uvicorn
 
 from decisionharbor.config import WorkerSettings
 from decisionharbor.dataset import load_dataset
-from decisionharbor.domain import QueryResult
 from decisionharbor.executor import ExecutionFailure, PostgresQueryExecutor
 from decisionharbor.readiness import AnalyticsReadinessProbe, PlatformReadinessProbe
-from decisionharbor.snapshots import SnapshotTooLarge, build_snapshot
+from decisionharbor.snapshots import BuiltSnapshot
 
 
 logger = logging.getLogger("decisionharbor.worker")
@@ -129,16 +128,8 @@ class QueryWorker:
                 max_rows=row.max_rows,
             )
 
-    def publish_success(self, claimed: ClaimedRun, result: QueryResult) -> bool:
+    def publish_success(self, claimed: ClaimedRun, snapshot: BuiltSnapshot) -> bool:
         """在一个事务内原子保存 succeeded 终态与结果快照；被栅栏时返回 False。"""
-        try:
-            snapshot = build_snapshot(result, max_rows=claimed.max_rows)
-        except SnapshotTooLarge:
-            return self.publish_failure(
-                claimed,
-                "result_too_large",
-                "The query result exceeds the supported size limit.",
-            )
         with self._platform.connect() as connection:
             fenced = False
             with connection.begin() as transaction:
@@ -243,7 +234,7 @@ class QueryWorker:
     def process(self, claimed: ClaimedRun) -> None:
         logger.info("executing run %s attempt %s", claimed.run_id, claimed.generation)
         try:
-            result = self._executor.execute(
+            snapshot = self._executor.execute(
                 claimed.raw_sql,
                 claimed.statement_timeout_ms,
                 claimed.max_rows,
@@ -256,7 +247,7 @@ class QueryWorker:
             published = self.publish_failure(claimed, "internal_error", "The query could not be completed.")
             logger.info("run %s failure published=%s code=internal_error", claimed.run_id, published)
             return
-        published = self.publish_success(claimed, result)
+        published = self.publish_success(claimed, snapshot)
         logger.info("run %s published=%s", claimed.run_id, published)
 
     def run_forever(self) -> None:

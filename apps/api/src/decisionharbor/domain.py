@@ -15,13 +15,6 @@ class QueryColumn:
 
 
 @dataclass(frozen=True)
-class QueryResult:
-    columns: tuple[QueryColumn, ...]
-    rows: tuple[tuple[JsonCell, ...], ...]
-    truncated: bool
-
-
-@dataclass(frozen=True)
 class ResultSnapshot:
     run_id: str
     payload: str

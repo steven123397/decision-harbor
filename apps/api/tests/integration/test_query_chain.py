@@ -1,32 +1,13 @@
-import os
-from pathlib import Path
-
 from fastapi.testclient import TestClient
 import pytest
 
 from decisionharbor.api import create_runtime_app
-from decisionharbor.config import WorkerSettings
 from decisionharbor.worker import QueryWorker
+
+from conftest import worker_settings
 
 
 pytestmark = pytest.mark.integration
-
-
-def worker_settings(**overrides: int) -> WorkerSettings:
-    values: dict[str, object] = {
-        "platform_database_url": os.environ["PLATFORM_WORKER_DATABASE_URL"],
-        "analytics_database_url": os.environ["ANALYTICS_DATABASE_URL"],
-        "analytics_readiness_database_url": os.environ["ANALYTICS_READINESS_DATABASE_URL"],
-        "dataset_root": Path(os.environ["DATASET_ROOT"]),
-        "max_concurrency": 4,
-        "lease_ms": 15_000,
-        "heartbeat_ms": 3_000,
-        "poll_ms": 250,
-        "max_execution_attempts": 3,
-        "http_port": 8001,
-    }
-    values.update(overrides)
-    return WorkerSettings(**values)
 
 
 def submit(client: TestClient, sql: str):

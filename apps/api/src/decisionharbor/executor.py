@@ -1,5 +1,7 @@
+from collections.abc import Callable, Sequence
 from datetime import date, datetime
 from decimal import Decimal
+from typing import Protocol
 from uuid import uuid4
 
 import psycopg
@@ -7,7 +9,8 @@ from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import DBAPIError
 
-from decisionharbor.domain import JsonCell, QueryColumn, QueryResult
+from decisionharbor.domain import JsonCell, QueryColumn
+from decisionharbor.snapshots import BuiltSnapshot, SnapshotBuilder, SnapshotTooLarge
 
 
 TYPE_NAMES = {
@@ -32,26 +35,60 @@ class ExecutionFailure(Exception):
         self.message = message
 
 
+class ResultColumnDescription(Protocol):
+    """psycopg 游标描述列的最小接口。"""
+
+    name: str
+    type_code: int
+
+
+def _unsupported_type_failure() -> ExecutionFailure:
+    return ExecutionFailure(
+        "unsupported_result_type",
+        "The query returned a result type that is not supported.",
+    )
+
+
 def serialize_cell(value: object, type_oid: int) -> JsonCell:
     if type_oid not in TYPE_NAMES:
-        raise ExecutionFailure(
-            "unsupported_result_type",
-            "The query returned a result type that is not supported.",
-        )
+        raise _unsupported_type_failure()
     if value is None:
         return None
     if type_oid in {20, 1700}:
         if not isinstance(value, (int, Decimal)):
-            raise ExecutionFailure("unsupported_result_type", "The query returned a result type that is not supported.")
+            raise _unsupported_type_failure()
         return str(value)
     if isinstance(value, (date, datetime)):
         return value.isoformat()
     if isinstance(value, (bool, int, str)):
         return value
-    raise ExecutionFailure(
-        "unsupported_result_type",
-        "The query returned a result type that is not supported.",
-    )
+    raise _unsupported_type_failure()
+
+
+def extract_snapshot(
+    fetch_row: Callable[[], Sequence[object] | None],
+    description: Sequence[ResultColumnDescription],
+    max_rows: int,
+) -> BuiltSnapshot:
+    """逐行提取并按快照预算累计；预算耗尽即停止读取，不先完整物化再截断。"""
+    columns: list[QueryColumn] = []
+    for column in description:
+        type_name = TYPE_NAMES.get(column.type_code)
+        if type_name is None:
+            raise _unsupported_type_failure()
+        columns.append(QueryColumn(name=column.name, type=type_name))
+    type_codes = [column.type_code for column in description]
+    builder = SnapshotBuilder(tuple(columns), max_rows=max_rows)
+    while True:
+        row = fetch_row()
+        if row is None:
+            break
+        serialized = tuple(
+            serialize_cell(value, type_codes[index]) for index, value in enumerate(row)
+        )
+        if not builder.add_row(serialized):
+            break
+    return builder.build()
 
 
 class PostgresQueryExecutor:
@@ -63,7 +100,7 @@ class PostgresQueryExecutor:
             pool_pre_ping=True,
         )
 
-    def execute(self, raw_sql: str, statement_timeout_ms: int, max_rows: int) -> QueryResult:
+    def execute(self, raw_sql: str, statement_timeout_ms: int, max_rows: int) -> BuiltSnapshot:
         try:
             with self._engine.connect() as connection:
                 with connection.begin():
@@ -75,26 +112,15 @@ class PostgresQueryExecutor:
                     driver_connection = connection.connection.driver_connection
                     with driver_connection.cursor(name=f"query_{uuid4().hex}") as cursor:
                         cursor.execute(raw_sql)
-                        description = cursor.description or ()
-                        for column in description:
-                            if column.type_code not in TYPE_NAMES:
-                                raise ExecutionFailure(
-                                    "unsupported_result_type",
-                                    "The query returned a result type that is not supported.",
-                                )
-                        fetched_rows = cursor.fetchmany(max_rows + 1)
-                        truncated = len(fetched_rows) > max_rows
-                        rows = tuple(
-                            tuple(serialize_cell(value, description[index].type_code) for index, value in enumerate(row))
-                            for row in fetched_rows[:max_rows]
-                        )
-                        columns = tuple(
-                            QueryColumn(name=column.name, type=TYPE_NAMES[column.type_code])
-                            for column in description
-                        )
-                        return QueryResult(columns=columns, rows=rows, truncated=truncated)
+                        # 逐行读取：内存上限为单行大小加 1 MiB 快照预算。
+                        return extract_snapshot(cursor.fetchone, cursor.description or (), max_rows)
         except ExecutionFailure:
             raise
+        except SnapshotTooLarge:
+            raise ExecutionFailure(
+                "result_too_large",
+                "The query result exceeds the supported size limit.",
+            ) from None
         except psycopg.Error as exc:
             raise map_database_error(exc) from exc
         except DBAPIError as exc:
@@ -103,6 +129,7 @@ class PostgresQueryExecutor:
             raise ExecutionFailure("analytics_unavailable", "The analytics database is unavailable.") from exc
         except Exception as exc:
             raise ExecutionFailure("internal_error", "The query could not be completed.") from exc
+
 
 def map_database_error(error: psycopg.Error) -> ExecutionFailure:
     sqlstate = error.sqlstate or ""

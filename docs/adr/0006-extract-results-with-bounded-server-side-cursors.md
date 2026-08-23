@@ -1,6 +1,7 @@
 ---
 status: implemented
 date: 2026-07-20
+updated: 2026-08-23
 ---
 
 # 使用服务端游标有界提取查询结果
@@ -24,7 +25,7 @@ analytics 执行器使用服务端游标按有限批次提取，并在已能判�
 
 ## Implementation and evidence
 
-提交 `6e3964f` 的 `PostgresQueryExecutor` 使用命名服务端游标、`fetchmany(max_rows + 1)`、有界连接池和事务上下文；集成测试覆盖真实 PostgreSQL 上的行数截断、只读权限和语句超时。
+提交 `6e3964f` 的 `PostgresQueryExecutor` 建立命名服务端游标、有界连接池和事务上下文。v0.2.0 起执行器改为 `fetchone` 逐行提取并在 `SnapshotBuilder` 中增量累计 500 行 / 1 MiB 预算，预算耗尽立即停止读取（见 `executor.py` 与 `snapshots.py`）；集成测试覆盖真实 PostgreSQL 上的行数与字节截断、结构性超限、只读权限和语句超时。
 
 ## Revisit when
 

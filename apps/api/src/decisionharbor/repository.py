@@ -1,13 +1,28 @@
+import hashlib
 import json
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine, Row
+from sqlalchemy.exc import IntegrityError
 
-from decisionharbor.domain import QueryRun, ResultSnapshot
+from decisionharbor.domain import IdempotencyRecord, QueryRun, ResultSnapshot
 
 
 class StateConflict(RuntimeError):
     pass
+
+
+class IdempotencyKeyTaken(RuntimeError):
+    """并发提交同一幂等键：唯一约束已由先提交的事务占用。"""
+
+
+# 提交幂等的实例级作用域；当前版本没有用户或租户。
+IDEMPOTENCY_SCOPE_SUBMIT = "submit"
+
+
+def request_fingerprint(raw_sql: str) -> str:
+    """幂等重放的输入指纹：相同 SQL 才视为完全相同输入。"""
+    return hashlib.sha256(raw_sql.encode("utf-8")).hexdigest()
 
 
 TRANSITION_COLUMNS = frozenset(
@@ -36,28 +51,73 @@ class QueryRunRepository:
         policy_version: str,
         statement_timeout_ms: int,
         max_rows: int,
+        idempotency_key: str | None = None,
     ) -> QueryRun:
         run = QueryRun.received(raw_sql, policy_version, statement_timeout_ms, max_rows)
-        with self._engine.begin() as connection:
+        try:
+            with self._engine.begin() as connection:
+                row = connection.execute(
+                    text(
+                        """
+                        INSERT INTO query_runs (
+                            id, raw_sql, status, policy_decision, policy_version,
+                            referenced_objects, statement_timeout_ms, max_rows, created_at
+                        ) VALUES (
+                            CAST(:id AS uuid), :raw_sql, :status, :policy_decision, :policy_version,
+                            CAST(:referenced_objects AS jsonb), :statement_timeout_ms, :max_rows, :created_at
+                        )
+                        RETURNING *
+                        """
+                    ),
+                    {
+                        **run.__dict__,
+                        "referenced_objects": json.dumps(run.referenced_objects),
+                    },
+                ).one()
+                if idempotency_key is not None:
+                    try:
+                        connection.execute(
+                            text(
+                                """
+                                INSERT INTO idempotency_keys (scope, key, request_fingerprint, run_id)
+                                VALUES (:scope, :key, :request_fingerprint, CAST(:run_id AS uuid))
+                                """
+                            ),
+                            {
+                                "scope": IDEMPOTENCY_SCOPE_SUBMIT,
+                                "key": idempotency_key,
+                                "request_fingerprint": request_fingerprint(raw_sql),
+                                "run_id": run.id,
+                            },
+                        )
+                    except IntegrityError as exc:
+                        # 只有键占用的唯一冲突才映射为幂等竞态；其他完整性
+                        # 失败继续向上抛出，由服务按审计存储不可用收敛。
+                        if exc.orig is not None and getattr(exc.orig, "sqlstate", None) == "23505":
+                            raise IdempotencyKeyTaken() from exc
+                        raise
+        except IdempotencyKeyTaken:
+            raise
+        return _row_to_query_run(row)
+
+    def find_idempotency(self, scope: str, key: str) -> IdempotencyRecord | None:
+        with self._engine.connect() as connection:
             row = connection.execute(
                 text(
-                    """
-                    INSERT INTO query_runs (
-                        id, raw_sql, status, policy_decision, policy_version,
-                        referenced_objects, statement_timeout_ms, max_rows, created_at
-                    ) VALUES (
-                        CAST(:id AS uuid), :raw_sql, :status, :policy_decision, :policy_version,
-                        CAST(:referenced_objects AS jsonb), :statement_timeout_ms, :max_rows, :created_at
-                    )
-                    RETURNING *
-                    """
+                    "SELECT scope, key, request_fingerprint, run_id FROM idempotency_keys "
+                    "WHERE scope = :scope AND key = :key"
                 ),
-                {
-                    **run.__dict__,
-                    "referenced_objects": json.dumps(run.referenced_objects),
-                },
-            ).one()
-        return _row_to_query_run(row)
+                {"scope": scope, "key": key},
+            ).one_or_none()
+        if row is None:
+            return None
+        values = row._mapping
+        return IdempotencyRecord(
+            scope=values["scope"],
+            key=values["key"],
+            request_fingerprint=values["request_fingerprint"],
+            run_id=str(values["run_id"]),
+        )
 
     def transition(self, run_id: str, expected_status: str, **changes: object) -> QueryRun:
         unknown = set(changes) - TRANSITION_COLUMNS

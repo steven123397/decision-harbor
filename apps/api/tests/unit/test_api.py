@@ -3,6 +3,7 @@ from threading import Event
 from time import monotonic
 
 from fastapi.testclient import TestClient
+import pytest
 
 import decisionharbor.api as api_module
 from decisionharbor.api import create_app
@@ -58,8 +59,10 @@ class FakeService:
     def __init__(self, failure: ServiceFailure | None = None, status: str = "queued") -> None:
         self.failure = failure
         self.status = status
+        self.submitted: list[tuple[str, str | None]] = []
 
-    def submit(self, raw_sql: str) -> QueryRun:
+    def submit(self, raw_sql: str, idempotency_key: str | None = None) -> QueryRun:
+        self.submitted.append((raw_sql, idempotency_key))
         if self.failure:
             raise self.failure
         return make_run(self.status)
@@ -188,6 +191,69 @@ def test_invalid_request_and_oversized_body_do_not_create_a_run() -> None:
     assert oversized.status_code == 422
     assert oversized.json()["error"]["code"] == "invalid_request"
     assert "query_run_id" not in oversized.json()["error"]
+
+
+def test_post_forwards_the_idempotency_key_to_the_service() -> None:
+    service = FakeService()
+    with client(service) as test_client:
+        response = test_client.post(
+            "/api/v1/query-runs",
+            json={"sql": "SELECT 1"},
+            headers={"Idempotency-Key": "key-1"},
+        )
+
+    assert response.status_code == 202
+    assert service.submitted == [("SELECT 1", "key-1")]
+
+
+def test_idempotency_conflict_maps_to_http_409() -> None:
+    failure = ServiceFailure("idempotency_conflict", "The key was reused with different input.", None)
+    with client(FakeService(failure)) as test_client:
+        response = test_client.post(
+            "/api/v1/query-runs",
+            json={"sql": "SELECT 2"},
+            headers={"Idempotency-Key": "key-1"},
+        )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "idempotency_conflict"
+    assert response.json()["data"] is None
+
+
+def test_invalid_idempotency_keys_are_rejected_before_creating_a_run() -> None:
+    service = FakeService()
+    # 空键在传输层等同于缺失，但直接到达服务端时也必须拒绝。
+    assert api_module._idempotency_key_error("") is not None
+    with client(service) as test_client:
+        for key in (
+            "a" * 129,  # 超过 128 字符
+            "key with space",  # 空格不可见
+            "tab\tkey",  # 制表符不可见
+            b"caf\xe9",  # 非 ASCII：按 HTTP 字节语义以 latin-1 字节发出
+        ):
+            response = test_client.post(
+                "/api/v1/query-runs",
+                json={"sql": "SELECT 1"},
+                headers={"Idempotency-Key": key},
+            )
+
+            assert response.status_code == 422, key
+            assert response.json()["error"]["code"] == "invalid_idempotency_key", key
+            assert response.json()["data"] is None
+            assert service.submitted == []
+
+
+def test_a_128_character_visible_ascii_key_is_accepted() -> None:
+    service = FakeService()
+    with client(service) as test_client:
+        response = test_client.post(
+            "/api/v1/query-runs",
+            json={"sql": "SELECT 1"},
+            headers={"Idempotency-Key": "k" * 128},
+        )
+
+    assert response.status_code == 202
+    assert service.submitted == [("SELECT 1", "k" * 128)]
 
 
 def test_get_returns_audit_without_result_cells() -> None:

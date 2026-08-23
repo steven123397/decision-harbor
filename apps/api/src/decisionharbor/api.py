@@ -25,11 +25,13 @@ from decisionharbor.service import QueryRunService, ServiceFailure
 
 MAX_REQUEST_BYTES = 128 * 1024
 READINESS_TIMEOUT_SECONDS = 1.0
+IDEMPOTENCY_KEY_MAX_CHARS = 128
 
 TERMINAL_STATUSES = frozenset({"rejected", "succeeded", "failed", "cancelled"})
 
 HTTP_STATUS_BY_CODE = {
     "invalid_request": 422,
+    "invalid_idempotency_key": 422,
     "sql_empty": 422,
     "sql_too_large": 422,
     "sql_parse_error": 422,
@@ -43,6 +45,7 @@ HTTP_STATUS_BY_CODE = {
     "result_not_ready": 409,
     "result_unavailable": 409,
     "result_expired": 410,
+    "idempotency_conflict": 409,
     "query_capacity_exceeded": 429,
     "query_timeout": 504,
     "analytics_unavailable": 503,
@@ -61,7 +64,7 @@ class QueryRequest(BaseModel):
 
 
 class QueryService(Protocol):
-    def submit(self, raw_sql: str) -> QueryRun: ...
+    def submit(self, raw_sql: str, idempotency_key: str | None = None) -> QueryRun: ...
 
 
 class QueryRepository(Protocol):
@@ -83,6 +86,15 @@ def _error(code: str, message: str, query_run_id: str | None = None) -> dict[str
     if query_run_id:
         payload["query_run_id"] = query_run_id
     return payload
+
+
+def _idempotency_key_error(key: str) -> str | None:
+    """键为 1 到 128 个可见 ASCII 字符；非法时返回错误消息。"""
+    if not 1 <= len(key) <= IDEMPOTENCY_KEY_MAX_CHARS:
+        return "The idempotency key must be 1 to 128 characters."
+    if not all(33 <= ord(character) <= 126 for character in key):
+        return "The idempotency key must contain only visible ASCII characters."
+    return None
 
 
 def create_app(
@@ -159,9 +171,17 @@ def create_app(
         return _envelope(data={"status": "ready"})
 
     @app.post("/api/v1/query-runs", response_model=None)
-    def create_query_run(query: QueryRequest):
+    def create_query_run(query: QueryRequest, request: Request):
+        idempotency_key = request.headers.get("Idempotency-Key")
+        if idempotency_key is not None:
+            invalid_reason = _idempotency_key_error(idempotency_key)
+            if invalid_reason is not None:
+                return JSONResponse(
+                    _envelope(error=_error("invalid_idempotency_key", invalid_reason)),
+                    status_code=422,
+                )
         try:
-            run = service.submit(query.sql)
+            run = service.submit(query.sql, idempotency_key=idempotency_key)
         except ServiceFailure as failure:
             run_id = failure.query_run.id if failure.query_run else None
             data = {"query_run": _run_payload(failure.query_run)} if failure.query_run else None

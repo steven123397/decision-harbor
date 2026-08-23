@@ -25,6 +25,16 @@ class ResultSnapshot:
 
 
 @dataclass(frozen=True)
+class IdempotencyRecord:
+    """提交幂等键的持久化占用：键作用域内与请求指纹绑定到唯一查询运行。"""
+
+    scope: str
+    key: str
+    request_fingerprint: str
+    run_id: str
+
+
+@dataclass(frozen=True)
 class QueryRun:
     id: str
     raw_sql: str

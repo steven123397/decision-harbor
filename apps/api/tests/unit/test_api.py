@@ -56,16 +56,32 @@ def make_snapshot() -> ResultSnapshot:
 
 
 class FakeService:
-    def __init__(self, failure: ServiceFailure | None = None, status: str = "queued") -> None:
+    def __init__(
+        self,
+        failure: ServiceFailure | None = None,
+        status: str = "queued",
+        cancel_outcome: str = "cancelled",
+        cancel_failure: ServiceFailure | None = None,
+    ) -> None:
         self.failure = failure
         self.status = status
+        self.cancel_outcome = cancel_outcome
+        self.cancel_failure = cancel_failure
         self.submitted: list[tuple[str, str | None]] = []
+        self.cancelled: list[str] = []
 
     def submit(self, raw_sql: str, idempotency_key: str | None = None) -> QueryRun:
         self.submitted.append((raw_sql, idempotency_key))
         if self.failure:
             raise self.failure
         return make_run(self.status)
+
+    def cancel(self, run_id: str) -> tuple[str, QueryRun]:
+        self.cancelled.append(run_id)
+        if self.cancel_failure:
+            raise self.cancel_failure
+        status_by_outcome = {"cancelled": "cancelled", "cancelling": "cancelling", "terminal": "succeeded"}
+        return self.cancel_outcome, make_run(status_by_outcome[self.cancel_outcome])
 
 
 class FakeRepository:
@@ -392,3 +408,58 @@ def test_expired_run_still_serves_full_audit_facts() -> None:
     assert facts["status"] == "succeeded"
     assert facts["returned_row_count"] == 1
     assert facts["raw_sql"] == "SELECT 1"
+
+
+def test_cancel_maps_service_outcomes_to_the_http_contract() -> None:
+    for outcome, status_code, run_status in (
+        ("cancelled", 200, "cancelled"),
+        ("cancelling", 202, "cancelling"),
+        ("terminal", 200, "succeeded"),
+    ):
+        service = FakeService(cancel_outcome=outcome)
+        with client(service) as test_client:
+            response = test_client.post(f"/api/v1/query-runs/{RUN_ID}/cancel")
+
+        assert response.status_code == status_code, outcome
+        assert response.json()["error"] is None, outcome
+        assert response.json()["data"]["query_run"]["status"] == run_status, outcome
+        assert service.cancelled == [RUN_ID], outcome
+
+
+def test_cancel_of_a_not_cancellable_run_maps_to_409() -> None:
+    run = make_run("failed", "query_semantic_error")
+    service = FakeService(
+        cancel_failure=ServiceFailure("query_run_not_cancellable", "The query run cannot be cancelled.", run)
+    )
+    with client(service) as test_client:
+        response = test_client.post(f"/api/v1/query-runs/{RUN_ID}/cancel")
+
+    assert response.status_code == 409
+    assert response.json()["data"] is None
+    assert response.json()["error"] == {
+        "code": "query_run_not_cancellable",
+        "message": "The query run cannot be cancelled.",
+        "query_run_id": RUN_ID,
+    }
+
+
+def test_cancel_of_an_unknown_run_is_not_found() -> None:
+    service = FakeService(
+        cancel_failure=ServiceFailure("query_run_not_found", "Query run was not found.", None)
+    )
+    with client(service) as test_client:
+        response = test_client.post(f"/api/v1/query-runs/{RUN_ID}/cancel")
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "query_run_not_found"
+    assert response.json()["data"] is None
+
+
+def test_cancel_maps_audit_failure_to_a_safe_envelope() -> None:
+    service = FakeService(cancel_failure=ServiceFailure("audit_unavailable", "The audit store is unavailable.", None))
+    with client(service) as test_client:
+        response = test_client.post(f"/api/v1/query-runs/{RUN_ID}/cancel")
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "audit_unavailable"
+    assert "DSN" not in response.text

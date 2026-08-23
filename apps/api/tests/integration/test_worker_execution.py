@@ -674,7 +674,9 @@ def test_recorded_cancellation_intent_blocks_auto_retry() -> None:
 
     repository = QueryRunRepository(os.environ["PLATFORM_DATABASE_URL"])
     run = repository.get(run_id)
-    assert run is not None and run.status == "cancelling"
+    # 数据库工作结束（analytics 不可用即失败返回）：取消意图未被自动尝试绕过，
+    # 当前所有者把运行收敛为 cancelled 终态（06 交付的收敛路径）。
+    assert run is not None and run.status == "cancelled"
     attempts = attempt_rows(engine, run_id)
     assert [attempt["generation"] for attempt in attempts] == [1]
     assert attempts[0]["finished_at"] is not None

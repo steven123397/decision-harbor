@@ -5,7 +5,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine, Row
 from sqlalchemy.exc import IntegrityError
 
-from decisionharbor.domain import IdempotencyRecord, QueryRun, ResultSnapshot
+from decisionharbor.domain import IdempotencyRecord, QueryRun, ResultSnapshot, finished_fields
 
 
 class StateConflict(RuntimeError):
@@ -18,6 +18,16 @@ class IdempotencyKeyTaken(RuntimeError):
 
 # 提交幂等的实例级作用域；当前版本没有用户或租户。
 IDEMPOTENCY_SCOPE_SUBMIT = "submit"
+
+# 取消请求的结果口径：取消意图与终态发布的竞态由条件更新竞争后落定的稳定结论。
+CANCEL_OUTCOME_CANCELLED = "cancelled"  # queued 直接取消为 cancelled 终态
+CANCEL_OUTCOME_CANCELLING = "cancelling"  # running 进入 cancelling 或重复取消幂等命中
+CANCEL_OUTCOME_TERMINAL = "terminal"  # cancelled/succeeded：返回既有终态事实
+CANCEL_OUTCOME_NOT_CANCELLABLE = "not_cancellable"  # rejected/failed/received 不可取消
+CANCEL_OUTCOME_NOT_FOUND = "not_found"
+
+# 条件更新竞争的重读上限：运行状态只前进，数据库行锁分出先后后必然稳定。
+CANCEL_RETRY_STEPS = 8
 
 
 def request_fingerprint(raw_sql: str) -> str:
@@ -145,6 +155,37 @@ class QueryRunRepository:
         if row is None:
             raise StateConflict("query run transition did not match expected state")
         return _row_to_query_run(row)
+
+    def cancel(self, run_id: str) -> tuple[str, QueryRun | None]:
+        """按条件更新竞争记录取消意图：queued 直接终态化，running 先进入 cancelling。
+
+        与领取、终态发布的竞态由数据库行锁仲裁：条件更新失败即重读后按新状态处理，
+        因此取消意图先落则取消获胜，成功终态先提交则迟到取消返回既有事实。
+        """
+        for _ in range(CANCEL_RETRY_STEPS):
+            run = self.get(run_id)
+            if run is None:
+                return (CANCEL_OUTCOME_NOT_FOUND, None)
+            if run.status == "queued":
+                try:
+                    cancelled = self.transition(
+                        run_id, "queued", status="cancelled", **finished_fields(run)
+                    )
+                except StateConflict:
+                    continue  # 与领取竞争：重读后按 running 记录取消意图
+                return (CANCEL_OUTCOME_CANCELLED, cancelled)
+            if run.status == "running":
+                try:
+                    cancelling = self.transition(run_id, "running", status="cancelling")
+                except StateConflict:
+                    continue  # 与终态发布竞争：重读后返回既有事实
+                return (CANCEL_OUTCOME_CANCELLING, cancelling)
+            if run.status == "cancelling":
+                return (CANCEL_OUTCOME_CANCELLING, run)
+            if run.status in ("cancelled", "succeeded"):
+                return (CANCEL_OUTCOME_TERMINAL, run)
+            return (CANCEL_OUTCOME_NOT_CANCELLABLE, run)
+        raise StateConflict("cancellation could not be settled against concurrent transitions")
 
     def get(self, run_id: str) -> QueryRun | None:
         with self._engine.connect() as connection:

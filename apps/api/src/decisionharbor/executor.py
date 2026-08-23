@@ -1,13 +1,15 @@
 from collections.abc import Callable, Sequence
 from datetime import date, datetime
 from decimal import Decimal
+import threading
 from typing import Protocol
 from uuid import uuid4
 
 import psycopg
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import DBAPIError
+from sqlalchemy.pool import NullPool
 
 from decisionharbor.domain import JsonCell, QueryColumn
 from decisionharbor.snapshots import BuiltSnapshot, SnapshotBuilder, SnapshotTooLarge
@@ -99,8 +101,19 @@ class PostgresQueryExecutor:
             max_overflow=0,
             pool_pre_ping=True,
         )
+        # 取消请求走独立连接：不与执行连接争用同一连接池。
+        self._cancel_engine: Engine = create_engine(database_url, poolclass=NullPool, pool_pre_ping=True)
+        self._active_lock = threading.Lock()
+        self._active_backends: dict[str, int] = {}
 
-    def execute(self, raw_sql: str, statement_timeout_ms: int, max_rows: int) -> BuiltSnapshot:
+    def execute(
+        self,
+        raw_sql: str,
+        statement_timeout_ms: int,
+        max_rows: int,
+        *,
+        cancel_key: str | None = None,
+    ) -> BuiltSnapshot:
         try:
             with self._engine.connect() as connection:
                 with connection.begin():
@@ -110,10 +123,18 @@ class PostgresQueryExecutor:
                         (f"{statement_timeout_ms}ms",),
                     )
                     driver_connection = connection.connection.driver_connection
-                    with driver_connection.cursor(name=f"query_{uuid4().hex}") as cursor:
-                        cursor.execute(raw_sql)
-                        # 逐行读取：内存上限为单行大小加 1 MiB 快照预算。
-                        return extract_snapshot(cursor.fetchone, cursor.description or (), max_rows)
+                    if cancel_key is not None:
+                        with self._active_lock:
+                            self._active_backends[cancel_key] = driver_connection.info.backend_pid
+                    try:
+                        with driver_connection.cursor(name=f"query_{uuid4().hex}") as cursor:
+                            cursor.execute(raw_sql)
+                            # 逐行读取：内存上限为单行大小加 1 MiB 快照预算。
+                            return extract_snapshot(cursor.fetchone, cursor.description or (), max_rows)
+                    finally:
+                        if cancel_key is not None:
+                            with self._active_lock:
+                                self._active_backends.pop(cancel_key, None)
         except ExecutionFailure:
             raise
         except SnapshotTooLarge:
@@ -129,6 +150,26 @@ class PostgresQueryExecutor:
             raise ExecutionFailure("analytics_unavailable", "The analytics database is unavailable.") from exc
         except Exception as exc:
             raise ExecutionFailure("internal_error", "The query could not be completed.") from exc
+
+    def cancel_active(self, cancel_key: str) -> bool:
+        """Best effort 请求数据库取消：向注册中的执行后端发送 pg_cancel_backend。
+
+        取消失败（后端已结束、请求被拒绝或数据库不可达）只返回 False，
+        不撤销调用方已持久化的取消意图。
+        """
+        with self._active_lock:
+            pid = self._active_backends.get(cancel_key)
+        if pid is None:
+            return False
+        try:
+            with self._cancel_engine.connect() as connection:
+                return bool(
+                    connection.execute(
+                        text("SELECT pg_cancel_backend(:pid)"), {"pid": pid}
+                    ).scalar_one()
+                )
+        except Exception:
+            return False
 
 
 def map_database_error(error: psycopg.Error) -> ExecutionFailure:

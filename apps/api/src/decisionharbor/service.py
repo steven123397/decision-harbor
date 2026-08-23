@@ -2,7 +2,13 @@ from typing import Protocol
 
 from decisionharbor.domain import IdempotencyRecord, QueryRun, finished_fields
 from decisionharbor.policy import PolicyDecision
-from decisionharbor.repository import IDEMPOTENCY_SCOPE_SUBMIT, IdempotencyKeyTaken, request_fingerprint
+from decisionharbor.repository import (
+    CANCEL_OUTCOME_NOT_CANCELLABLE,
+    CANCEL_OUTCOME_NOT_FOUND,
+    IDEMPOTENCY_SCOPE_SUBMIT,
+    IdempotencyKeyTaken,
+    request_fingerprint,
+)
 
 
 class Policy(Protocol):
@@ -25,6 +31,8 @@ class Repository(Protocol):
         expected_status: str,
         **changes: object,
     ) -> QueryRun: ...
+
+    def cancel(self, run_id: str) -> tuple[str, QueryRun | None]: ...
 
     def get(self, run_id: str) -> QueryRun | None: ...
 
@@ -155,6 +163,21 @@ class QueryRunService:
             policy_decision="allowed",
             referenced_objects=decision.referenced_objects,
         )
+
+    def cancel(self, run_id: str) -> tuple[str, QueryRun]:
+        """取消请求：持久化取消意图或返回既有终态事实；不可取消状态返回稳定失败。"""
+        try:
+            outcome, run = self._repository.cancel(run_id)
+        except ServiceFailure:
+            raise
+        except Exception as exc:
+            raise _audit_unavailable() from exc
+        if outcome == CANCEL_OUTCOME_NOT_FOUND:
+            raise ServiceFailure("query_run_not_found", "Query run was not found.", None)
+        if outcome == CANCEL_OUTCOME_NOT_CANCELLABLE:
+            raise ServiceFailure("query_run_not_cancellable", "The query run cannot be cancelled.", run)
+        assert run is not None  # 可取消结果的运行事实总是存在。
+        return outcome, run
 
     def _transition(
         self,

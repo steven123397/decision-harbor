@@ -19,7 +19,11 @@ from decisionharbor.dataset import load_dataset
 from decisionharbor.domain import QueryRun, ResultSnapshot
 from decisionharbor.policy import SqlPolicy
 from decisionharbor.readiness import AnalyticsReadinessProbe, PlatformReadinessProbe
-from decisionharbor.repository import QueryRunRepository
+from decisionharbor.repository import (
+    CANCEL_OUTCOME_CANCELLED,
+    CANCEL_OUTCOME_TERMINAL,
+    QueryRunRepository,
+)
 from decisionharbor.service import QueryRunService, ServiceFailure
 
 
@@ -46,6 +50,7 @@ HTTP_STATUS_BY_CODE = {
     "result_unavailable": 409,
     "result_expired": 410,
     "idempotency_conflict": 409,
+    "query_run_not_cancellable": 409,
     "query_capacity_exceeded": 429,
     "query_timeout": 504,
     "analytics_unavailable": 503,
@@ -65,6 +70,8 @@ class QueryRequest(BaseModel):
 
 class QueryService(Protocol):
     def submit(self, raw_sql: str, idempotency_key: str | None = None) -> QueryRun: ...
+
+    def cancel(self, run_id: str) -> tuple[str, QueryRun]: ...
 
 
 class QueryRepository(Protocol):
@@ -95,6 +102,16 @@ def _idempotency_key_error(key: str) -> str | None:
     if not all(33 <= ord(character) <= 126 for character in key):
         return "The idempotency key must contain only visible ASCII characters."
     return None
+
+
+def _failure_response(failure: ServiceFailure, *, include_run: bool) -> JSONResponse:
+    """统一 ServiceFailure 映射：稳定错误码 + 脱敏消息 + 可选的运行事实。"""
+    run_id = failure.query_run.id if failure.query_run else None
+    data = {"query_run": _run_payload(failure.query_run)} if include_run and failure.query_run else None
+    return JSONResponse(
+        _envelope(data=data, error=_error(failure.code, failure.message, run_id)),
+        status_code=HTTP_STATUS_BY_CODE.get(failure.code, 500),
+    )
 
 
 def create_app(
@@ -183,12 +200,8 @@ def create_app(
         try:
             run = service.submit(query.sql, idempotency_key=idempotency_key)
         except ServiceFailure as failure:
-            run_id = failure.query_run.id if failure.query_run else None
-            data = {"query_run": _run_payload(failure.query_run)} if failure.query_run else None
-            return JSONResponse(
-                _envelope(data=data, error=_error(failure.code, failure.message, run_id)),
-                status_code=HTTP_STATUS_BY_CODE.get(failure.code, 500),
-            )
+            # 策略拒绝等失败仍随响应返回原运行事实（rejected 终态可读）。
+            return _failure_response(failure, include_run=True)
         return JSONResponse(
             _envelope(data={"query_run": _run_payload(run)}),
             status_code=202,
@@ -273,6 +286,19 @@ def create_app(
             )
         result = {**json.loads(snapshot.payload), "truncated": snapshot.truncated}
         return _envelope(data={"result": result})
+
+    @app.post("/api/v1/query-runs/{run_id}/cancel", response_model=None)
+    def cancel_query_run(run_id: UUID):
+        try:
+            outcome, run = service.cancel(str(run_id))
+        except ServiceFailure as failure:
+            return _failure_response(failure, include_run=False)
+        # queued 直接取消与既有终态返回 200；取消意图已记录（含重复取消）返回 202。
+        status_code = 200 if outcome in (CANCEL_OUTCOME_CANCELLED, CANCEL_OUTCOME_TERMINAL) else 202
+        return JSONResponse(
+            _envelope(data={"query_run": _run_payload(run)}),
+            status_code=status_code,
+        )
 
     return app
 

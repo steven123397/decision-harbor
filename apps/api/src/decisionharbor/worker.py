@@ -43,11 +43,25 @@ FROM execution_attempts AS attempt
 WHERE r.id = CAST(:run_id AS uuid){_OWNERSHIP_GUARD_SQL}
 """
 
+# cancelled 收敛的公共骨架：目标运行处于 cancelling 且所有权仍指向该尝试。
+_CANCELLING_TARGET_SQL = """
+FROM execution_attempts AS attempt
+WHERE r.status = 'cancelling'
+  AND r.current_attempt_id = attempt.id
+"""
+
 # failed 终态的统一字段事实：发布失败与尝试耗尽收敛共用。
 _FAILED_SET_SQL = f"""
 SET status = 'failed',
     error_code = :code,
     error_summary = :summary,
+    finished_at = now(),
+    duration_ms = {_DURATION_MS_SQL}
+"""
+
+# cancelled 终态的统一字段事实：当前所有者收敛与失联清理共用。
+_CANCELLED_SET_SQL = f"""
+SET status = 'cancelled',
     finished_at = now(),
     duration_ms = {_DURATION_MS_SQL}
 """
@@ -285,8 +299,67 @@ class QueryWorker:
                 {"worker_id": self._worker_id, "lease_ms": self._settings.lease_ms},
             )
 
+    def request_pending_cancellations(self) -> int:
+        """对本人仍持有的 cancelling 运行 best effort 请求数据库取消；返回发现数。
+
+        取消失败不撤销已持久化的取消意图；数据库活动的最终停止仍由
+        statement_timeout 与所有者收敛路径兜底。
+        """
+        with self._platform.connect() as connection:
+            pending = list(
+                connection.execute(
+                    text(
+                        """
+                        SELECT CAST(r.id AS text)
+                        FROM query_runs AS r
+                        JOIN execution_attempts AS attempt ON attempt.id = r.current_attempt_id
+                        WHERE r.status = 'cancelling'
+                          AND attempt.worker_id = :worker_id
+                          AND attempt.finished_at IS NULL
+                        """
+                    ),
+                    {"worker_id": self._worker_id},
+                ).scalars()
+            )
+        for run_id in pending:
+            try:
+                requested = self._executor.cancel_active(run_id)
+            except Exception:
+                # 取消是 best effort：单次失败不撤销取消意图，也不中断其余维护。
+                logger.warning("database cancellation request failed for run %s", run_id, exc_info=True)
+                continue
+            if requested:
+                logger.info("database cancellation requested for run %s", run_id)
+        return len(pending)
+
+    def converge_expired_cancellations(self) -> int:
+        """接管/清理循环收敛：把当前所有权租约已过期的 cancelling 运行收敛为 cancelled。
+
+        幂等：并发执行时同一运行只有一方赢得条件更新；收敛不创建新执行尝试。
+        """
+        with self._platform.begin() as connection:
+            attempt_ids = list(
+                connection.execute(
+                    text(
+                        f"""
+                        UPDATE query_runs AS r
+                        {_CANCELLED_SET_SQL}
+                        {_CANCELLING_TARGET_SQL}
+                          AND attempt.lease_expires_at <= now()
+                        RETURNING attempt.id
+                        """
+                    )
+                ).scalars()
+            )
+            for attempt_id in attempt_ids:
+                self._finish_attempt(connection, attempt_id)
+        if attempt_ids:
+            logger.info("converged %s cancelling run(s) after lease expiry", len(attempt_ids))
+        return len(attempt_ids)
+
     def run_once(self) -> bool:
-        """领取并完整处理一个运行；未领取到任何运行时返回 False。"""
+        """收敛失联取消后领取并完整处理一个运行；未领取到任何运行时返回 False。"""
+        self.converge_expired_cancellations()
         claimed = self.claim_next()
         if claimed is None:
             return False
@@ -300,6 +373,7 @@ class QueryWorker:
                 claimed.raw_sql,
                 claimed.statement_timeout_ms,
                 claimed.max_rows,
+                cancel_key=claimed.run_id,
             )
         except ExecutionFailure as exc:
             if should_release_for_retry(
@@ -314,13 +388,37 @@ class QueryWorker:
                 return
             published = self.publish_failure(claimed, exc.code, exc.message)
             logger.info("run %s failure published=%s code=%s", claimed.run_id, published, exc.code)
-            return
         except Exception:
             published = self.publish_failure(claimed, "internal_error", "The query could not be completed.")
             logger.info("run %s failure published=%s code=internal_error", claimed.run_id, published)
-            return
-        published = self.publish_success(claimed, snapshot)
-        logger.info("run %s published=%s", claimed.run_id, published)
+        else:
+            published = self.publish_success(claimed, snapshot)
+            logger.info("run %s published=%s", claimed.run_id, published)
+        # 数据库工作已结束（结果可能已被取消栅栏丢弃）：把仍归本人所有的
+        # cancelling 运行收敛为 cancelled；无取消意图时条件更新为无操作。
+        self._converge_cancelled(claimed)
+
+    def _converge_cancelled(self, claimed: ClaimedRun) -> bool:
+        """当前所有者收敛：仍归本人有效持有的 cancelling 运行进入 cancelled 终态。"""
+        with self._platform.begin() as connection:
+            converged = connection.execute(
+                text(
+                    f"""
+                    UPDATE query_runs AS r
+                    {_CANCELLED_SET_SQL}
+                    {_CANCELLING_TARGET_SQL}
+                      AND r.id = CAST(:run_id AS uuid)
+                      AND attempt.id = :attempt_id
+                      AND attempt.lease_expires_at > now()
+                    """
+                ),
+                {"run_id": claimed.run_id, "attempt_id": claimed.attempt_id},
+            ).rowcount
+            if converged:
+                self._finish_attempt(connection, claimed.attempt_id)
+        if converged:
+            logger.info("run %s converged to cancelled after database work ended", claimed.run_id)
+        return converged == 1
 
     def _release_for_retry(self, claimed: ClaimedRun) -> bool:
         """把仍归本人所有的运行释放回可领取状态：终结当前尝试并使租约即刻过期。"""
@@ -349,6 +447,13 @@ class QueryWorker:
                     self.renew_leases()
                 except Exception:
                     logger.warning("lease renewal failed", exc_info=True)
+                # 心跳线程独立于主循环：执行占用主循环时仍按心跳周期
+                # 请求取消并收敛失联的 cancelling 运行。
+                try:
+                    self.request_pending_cancellations()
+                    self.converge_expired_cancellations()
+                except Exception:
+                    logger.warning("cancellation maintenance failed", exc_info=True)
 
         def cleanup_loop() -> None:
             while not stop.wait(self._settings.cleanup_interval_ms / 1_000):

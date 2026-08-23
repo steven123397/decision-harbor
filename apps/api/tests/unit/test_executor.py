@@ -77,6 +77,16 @@ def test_maps_connection_failure_without_leaking_driver_detail() -> None:
     assert "password" not in mapped.message
 
 
+def test_maps_unrecognized_server_errors_to_stable_internal_error() -> None:
+    error = psycopg.Error("unexpected server condition detail")
+    error.sqlstate = "XX001"
+
+    mapped = map_database_error(error)
+
+    assert mapped.code == "internal_error"
+    assert "unexpected server condition" not in mapped.message
+
+
 def test_extraction_stops_reading_once_the_byte_budget_is_exhausted() -> None:
     wide = "a" * 600_000
     rows = [(wide,) for _ in range(600)]

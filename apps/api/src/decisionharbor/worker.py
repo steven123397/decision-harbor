@@ -31,14 +31,42 @@ CAPACITY_ADVISORY_LOCK_KEY = 918_273_645
 _DURATION_MS_SQL = "GREATEST(0, (EXTRACT(EPOCH FROM (now() - created_at)) * 1000)::integer)"
 
 # 发布栅栏：只有当前 generation 且租约未过期的所有权才能发布状态或结果。
-_PUBLISH_FENCE_SQL = """
-FROM execution_attempts AS attempt
-WHERE r.id = CAST(:run_id AS uuid)
+_OWNERSHIP_GUARD_SQL = """
   AND r.status = 'running'
   AND r.current_attempt_id = attempt.id
   AND attempt.id = :attempt_id
   AND attempt.lease_expires_at > now()
 """
+
+_PUBLISH_FENCE_SQL = f"""
+FROM execution_attempts AS attempt
+WHERE r.id = CAST(:run_id AS uuid){_OWNERSHIP_GUARD_SQL}
+"""
+
+# failed 终态的统一字段事实：发布失败与尝试耗尽收敛共用。
+_FAILED_SET_SQL = f"""
+SET status = 'failed',
+    error_code = :code,
+    error_summary = :summary,
+    finished_at = now(),
+    duration_ms = {_DURATION_MS_SQL}
+"""
+
+# 自动尝试只覆盖基础设施故障：analytics 连接或会话中断；其余错误码直接进入 failed 终态。
+RETRYABLE_FAILURE_CODES = frozenset({"analytics_unavailable"})
+
+_ATTEMPTS_EXHAUSTED_CODE = "execution_attempts_exhausted"
+_ATTEMPTS_EXHAUSTED_SUMMARY = "The query did not complete within its execution attempt limit."
+
+
+def attempt_cap_reached(generation: int, max_execution_attempts: int) -> bool:
+    """尝试上限判定：generation 即该运行已创建的第 N 次执行尝试。"""
+    return generation >= max_execution_attempts
+
+
+def should_release_for_retry(code: str, generation: int, max_execution_attempts: int) -> bool:
+    """纯决策接缝：该失败是否应把运行释放回队列等待自动重试。"""
+    return code in RETRYABLE_FAILURE_CODES and not attempt_cap_reached(generation, max_execution_attempts)
 
 
 @dataclass(frozen=True)
@@ -89,7 +117,7 @@ class QueryWorker:
                 text(
                     """
                     SELECT r.id, r.raw_sql, r.statement_timeout_ms, r.max_rows,
-                           attempt.id AS expired_attempt_id
+                           attempt.id AS expired_attempt_id, attempt.generation AS expired_generation
                     FROM query_runs AS r
                     LEFT JOIN execution_attempts AS attempt ON attempt.id = r.current_attempt_id
                     WHERE r.status = 'queued'
@@ -103,6 +131,30 @@ class QueryWorker:
             if row is None:
                 return None
             run_id = str(row.id)
+            if row.expired_attempt_id is not None and attempt_cap_reached(
+                row.expired_generation, self._settings.max_execution_attempts
+            ):
+                # 租约失联耗尽尝试：收敛为稳定 failed 终态，不再创建新执行尝试。
+                exhausted = connection.execute(
+                    text(
+                        f"""
+                        UPDATE query_runs AS r
+                        {_FAILED_SET_SQL}
+                        WHERE r.id = CAST(:run_id AS uuid)
+                          AND r.status = 'running'
+                          AND r.current_attempt_id = :attempt_id
+                        """
+                    ),
+                    {
+                        "run_id": run_id,
+                        "attempt_id": row.expired_attempt_id,
+                        "code": _ATTEMPTS_EXHAUSTED_CODE,
+                        "summary": _ATTEMPTS_EXHAUSTED_SUMMARY,
+                    },
+                ).rowcount
+                if exhausted == 1:
+                    self._finish_attempt(connection, row.expired_attempt_id)
+                return None
             attempt = connection.execute(
                 text(
                     """
@@ -204,11 +256,7 @@ class QueryWorker:
                 text(
                     f"""
                     UPDATE query_runs AS r
-                    SET status = 'failed',
-                        error_code = :code,
-                        error_summary = :summary,
-                        finished_at = now(),
-                        duration_ms = {_DURATION_MS_SQL}
+                    {_FAILED_SET_SQL}
                     {_PUBLISH_FENCE_SQL}
                     """
                 ),
@@ -254,6 +302,16 @@ class QueryWorker:
                 claimed.max_rows,
             )
         except ExecutionFailure as exc:
+            if should_release_for_retry(
+                exc.code, claimed.generation, self._settings.max_execution_attempts
+            ) and self._release_for_retry(claimed):
+                logger.info(
+                    "run %s attempt %s released for retry after %s",
+                    claimed.run_id,
+                    claimed.generation,
+                    exc.code,
+                )
+                return
             published = self.publish_failure(claimed, exc.code, exc.message)
             logger.info("run %s failure published=%s code=%s", claimed.run_id, published, exc.code)
             return
@@ -263,6 +321,24 @@ class QueryWorker:
             return
         published = self.publish_success(claimed, snapshot)
         logger.info("run %s published=%s", claimed.run_id, published)
+
+    def _release_for_retry(self, claimed: ClaimedRun) -> bool:
+        """把仍归本人所有的运行释放回可领取状态：终结当前尝试并使租约即刻过期。"""
+        with self._platform.begin() as connection:
+            released = connection.execute(
+                text(
+                    f"""
+                    UPDATE execution_attempts AS attempt
+                    SET finished_at = now(),
+                        lease_expires_at = now()
+                    FROM query_runs AS r
+                    WHERE r.id = CAST(:run_id AS uuid){_OWNERSHIP_GUARD_SQL}
+                      AND attempt.finished_at IS NULL
+                    """
+                ),
+                {"run_id": claimed.run_id, "attempt_id": claimed.attempt_id},
+            ).rowcount
+        return released == 1
 
     def run_forever(self, stop: threading.Event | None = None) -> None:
         stop = stop or threading.Event()

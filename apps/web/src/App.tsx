@@ -40,6 +40,7 @@ const ERROR_MESSAGES: Record<string, string> = {
   query_capacity_exceeded: 'The query service is busy. Run it again shortly.',
   query_timeout: 'The query exceeded its time limit.',
   analytics_unavailable: 'The analytics database is unavailable.',
+  execution_attempts_exhausted: 'The query did not complete within its execution attempt limit.',
   audit_unavailable: 'The audit store is unavailable.',
   service_not_ready: 'The service is not ready.',
   policy_internal_error: 'The query policy could not complete.',

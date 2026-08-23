@@ -30,6 +30,16 @@ CAPACITY_ADVISORY_LOCK_KEY = 918_273_645
 # 与 audit 侧一致的时长口径：finished_at 与 created_at 之差。
 _DURATION_MS_SQL = "GREATEST(0, (EXTRACT(EPOCH FROM (now() - created_at)) * 1000)::integer)"
 
+# 发布栅栏：只有当前 generation 且租约未过期的所有权才能发布状态或结果。
+_PUBLISH_FENCE_SQL = """
+FROM execution_attempts AS attempt
+WHERE r.id = CAST(:run_id AS uuid)
+  AND r.status = 'running'
+  AND r.current_attempt_id = attempt.id
+  AND attempt.id = :attempt_id
+  AND attempt.lease_expires_at > now()
+"""
+
 
 @dataclass(frozen=True)
 class ClaimedRun:
@@ -56,7 +66,7 @@ class QueryWorker:
         return self._worker_id
 
     def claim_next(self) -> ClaimedRun | None:
-        """领取一个 queued 运行；全局有效执行所有权达到上限时返回 None。"""
+        """领取一个 queued 运行或租约已过期的 running 运行；全局有效执行所有权达到上限时返回 None。"""
         with self._platform.begin() as connection:
             connection.execute(
                 text("SELECT pg_advisory_xact_lock(:key)"), {"key": CAPACITY_ADVISORY_LOCK_KEY}
@@ -78,11 +88,14 @@ class QueryWorker:
             row = connection.execute(
                 text(
                     """
-                    SELECT id, raw_sql, statement_timeout_ms, max_rows
-                    FROM query_runs
-                    WHERE status = 'queued'
-                    ORDER BY created_at, id
-                    FOR UPDATE SKIP LOCKED
+                    SELECT r.id, r.raw_sql, r.statement_timeout_ms, r.max_rows,
+                           attempt.id AS expired_attempt_id
+                    FROM query_runs AS r
+                    LEFT JOIN execution_attempts AS attempt ON attempt.id = r.current_attempt_id
+                    WHERE r.status = 'queued'
+                       OR (r.status = 'running' AND attempt.lease_expires_at <= now())
+                    ORDER BY r.created_at, r.id
+                    FOR UPDATE OF r SKIP LOCKED
                     LIMIT 1
                     """
                 )
@@ -114,13 +127,16 @@ class QueryWorker:
                     SET status = 'running',
                         started_at = COALESCE(started_at, now()),
                         current_attempt_id = :attempt_id
-                    WHERE id = CAST(:run_id AS uuid) AND status = 'queued'
+                    WHERE id = CAST(:run_id AS uuid) AND status IN ('queued', 'running')
                     """
                 ),
                 {"attempt_id": attempt.id, "run_id": run_id},
             )
             if updated.rowcount != 1:
                 raise RuntimeError("claimed query run changed state during claim")
+            if row.expired_attempt_id is not None:
+                # 接管失联所有权：终结已失租的旧尝试；运行保持 running，不回退 queued。
+                self._finish_attempt(connection, row.expired_attempt_id)
             return ClaimedRun(
                 run_id=run_id,
                 attempt_id=attempt.id,
@@ -138,15 +154,13 @@ class QueryWorker:
                 updated = connection.execute(
                     text(
                         f"""
-                        UPDATE query_runs
+                        UPDATE query_runs AS r
                         SET status = 'succeeded',
                             returned_row_count = :row_count,
                             result_truncated = :truncated,
                             finished_at = now(),
                             duration_ms = {_DURATION_MS_SQL}
-                        WHERE id = CAST(:run_id AS uuid)
-                          AND status = 'running'
-                          AND current_attempt_id = :attempt_id
+                        {_PUBLISH_FENCE_SQL}
                         """
                     ),
                     {
@@ -189,15 +203,13 @@ class QueryWorker:
             updated = connection.execute(
                 text(
                     f"""
-                    UPDATE query_runs
+                    UPDATE query_runs AS r
                     SET status = 'failed',
                         error_code = :code,
                         error_summary = :summary,
                         finished_at = now(),
                         duration_ms = {_DURATION_MS_SQL}
-                    WHERE id = CAST(:run_id AS uuid)
-                      AND status = 'running'
-                      AND current_attempt_id = :attempt_id
+                    {_PUBLISH_FENCE_SQL}
                     """
                 ),
                 {"run_id": claimed.run_id, "attempt_id": claimed.attempt_id, "code": code, "summary": message},
@@ -252,8 +264,8 @@ class QueryWorker:
         published = self.publish_success(claimed, snapshot)
         logger.info("run %s published=%s", claimed.run_id, published)
 
-    def run_forever(self) -> None:
-        stop = threading.Event()
+    def run_forever(self, stop: threading.Event | None = None) -> None:
+        stop = stop or threading.Event()
 
         def heartbeat_loop() -> None:
             while not stop.wait(self._settings.heartbeat_ms / 1_000):
@@ -277,7 +289,7 @@ class QueryWorker:
         cleanup.start()
         logger.info("worker %s started", self._worker_id)
         try:
-            while True:
+            while not stop.is_set():
                 try:
                     busy = self.run_once()
                 except Exception:

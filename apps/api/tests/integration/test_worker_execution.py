@@ -1,5 +1,7 @@
+import concurrent.futures
 import json
 import os
+import threading
 import time
 
 import pytest
@@ -54,6 +56,27 @@ def valid_ownership_count(engine: Engine) -> int:
                 )
             ).scalar_one()
         )
+
+
+def run_ids_with_multiple_valid_ownerships(engine: Engine) -> list[str]:
+    """同一运行出现多于一个未过期有效所有权的违例列表，应为空。"""
+    with engine.connect() as connection:
+        rows = connection.execute(
+            text(
+                """
+                SELECT CAST(r.id AS text)
+                FROM execution_attempts AS attempt
+                JOIN query_runs AS r ON r.id = attempt.run_id
+                WHERE attempt.finished_at IS NULL
+                  AND attempt.lease_expires_at > now()
+                  AND r.current_attempt_id = attempt.id
+                  AND r.status IN ('running', 'cancelling')
+                GROUP BY r.id
+                HAVING count(*) > 1
+                """
+            )
+        ).scalars()
+        return list(rows)
 
 
 def test_claim_creates_the_first_attempt_and_moves_the_run_to_running() -> None:
@@ -233,3 +256,212 @@ def test_lease_renewal_extends_only_fresh_owned_attempts() -> None:
             {"attempt_id": short_claimed.attempt_id},
         ).scalar_one()
     assert expired is False
+
+
+def test_fresh_lease_cannot_be_taken_over_by_another_worker() -> None:
+    engine = platform_engine()
+    owner = QueryWorker(worker_settings(lease_ms=60_000), worker_id="owner-worker")
+    other = QueryWorker(worker_settings(), worker_id="other-worker")
+    run_id = enqueue("SELECT count(*) FROM customers")
+    claimed = owner.claim_next()
+    assert claimed is not None
+
+    # 租约未过期：其他副本与本人都不能抢占运行中的运行。
+    assert other.claim_next() is None
+    assert owner.claim_next() is None
+
+    run = QueryRunRepository(os.environ["PLATFORM_DATABASE_URL"]).get(run_id)
+    assert run is not None and run.status == "running"
+    assert valid_ownership_count(engine) == 1
+
+
+def test_takeover_after_lease_expiry_increments_generation_and_keeps_run_running() -> None:
+    engine = platform_engine()
+    first_worker = QueryWorker(worker_settings(lease_ms=1), worker_id="first-worker")
+    second_worker = QueryWorker(worker_settings(), worker_id="second-worker")
+    run_id = enqueue("SELECT count(*) FROM customers")
+
+    first_claim = first_worker.claim_next()
+    assert first_claim is not None and first_claim.generation == 1
+    with engine.connect() as connection:
+        started_at = connection.execute(
+            text("SELECT started_at FROM query_runs WHERE id = CAST(:run_id AS uuid)"),
+            {"run_id": run_id},
+        ).scalar_one()
+
+    time.sleep(0.05)
+
+    second_claim = second_worker.claim_next()
+    assert second_claim is not None
+    assert second_claim.run_id == run_id
+    assert second_claim.generation == 2
+
+    # 接管期间查询运行保持 running，不回退 queued；started_at 保留首次执行事实。
+    run = QueryRunRepository(os.environ["PLATFORM_DATABASE_URL"]).get(run_id)
+    assert run is not None and run.status == "running"
+    attempts = attempt_rows(engine, run_id)
+    assert [attempt["generation"] for attempt in attempts] == [1, 2]
+    assert attempts[0]["worker_id"] == "first-worker"
+    assert attempts[0]["finished_at"] is not None
+    assert attempts[1]["worker_id"] == "second-worker"
+    assert attempts[1]["finished_at"] is None
+    with engine.connect() as connection:
+        row = connection.execute(
+            text("SELECT started_at, current_attempt_id FROM query_runs WHERE id = CAST(:run_id AS uuid)"),
+            {"run_id": run_id},
+        ).one()
+    assert row.started_at == started_at
+    assert row.current_attempt_id == attempts[1]["id"]
+    assert valid_ownership_count(engine) == 1
+
+    snapshot = build_snapshot((QueryColumn(name="count", type="bigint"),), ((3,),))
+    assert second_worker.publish_success(second_claim, snapshot) is True
+    run = QueryRunRepository(os.environ["PLATFORM_DATABASE_URL"]).get(run_id)
+    assert run is not None and run.status == "succeeded"
+
+
+def test_expired_attempt_cannot_publish_even_while_still_current() -> None:
+    engine = platform_engine()
+    worker = QueryWorker(worker_settings(lease_ms=1), worker_id="expired-worker")
+    run_id = enqueue("SELECT count(*) FROM customers")
+    claimed = worker.claim_next()
+    assert claimed is not None
+
+    time.sleep(0.05)
+    # 租约过期但尚无副本接管：失租的当前 generation 也不是可发布所有者。
+    snapshot = build_snapshot((QueryColumn(name="count", type="bigint"),), ((1,),))
+    assert worker.publish_success(claimed, snapshot) is False
+    assert worker.publish_failure(claimed, "internal_error", "The query could not be completed.") is False
+
+    repository = QueryRunRepository(os.environ["PLATFORM_DATABASE_URL"])
+    run = repository.get(run_id)
+    assert run is not None and run.status == "running"
+    assert repository.get_result_snapshot(run_id) is None
+    assert valid_ownership_count(engine) == 0
+
+    takeover_worker = QueryWorker(worker_settings(), worker_id="takeover-worker")
+    takeover = takeover_worker.claim_next()
+    assert takeover is not None
+    assert takeover.run_id == run_id and takeover.generation == 2
+
+
+def test_stale_database_activity_does_not_count_as_ownership_and_cannot_publish() -> None:
+    engine = platform_engine()
+    stale_worker = QueryWorker(worker_settings(lease_ms=600), worker_id="stale-worker")
+    taking_worker = QueryWorker(worker_settings(), worker_id="taking-worker")
+    # pg_sleep 返回 void；包一层 count(*) 使结果列是受支持的 bigint。
+    run_id = enqueue("SELECT count(*) FROM (SELECT pg_sleep(3)) AS delayed")
+
+    stale_claim = stale_worker.claim_next()
+    assert stale_claim is not None and stale_claim.generation == 1
+
+    # 旧副本在 analytics 上真实执行长查询；随后进程"失联"（无心跳续租）。
+    stale_thread = threading.Thread(target=stale_worker.process, args=(stale_claim,))
+    stale_thread.start()
+
+    time.sleep(1.0)
+    # 旧数据库活动尚未物理停止，但已失租，不计为有效执行所有权。
+    assert valid_ownership_count(engine) == 0
+
+    takeover_claim = taking_worker.claim_next()
+    assert takeover_claim is not None
+    assert takeover_claim.run_id == run_id and takeover_claim.generation == 2
+    assert valid_ownership_count(engine) == 1
+    assert run_ids_with_multiple_valid_ownerships(engine) == []
+
+    taking_worker.process(takeover_claim)
+    stale_thread.join(timeout=10)
+
+    repository = QueryRunRepository(os.environ["PLATFORM_DATABASE_URL"])
+    run = repository.get(run_id)
+    assert run is not None and run.status == "succeeded"
+    snapshot = repository.get_result_snapshot(run_id)
+    assert snapshot is not None and snapshot.row_count == 1
+    attempts = attempt_rows(engine, run_id)
+    assert [attempt["generation"] for attempt in attempts] == [1, 2]
+    assert all(attempt["finished_at"] is not None for attempt in attempts)
+    with engine.connect() as connection:
+        current = connection.execute(
+            text("SELECT current_attempt_id FROM query_runs WHERE id = CAST(:run_id AS uuid)"),
+            {"run_id": run_id},
+        ).scalar_one()
+    assert current == attempts[1]["id"]
+    assert valid_ownership_count(engine) == 0
+
+
+def test_two_worker_replicas_share_the_global_capacity_limit() -> None:
+    engine = platform_engine()
+    worker_a = QueryWorker(worker_settings(), worker_id="worker-a")
+    worker_b = QueryWorker(worker_settings(), worker_id="worker-b")
+    enqueued = {enqueue("SELECT count(*) FROM customers") for _ in range(6)}
+
+    claims_a = [worker_a.claim_next() for _ in range(3)]
+    claim_b = worker_b.claim_next()
+    claimed = [claim for claim in claims_a + [claim_b] if claim is not None]
+    assert len(claimed) == 4
+    assert len({claim.run_id for claim in claimed}) == 4
+    assert all(claim.run_id in enqueued for claim in claimed)
+    assert valid_ownership_count(engine) == 4
+
+    # 容量已满：两个副本并发领取都必须落空。
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        exhausted = list(pool.map(lambda fn: fn(), [worker_a.claim_next, worker_b.claim_next]))
+    assert exhausted == [None, None]
+    assert valid_ownership_count(engine) == 4
+    assert run_ids_with_multiple_valid_ownerships(engine) == []
+
+    # 释放一个有效所有权后，另一副本可以领取下一个排队运行。
+    assert worker_a.publish_failure(claimed[0], "internal_error", "The query could not be completed.") is True
+    assert valid_ownership_count(engine) == 3
+    refilled = worker_b.claim_next()
+    assert refilled is not None
+    assert refilled.run_id in enqueued
+    assert refilled.run_id not in {claim.run_id for claim in claimed}
+
+    with engine.connect() as connection:
+        attempt_workers = {
+            claim.attempt_id: connection.execute(
+                text("SELECT worker_id FROM execution_attempts WHERE id = :attempt_id"),
+                {"attempt_id": claim.attempt_id},
+            ).scalar_one()
+            for claim in claims_a + [claim_b, refilled]
+            if claim is not None
+        }
+    assert set(attempt_workers[claim.attempt_id] for claim in claims_a) == {"worker-a"}
+    assert attempt_workers[claim_b.attempt_id] == "worker-b"
+    assert attempt_workers[refilled.attempt_id] == "worker-b"
+
+
+def test_heartbeat_keeps_ownership_fresh_during_execution() -> None:
+    engine = platform_engine()
+    # 执行时长（3 秒）超过租约（2 秒）：只有按 200ms 间隔续租才能保持唯一所有权；
+    # 租约与心跳保留 10 倍裕度，避免环境抖动造成的偶发接管。
+    worker = QueryWorker(
+        worker_settings(lease_ms=2_000, heartbeat_ms=200, poll_ms=50), worker_id="heartbeating-worker"
+    )
+    run_id = enqueue("SELECT count(*) FROM (SELECT pg_sleep(3)) AS delayed")
+
+    stop = threading.Event()
+    thread = threading.Thread(target=worker.run_forever, args=(stop,), daemon=True)
+    thread.start()
+    try:
+        status = None
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            with engine.connect() as connection:
+                status = connection.execute(
+                    text("SELECT status FROM query_runs WHERE id = CAST(:run_id AS uuid)"),
+                    {"run_id": run_id},
+                ).scalar_one()
+            if status == "succeeded":
+                break
+            time.sleep(0.1)
+        assert status == "succeeded"
+    finally:
+        stop.set()
+        thread.join(timeout=5)
+
+    # 租约从未在执行期间失效：没有产生接管，也就只有 generation 1 的单一执行尝试。
+    attempts = attempt_rows(engine, run_id)
+    assert [attempt["generation"] for attempt in attempts] == [1]
+    assert attempts[0]["finished_at"] is not None

@@ -25,6 +25,12 @@ platform PostgreSQL 协调带租约和递增 generation 的有效执行所有权
 
 产品可证明同一时刻最多存在 4 个有效执行所有权和每个运行最多 1 个可发布所有者，但不提供物理 exactly-once 保证。故障注入测试必须分别观测所有权上限和旧 generation 发布失效，不能把数据库会话数当作唯一判据。
 
+## Implementation status
+
+提交 `bb9853f` 交付全局执行所有权基础：`platform_0004` 保存当前 generation、Worker、心跳、租约和执行尝试；PostgreSQL 事务级协调串行化容量判定与领取；续租和终态发布使用 ownership token 栅栏。`apps/api/tests/integration/test_worker_repository.py` 通过一次性 PostgreSQL 数据库和真实 analytics 执行器证明双 Worker 全局容量、单运行唯一当前所有者和未过期租约不可抢占。
+
+过期运行接管、自动尝试上限、错误分类和失租 analytics 活动取消仍属于 [Ticket 05](../../.scratch/decisionharbor-v0.2.0/issues/05-lease-recovery-and-attempts.md)，本阶段不把 ADR 整体状态提前改为 `implemented`。
+
 ## Revisit when
 
 analytics 执行环境能够提供独立于 Worker 生命周期的强制任务身份与取消确认，或平台需要对物理数据库活动作严格配额时，重新评估所有权释放条件。

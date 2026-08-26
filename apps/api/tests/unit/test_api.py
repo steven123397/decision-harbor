@@ -1,7 +1,8 @@
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime, timezone
 from threading import Event
-from time import monotonic
+from time import monotonic, sleep
 
 from fastapi.testclient import TestClient
 import pytest
@@ -134,6 +135,32 @@ def test_ready_returns_promptly_when_a_dependency_probe_hangs(
     assert elapsed < 0.1
     assert response.status_code == 503
     assert response.json()["error"]["code"] == "service_not_ready"
+
+
+def test_concurrent_ready_requests_share_the_in_flight_probe() -> None:
+    started = Event()
+    release = Event()
+
+    def readiness_check() -> bool:
+        started.set()
+        release.wait(timeout=1)
+        return True
+
+    app = create_app(
+        service=FakeService(),
+        repository=FakeRepository(),
+        readiness_check=readiness_check,
+    )
+    with TestClient(app) as test_client, ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(test_client.get, "/ready")
+        assert started.wait(timeout=1)
+        second = executor.submit(test_client.get, "/ready")
+        sleep(0.05)
+        assert second.done() is False
+        release.set()
+
+        assert first.result().status_code == 200
+        assert second.result().status_code == 200
 
 
 def test_post_accepts_a_queued_run_without_an_immediate_result() -> None:

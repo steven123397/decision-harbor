@@ -38,13 +38,21 @@ class WorkerSettings:
     platform_database_url: str
     analytics_database_url: str
     max_concurrency: int
+    lease_ms: int
+    heartbeat_ms: int
     poll_ms: int
 
     @classmethod
     def from_env(cls) -> "WorkerSettings":
+        lease_ms = _bounded_int("WORKER_LEASE_MS", 15_000, 1, 300_000)
+        heartbeat_ms = _bounded_int("WORKER_HEARTBEAT_MS", 3_000, 1, 300_000)
+        if heartbeat_ms >= lease_ms:
+            raise ValueError("WORKER_HEARTBEAT_MS must be less than WORKER_LEASE_MS")
         return cls(
             platform_database_url=os.environ["PLATFORM_WORKER_DATABASE_URL"],
             analytics_database_url=os.environ["ANALYTICS_DATABASE_URL"],
             max_concurrency=_bounded_int("QUERY_MAX_CONCURRENCY", 4, 1, 16),
+            lease_ms=lease_ms,
+            heartbeat_ms=heartbeat_ms,
             poll_ms=_bounded_int("WORKER_POLL_MS", 250, 1, 60_000),
         )

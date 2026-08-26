@@ -114,11 +114,11 @@ def create_app(
     def check_readiness_with_deadline() -> bool:
         nonlocal readiness_future
         with readiness_lock:
-            if readiness_future is not None and not readiness_future.done():
-                return False
-            readiness_future = readiness_executor.submit(readiness_check)
+            if readiness_future is None or readiness_future.done():
+                readiness_future = readiness_executor.submit(readiness_check)
+            current_future = readiness_future
         try:
-            return bool(readiness_future.result(timeout=READINESS_TIMEOUT_SECONDS))
+            return bool(current_future.result(timeout=READINESS_TIMEOUT_SECONDS))
         except TimeoutError:
             return False
         except Exception:

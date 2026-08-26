@@ -74,6 +74,15 @@ class QueryRunCreation:
     created: bool
 
 
+@dataclass(frozen=True)
+class ExecutionOwnership:
+    query_run: QueryRun
+    worker_id: str
+    generation: int
+    heartbeat_at: datetime
+    lease_expires_at: datetime
+
+
 def finished_fields(run: QueryRun) -> dict[str, datetime | int]:
     finished_at = datetime.now(timezone.utc)
     duration_ms = max(0, int((finished_at - run.created_at).total_seconds() * 1_000))

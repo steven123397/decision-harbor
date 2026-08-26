@@ -60,6 +60,8 @@ services:
       PLATFORM_WORKER_DATABASE_URL: postgresql+psycopg://platform_worker:${PLATFORM_WORKER_PASSWORD:-decisionharbor_worker_local}@postgres:5432/platform
       ANALYTICS_DATABASE_URL: postgresql+psycopg://analytics_reader:${ANALYTICS_READER_PASSWORD:-decisionharbor_analytics_local}@postgres:5432/analytics
       QUERY_MAX_CONCURRENCY: ${QUERY_MAX_CONCURRENCY:-4}
+      WORKER_LEASE_MS: ${WORKER_LEASE_MS:-15000}
+      WORKER_HEARTBEAT_MS: ${WORKER_HEARTBEAT_MS:-3000}
       WORKER_POLL_MS: ${WORKER_POLL_MS:-250}
     depends_on:
       init:

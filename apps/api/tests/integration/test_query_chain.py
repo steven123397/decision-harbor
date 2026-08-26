@@ -5,6 +5,9 @@ from uuid import uuid4
 
 import httpx
 import pytest
+from sqlalchemy import create_engine, text
+
+from decisionharbor.config import ApiSettings
 
 
 pytestmark = pytest.mark.integration
@@ -26,6 +29,21 @@ def wait_for_terminal(client: httpx.Client, run_id: str, timeout_seconds: float 
 
 def live_client() -> httpx.Client:
     return httpx.Client(base_url=os.environ["API_BASE_URL"], timeout=5)
+
+
+def persisted_run_ids_for_sql(raw_sql: str) -> list[str]:
+    engine = create_engine(ApiSettings.from_env().platform_database_url)
+    try:
+        with engine.connect() as connection:
+            return [
+                str(run_id)
+                for run_id in connection.execute(
+                    text("SELECT id FROM query_runs WHERE raw_sql = :raw_sql"),
+                    {"raw_sql": raw_sql},
+                ).scalars()
+            ]
+    finally:
+        engine.dispose()
 
 
 def test_live_submission_replays_the_original_run_for_the_same_key_and_sql() -> None:
@@ -69,16 +87,17 @@ def test_live_submission_without_an_idempotency_key_creates_a_new_run_each_time(
 def test_live_submission_rejects_reusing_a_key_with_different_sql() -> None:
     idempotency_key = f"conflict-{uuid4()}"
     headers = {"Idempotency-Key": idempotency_key}
+    raw_sql = "SELECT count(*) FROM customers"
 
     with live_client() as client:
         first = client.post(
             "/api/v1/query-runs",
-            json={"sql": "SELECT count(*) FROM customers"},
+            json={"sql": raw_sql},
             headers=headers,
         )
         conflict = client.post(
             "/api/v1/query-runs",
-            json={"sql": "SELECT count(*) FROM orders"},
+            json={"sql": raw_sql + " "},
             headers=headers,
         )
 
@@ -122,7 +141,7 @@ def test_live_concurrent_submission_replays_one_run_for_the_same_key_and_sql() -
     raw_sql = (
         "SELECT "
         + ", ".join(f"count(*) AS total_{index}" for index in range(500))
-        + " FROM customers"
+        + f" FROM customers /* {idempotency_key} */"
     )
 
     def submit() -> httpx.Response:
@@ -150,6 +169,7 @@ def test_live_concurrent_submission_replays_one_run_for_the_same_key_and_sql() -
         for response in responses
     } == {"allowed"}
     assert all(response.json()["error"] is None for response in responses)
+    assert persisted_run_ids_for_sql(raw_sql) == [responses[0].json()["data"]["query_run"]["id"]]
 
 
 def test_live_api_and_worker_complete_allowed_rejected_and_failed_runs() -> None:

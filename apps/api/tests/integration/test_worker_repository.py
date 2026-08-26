@@ -11,7 +11,7 @@ pytestmark = pytest.mark.integration
 def test_repository_claims_queued_work_and_atomically_publishes_its_result() -> None:
     api_repository = QueryRunRepository(ApiSettings.from_env().platform_database_url)
     worker_repository = QueryRunRepository(WorkerSettings.from_env().platform_database_url)
-    rejected = api_repository.create("DELETE FROM customers", "policy-v1", 5_000, 500)
+    rejected = api_repository.create("DELETE FROM customers", "policy-v1", 5_000, 500).query_run
     api_repository.transition(
         rejected.id,
         "received",
@@ -22,7 +22,7 @@ def test_repository_claims_queued_work_and_atomically_publishes_its_result() -> 
         finished_at=rejected.created_at,
         duration_ms=0,
     )
-    queued = api_repository.create("SELECT count(*) FROM customers", "policy-v1", 5_000, 500)
+    queued = api_repository.create("SELECT count(*) FROM customers", "policy-v1", 5_000, 500).query_run
     api_repository.transition(
         queued.id,
         "received",

@@ -26,6 +26,8 @@ READINESS_TIMEOUT_SECONDS = 1.0
 
 HTTP_STATUS_BY_CODE = {
     "invalid_request": 422,
+    "invalid_idempotency_key": 422,
+    "idempotency_conflict": 409,
     "sql_empty": 422,
     "sql_too_large": 422,
     "sql_parse_error": 422,
@@ -53,7 +55,7 @@ class QueryRequest(BaseModel):
 
 
 class QueryService(Protocol):
-    def submit(self, raw_sql: str): ...
+    def submit(self, raw_sql: str, idempotency_key: str | None = None): ...
 
 
 class QueryRepository(Protocol):
@@ -93,6 +95,10 @@ def _error(code: str, message: str, query_run_id: str | None = None) -> dict[str
     if query_run_id:
         payload["query_run_id"] = query_run_id
     return payload
+
+
+def _valid_idempotency_key(value: str) -> bool:
+    return 1 <= len(value) <= 128 and all("!" <= character <= "~" for character in value)
 
 
 def create_app(
@@ -169,9 +175,20 @@ def create_app(
         return _envelope(data={"status": "ready"})
 
     @app.post("/api/v1/query-runs", response_model=None)
-    def create_query_run(query: QueryRequest):
+    def create_query_run(query: QueryRequest, request: Request):
+        idempotency_key = request.headers.get("Idempotency-Key")
+        if idempotency_key is not None and not _valid_idempotency_key(idempotency_key):
+            return JSONResponse(
+                _envelope(
+                    error=_error(
+                        "invalid_idempotency_key",
+                        "Idempotency-Key must contain 1 to 128 visible ASCII characters.",
+                    )
+                ),
+                status_code=422,
+            )
         try:
-            run = service.submit(query.sql)
+            run = service.submit(query.sql, idempotency_key)
         except ServiceFailure as failure:
             run_id = failure.query_run.id if failure.query_run else None
             data = {"query_run": _run_payload(failure.query_run)} if failure.query_run else None

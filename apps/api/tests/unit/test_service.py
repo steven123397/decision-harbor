@@ -2,7 +2,7 @@ from dataclasses import replace
 
 import pytest
 
-from decisionharbor.domain import QueryRun
+from decisionharbor.domain import QueryRun, QueryRunCreation
 from decisionharbor.policy import PolicyDecision
 from decisionharbor.service import QueryRunService, ServiceFailure
 
@@ -26,18 +26,28 @@ class FakeRepository:
             max_rows=500,
         )
 
-    def create(self, raw_sql: str, policy_version: str, statement_timeout_ms: int, max_rows: int) -> QueryRun:
+    def create(
+        self,
+        raw_sql: str,
+        policy_version: str,
+        statement_timeout_ms: int,
+        max_rows: int,
+        idempotency_key: str | None = None,
+    ) -> QueryRunCreation:
         self.events.append("create")
         if self.fail_create:
             raise RuntimeError("database DSN and secret must not escape")
         self.run = replace(self.run, raw_sql=raw_sql)
-        return self.run
+        return QueryRunCreation(query_run=self.run, created=True)
 
     def transition(self, run_id: str, expected_status: str, **changes: object) -> QueryRun:
         self.events.append(f"transition:{changes['status']}")
         assert self.run.status == expected_status
         self.run = replace(self.run, **changes)
         return self.run
+
+    def get(self, run_id: str) -> QueryRun | None:
+        return self.run if run_id == self.run.id else None
 
 
 def build_service(

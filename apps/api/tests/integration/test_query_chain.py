@@ -1,5 +1,7 @@
 import os
+from concurrent.futures import ThreadPoolExecutor
 from time import monotonic, sleep
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -24,6 +26,130 @@ def wait_for_terminal(client: httpx.Client, run_id: str, timeout_seconds: float 
 
 def live_client() -> httpx.Client:
     return httpx.Client(base_url=os.environ["API_BASE_URL"], timeout=5)
+
+
+def test_live_submission_replays_the_original_run_for_the_same_key_and_sql() -> None:
+    idempotency_key = f"sequential-{uuid4()}"
+    headers = {"Idempotency-Key": idempotency_key}
+
+    with live_client() as client:
+        first = client.post(
+            "/api/v1/query-runs",
+            json={"sql": "SELECT count(*) FROM customers"},
+            headers=headers,
+        )
+        replay = client.post(
+            "/api/v1/query-runs",
+            json={"sql": "SELECT count(*) FROM customers"},
+            headers=headers,
+        )
+
+    assert first.status_code == 202
+    assert replay.status_code == 202
+    assert replay.json()["data"]["query_run"]["id"] == first.json()["data"]["query_run"]["id"]
+    assert replay.json()["error"] is None
+
+
+def test_live_submission_without_an_idempotency_key_creates_a_new_run_each_time() -> None:
+    with live_client() as client:
+        first = client.post(
+            "/api/v1/query-runs",
+            json={"sql": "SELECT count(*) FROM customers"},
+        )
+        second = client.post(
+            "/api/v1/query-runs",
+            json={"sql": "SELECT count(*) FROM customers"},
+        )
+
+    assert first.status_code == 202
+    assert second.status_code == 202
+    assert second.json()["data"]["query_run"]["id"] != first.json()["data"]["query_run"]["id"]
+
+
+def test_live_submission_rejects_reusing_a_key_with_different_sql() -> None:
+    idempotency_key = f"conflict-{uuid4()}"
+    headers = {"Idempotency-Key": idempotency_key}
+
+    with live_client() as client:
+        first = client.post(
+            "/api/v1/query-runs",
+            json={"sql": "SELECT count(*) FROM customers"},
+            headers=headers,
+        )
+        conflict = client.post(
+            "/api/v1/query-runs",
+            json={"sql": "SELECT count(*) FROM orders"},
+            headers=headers,
+        )
+
+    assert first.status_code == 202
+    assert conflict.status_code == 409
+    assert conflict.json() == {
+        "data": None,
+        "error": {
+            "code": "idempotency_conflict",
+            "message": "Idempotency-Key was already used with a different request.",
+        },
+    }
+    assert "SELECT" not in conflict.text
+
+
+def test_live_submission_replays_the_original_policy_rejection() -> None:
+    idempotency_key = f"rejected-{uuid4()}"
+    headers = {"Idempotency-Key": idempotency_key}
+
+    with live_client() as client:
+        first = client.post(
+            "/api/v1/query-runs",
+            json={"sql": "DELETE FROM customers"},
+            headers=headers,
+        )
+        replay = client.post(
+            "/api/v1/query-runs",
+            json={"sql": "DELETE FROM customers"},
+            headers=headers,
+        )
+
+    assert first.status_code == 422
+    assert replay.status_code == 422
+    assert replay.json()["data"]["query_run"]["id"] == first.json()["data"]["query_run"]["id"]
+    assert replay.json()["data"]["query_run"]["status"] == "rejected"
+    assert replay.json()["error"] == first.json()["error"]
+
+
+def test_live_concurrent_submission_replays_one_run_for_the_same_key_and_sql() -> None:
+    idempotency_key = f"concurrent-{uuid4()}"
+    raw_sql = (
+        "SELECT "
+        + ", ".join(f"count(*) AS total_{index}" for index in range(500))
+        + " FROM customers"
+    )
+
+    def submit() -> httpx.Response:
+        with live_client() as client:
+            return client.post(
+                "/api/v1/query-runs",
+                json={"sql": raw_sql},
+                headers={"Idempotency-Key": idempotency_key},
+            )
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        responses = list(executor.map(lambda _: submit(), range(8)))
+
+    assert {response.status_code for response in responses} == {202}
+    assert {
+        response.json()["data"]["query_run"]["id"]
+        for response in responses
+    } == {responses[0].json()["data"]["query_run"]["id"]}
+    assert {
+        response.json()["data"]["query_run"]["status"]
+        for response in responses
+    } <= {"queued", "running", "succeeded"}
+    assert {
+        response.json()["data"]["query_run"]["policy_decision"]
+        for response in responses
+    } == {"allowed"}
+    assert all(response.json()["error"] is None for response in responses)
 
 
 def test_live_api_and_worker_complete_allowed_rejected_and_failed_runs() -> None:

@@ -3,7 +3,7 @@ import json
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine, Row
 
-from decisionharbor.domain import QueryColumn, QueryResult, QueryRun
+from decisionharbor.domain import QueryColumn, QueryResult, QueryRun, QueryRunCreation
 
 
 class StateConflict(RuntimeError):
@@ -36,7 +36,8 @@ class QueryRunRepository:
         policy_version: str,
         statement_timeout_ms: int,
         max_rows: int,
-    ) -> QueryRun:
+        idempotency_key: str | None = None,
+    ) -> QueryRunCreation:
         run = QueryRun.received(raw_sql, policy_version, statement_timeout_ms, max_rows)
         with self._engine.begin() as connection:
             row = connection.execute(
@@ -44,20 +45,30 @@ class QueryRunRepository:
                     """
                     INSERT INTO query_runs (
                         id, raw_sql, status, policy_decision, policy_version,
-                        referenced_objects, statement_timeout_ms, max_rows, created_at
+                        referenced_objects, statement_timeout_ms, max_rows, created_at,
+                        idempotency_key
                     ) VALUES (
                         CAST(:id AS uuid), :raw_sql, :status, :policy_decision, :policy_version,
-                        CAST(:referenced_objects AS jsonb), :statement_timeout_ms, :max_rows, :created_at
+                        CAST(:referenced_objects AS jsonb), :statement_timeout_ms, :max_rows, :created_at,
+                        :idempotency_key
                     )
+                    ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
                     RETURNING *
                     """
                 ),
                 {
                     **run.__dict__,
                     "referenced_objects": json.dumps(run.referenced_objects),
+                    "idempotency_key": idempotency_key,
                 },
+            ).one_or_none()
+            if row is not None:
+                return QueryRunCreation(query_run=_row_to_query_run(row), created=True)
+            row = connection.execute(
+                text("SELECT * FROM query_runs WHERE idempotency_key = :idempotency_key"),
+                {"idempotency_key": idempotency_key},
             ).one()
-        return _row_to_query_run(row)
+        return QueryRunCreation(query_run=_row_to_query_run(row), created=False)
 
     def transition(self, run_id: str, expected_status: str, **changes: object) -> QueryRun:
         unknown = set(changes) - TRANSITION_COLUMNS

@@ -1,6 +1,6 @@
 from typing import Protocol
 
-from decisionharbor.domain import QueryRun, finished_fields
+from decisionharbor.domain import QueryRun, QueryRunCreation, finished_fields
 from decisionharbor.policy import PolicyDecision
 
 
@@ -15,7 +15,8 @@ class Repository(Protocol):
         policy_version: str,
         statement_timeout_ms: int,
         max_rows: int,
-    ) -> QueryRun: ...
+        idempotency_key: str | None = None,
+    ) -> QueryRunCreation: ...
 
     def transition(
         self,
@@ -23,6 +24,8 @@ class Repository(Protocol):
         expected_status: str,
         **changes: object,
     ) -> QueryRun: ...
+
+    def get(self, run_id: str) -> QueryRun | None: ...
 
 
 class ServiceFailure(Exception):
@@ -48,13 +51,14 @@ class QueryRunService:
         self._statement_timeout_ms = statement_timeout_ms
         self._max_rows = max_rows
 
-    def submit(self, raw_sql: str) -> QueryRun:
+    def submit(self, raw_sql: str, idempotency_key: str | None = None) -> QueryRun:
         try:
-            run = self._repository.create(
+            creation = self._repository.create(
                 raw_sql,
                 self._policy_version,
                 self._statement_timeout_ms,
                 self._max_rows,
+                idempotency_key,
             )
         except Exception as exc:
             raise ServiceFailure(
@@ -63,10 +67,28 @@ class QueryRunService:
                 None,
             ) from exc
 
+        run = creation.query_run
+        if not creation.created:
+            if run.raw_sql != raw_sql:
+                raise ServiceFailure(
+                    "idempotency_conflict",
+                    "Idempotency-Key was already used with a different request.",
+                    None,
+                )
+            if run.status != "received":
+                return self._replay(run)
+
         try:
             decision = self._policy.evaluate(raw_sql)
         except Exception as exc:
-            failed = self._fail_received(run, "policy_internal_error", "The SQL policy could not be evaluated.")
+            failed = self._fail_received(
+                run,
+                "policy_internal_error",
+                "The SQL policy could not be evaluated.",
+                replay_on_conflict=idempotency_key is not None,
+            )
+            if failed.status != "failed":
+                return self._replay(failed)
             raise ServiceFailure(
                 "policy_internal_error",
                 "The SQL policy could not be evaluated.",
@@ -82,23 +104,37 @@ class QueryRunService:
                 referenced_objects=decision.referenced_objects,
                 error_code=decision.code,
                 error_summary=decision.summary,
+                replay_on_conflict=idempotency_key is not None,
                 **finished_fields(run),
             )
-            raise ServiceFailure(decision.code or "unsupported_sql", decision.summary or "SQL is not allowed.", rejected)
+            return self._replay(rejected)
 
-        return self._transition(
-            run,
-            "received",
-            status="queued",
-            policy_decision="allowed",
-            referenced_objects=decision.referenced_objects,
+        return self._replay(
+            self._transition(
+                run,
+                "received",
+                status="queued",
+                policy_decision="allowed",
+                referenced_objects=decision.referenced_objects,
+                replay_on_conflict=idempotency_key is not None,
+            )
         )
+
+    def _replay(self, run: QueryRun) -> QueryRun:
+        if run.status == "rejected":
+            raise ServiceFailure(
+                run.error_code or "unsupported_sql",
+                run.error_summary or "SQL is not allowed.",
+                run,
+            )
+        return run
 
     def _fail_received(
         self,
         run: QueryRun,
         code: str,
         summary: str,
+        replay_on_conflict: bool = False,
         **facts: object,
     ) -> QueryRun:
         return self._transition(
@@ -107,6 +143,7 @@ class QueryRunService:
             status="failed",
             error_code=code,
             error_summary=summary,
+            replay_on_conflict=replay_on_conflict,
             **facts,
             **finished_fields(run),
         )
@@ -115,6 +152,7 @@ class QueryRunService:
         self,
         run: QueryRun,
         expected_status: str,
+        replay_on_conflict: bool = False,
         **changes: object,
     ) -> QueryRun:
         try:
@@ -122,6 +160,13 @@ class QueryRunService:
         except ServiceFailure:
             raise
         except Exception as exc:
+            if replay_on_conflict:
+                try:
+                    current = self._repository.get(run.id)
+                except Exception:
+                    current = None
+                if current is not None and current.status != expected_status:
+                    return current
             raise ServiceFailure(
                 "audit_unavailable",
                 "The audit store is unavailable.",

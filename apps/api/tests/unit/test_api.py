@@ -4,6 +4,7 @@ from threading import Event
 from time import monotonic
 
 from fastapi.testclient import TestClient
+import pytest
 
 import decisionharbor.api as api_module
 from decisionharbor.api import create_app
@@ -36,8 +37,10 @@ def terminal_run(status: str = "succeeded", code: str | None = None) -> QueryRun
 class FakeService:
     def __init__(self, failure: ServiceFailure | None = None) -> None:
         self.failure = failure
+        self.submissions: list[tuple[str, str | None]] = []
 
-    def submit(self, raw_sql: str) -> QueryRun:
+    def submit(self, raw_sql: str, idempotency_key: str | None = None) -> QueryRun:
+        self.submissions.append((raw_sql, idempotency_key))
         if self.failure:
             raise self.failure
         return replace(
@@ -174,6 +177,41 @@ def test_invalid_request_and_oversized_body_do_not_create_a_run() -> None:
     assert oversized.status_code == 422
     assert oversized.json()["error"]["code"] == "invalid_request"
     assert "query_run_id" not in oversized.json()["error"]
+
+
+@pytest.mark.parametrize("idempotency_key", ["", "contains space", "x" * 129])
+def test_invalid_idempotency_key_is_rejected_before_submission(idempotency_key: str) -> None:
+    service = FakeService()
+    with client(service) as test_client:
+        response = test_client.post(
+            "/api/v1/query-runs",
+            json={"sql": "SELECT 1"},
+            headers={"Idempotency-Key": idempotency_key},
+        )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "data": None,
+        "error": {
+            "code": "invalid_idempotency_key",
+            "message": "Idempotency-Key must contain 1 to 128 visible ASCII characters.",
+        },
+    }
+    assert service.submissions == []
+
+
+@pytest.mark.parametrize("idempotency_key", ["!", "~", "x" * 128])
+def test_valid_idempotency_key_is_forwarded_to_submission(idempotency_key: str) -> None:
+    service = FakeService()
+    with client(service) as test_client:
+        response = test_client.post(
+            "/api/v1/query-runs",
+            json={"sql": "SELECT 1"},
+            headers={"Idempotency-Key": idempotency_key},
+        )
+
+    assert response.status_code == 202
+    assert service.submissions == [("SELECT 1", idempotency_key)]
 
 
 def test_get_returns_audit_without_result_cells() -> None:

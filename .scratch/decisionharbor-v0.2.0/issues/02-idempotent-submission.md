@@ -4,7 +4,7 @@
 
 **Blocked by:** 01 — 打通持久异步查询主链
 
-**Status:** ready-for-agent
+**Status:** claimed
 
 - [ ] `Idempotency-Key` 接受 1 到 128 个可见 ASCII 字符；非法键返回 HTTP 422 `invalid_idempotency_key`，且不创建查询运行。
 - [ ] 未提供幂等键时，每次提交都创建新的查询运行；提供键时，其作用域覆盖当前产品实例。

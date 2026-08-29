@@ -126,4 +126,4 @@ DecisionHarbor 当前在一次 HTTP 请求内完成策略校验、SQL 执行和�
 
 - 当前同步实现是迁移起点和回归基线，不要求保持同步 POST 成功响应的向后兼容。
 - PostgreSQL 队列、执行所有权与结果快照的长期取舍分别记录在 [ADR-0003](../../docs/adr/0003-use-postgresql-as-the-durable-query-queue.md)、[ADR-0005](../../docs/adr/0005-coordinate-valid-execution-ownership.md) 和 [ADR-0004](../../docs/adr/0004-store-bounded-result-snapshots.md)；spec 只规定本版本必须交付的外部行为和实现约束。
-- 路线已经足够清晰，不需要为本功能建立 Wayfinder map。spec 评审通过后，再由 `/to-tickets` 生成实现使用的 tracer-bullet tickets。
+- 路线已经足够清晰，不需要为本功能建立 Wayfinder map。本功能的 tracer-bullet tickets 位于同目录 `issues/`，按依赖顺序从 `01` 编号，每张票的 `Blocked by` 使用同目录编号。

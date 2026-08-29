@@ -23,7 +23,7 @@ def upgrade() -> None:
     )
     op.execute(
         """
-        CREATE FUNCTION query_runs_require_result_snapshot() RETURNS trigger AS $$
+        CREATE FUNCTION query_runs_require_snapshot() RETURNS trigger AS $$
         BEGIN
             IF NEW.status = 'succeeded' AND NOT EXISTS (
                 SELECT 1 FROM query_run_results WHERE query_run_id = NEW.id
@@ -40,7 +40,7 @@ def upgrade() -> None:
         """
         CREATE TRIGGER query_runs_require_snapshot
         BEFORE UPDATE ON query_runs
-        FOR EACH ROW EXECUTE FUNCTION query_runs_require_result_snapshot()
+        FOR EACH ROW EXECUTE FUNCTION query_runs_require_snapshot()
         """
     )
     op.execute("GRANT SELECT, INSERT ON TABLE query_run_results TO platform_worker")
@@ -50,4 +50,4 @@ def upgrade() -> None:
 def downgrade() -> None:
     op.execute("DROP TABLE query_run_results")
     op.execute("DROP TRIGGER query_runs_require_snapshot ON query_runs")
-    op.execute("DROP FUNCTION query_runs_require_result_snapshot()")
+    op.execute("DROP FUNCTION query_runs_require_snapshot()")

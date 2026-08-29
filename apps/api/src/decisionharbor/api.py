@@ -14,7 +14,7 @@ from pydantic import BaseModel, ConfigDict
 
 from decisionharbor.config import Settings
 from decisionharbor.dataset import load_dataset
-from decisionharbor.executor import PostgresQueryExecutor
+from decisionharbor.domain import QueryRun
 from decisionharbor.policy import SqlPolicy
 from decisionharbor.readiness import AnalyticsReadinessProbe, PlatformReadinessProbe
 from decisionharbor.repository import QueryRunRepository
@@ -34,15 +34,10 @@ HTTP_STATUS_BY_CODE = {
     "sql_object_not_allowed": 422,
     "sql_function_not_allowed": 422,
     "unsupported_sql": 422,
-    "query_semantic_error": 400,
-    "query_capacity_exceeded": 429,
-    "query_timeout": 504,
-    "analytics_unavailable": 503,
     "audit_unavailable": 503,
     "service_not_ready": 503,
     "policy_internal_error": 500,
     "internal_error": 500,
-    "unsupported_result_type": 500,
 }
 
 
@@ -53,7 +48,7 @@ class QueryRequest(BaseModel):
 
 
 class QueryService(Protocol):
-    def run(self, raw_sql: str): ...
+    def submit(self, raw_sql: str) -> QueryRun: ...
 
 
 class QueryRepository(Protocol):
@@ -156,7 +151,7 @@ def create_app(
     @app.post("/api/v1/query-runs", response_model=None)
     def create_query_run(query: QueryRequest):
         try:
-            outcome = service.run(query.sql)
+            run = service.submit(query.sql)
         except ServiceFailure as failure:
             run_id = failure.query_run.id if failure.query_run else None
             data = {"query_run": _run_payload(failure.query_run)} if failure.query_run else None
@@ -164,11 +159,9 @@ def create_app(
                 _envelope(data=data, error=_error(failure.code, failure.message, run_id)),
                 status_code=HTTP_STATUS_BY_CODE.get(failure.code, 500),
             )
-        return _envelope(
-            data={
-                "query_run": _run_payload(outcome.query_run),
-                "result": jsonable_encoder(asdict(outcome.result)),
-            }
+        return JSONResponse(
+            _envelope(data={"query_run": _run_payload(run)}),
+            status_code=202,
         )
 
     @app.get("/api/v1/query-runs/{run_id}", response_model=None)
@@ -194,19 +187,15 @@ def create_runtime_app() -> FastAPI:
     settings = Settings.from_env()
     dataset = load_dataset(settings.dataset_root)
     repository = QueryRunRepository(settings.platform_database_url)
-    executor = PostgresQueryExecutor(settings.analytics_database_url, settings.max_concurrency)
     platform_readiness = PlatformReadinessProbe(settings.platform_database_url)
     analytics_readiness = AnalyticsReadinessProbe(settings.analytics_readiness_database_url)
     policy = SqlPolicy(dataset.allowed_tables)
     service = QueryRunService(
         repository=repository,
         policy=policy,
-        executor=executor,
         policy_version=dataset.policy_version,
         statement_timeout_ms=settings.statement_timeout_ms,
         max_rows=settings.max_rows,
-        max_concurrency=settings.max_concurrency,
-        capacity_wait_ms=settings.capacity_wait_ms,
     )
     return create_app(
         service=service,

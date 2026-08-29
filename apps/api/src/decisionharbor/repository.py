@@ -22,6 +22,14 @@ TRANSITION_COLUMNS = frozenset(
         "started_at",
         "finished_at",
         "duration_ms",
+        "cancellation_requested_at",
+        "execution_attempt_count",
+        "attempt_number",
+        "attempt_worker_id",
+        "attempt_generation",
+        "lease_expires_at",
+        "heartbeat_at",
+        "retry_of",
     }
 )
 
@@ -105,7 +113,7 @@ class QueryRunRepository:
                         error_summary = 'Execution was interrupted before completion.',
                         finished_at = now(),
                         duration_ms = GREATEST(0, (EXTRACT(EPOCH FROM (now() - created_at)) * 1000)::integer)
-                    WHERE status IN ('received', 'running')
+                    WHERE status = 'received'
                     """
                 )
             )
@@ -130,4 +138,12 @@ def _row_to_query_run(row: Row) -> QueryRun:
         started_at=values["started_at"],
         finished_at=values["finished_at"],
         duration_ms=values["duration_ms"],
+        cancellation_requested_at=values["cancellation_requested_at"],
+        execution_attempt_count=values["execution_attempt_count"],
+        attempt_number=values["attempt_number"],
+        attempt_worker_id=values["attempt_worker_id"],
+        attempt_generation=values["attempt_generation"],
+        lease_expires_at=values["lease_expires_at"],
+        heartbeat_at=values["heartbeat_at"],
+        retry_of=str(values["retry_of"]) if values["retry_of"] else None,
     )

@@ -1,6 +1,6 @@
 export type QueryRun = {
   id: string
-  status: 'received' | 'running' | 'succeeded' | 'rejected' | 'failed'
+  status: 'received' | 'rejected' | 'queued' | 'running' | 'cancelling' | 'succeeded' | 'failed' | 'cancelled'
   returned_row_count: number | null
   result_truncated: boolean | null
   duration_ms: number | null

@@ -1,4 +1,5 @@
 import os
+from time import monotonic
 
 from fastapi.testclient import TestClient
 import pytest
@@ -11,58 +12,41 @@ from decisionharbor.repository import QueryRunRepository
 pytestmark = pytest.mark.integration
 
 
-def test_real_api_success_rejection_failure_and_audit() -> None:
+def test_api_is_ready_without_analytics_execution_credentials() -> None:
+    assert "ANALYTICS_DATABASE_URL" not in os.environ
+    app = create_runtime_app()
+
+    with TestClient(app) as client:
+        assert client.get("/health").json() == {"data": {"status": "ok"}, "error": None}
+        started_at = monotonic()
+        ready = client.get("/ready")
+
+    assert monotonic() - started_at < 1.0
+    assert ready.status_code == 200
+    assert ready.json() == {"data": {"status": "ready"}, "error": None}
+
+
+def test_allowed_query_is_queued_without_returning_a_result() -> None:
     app = create_runtime_app()
     with TestClient(app) as client:
-        assert client.get("/ready").status_code == 200
-
-        success = client.post(
+        submitted = client.post(
             "/api/v1/query-runs",
             json={"sql": "SELECT count(*) AS customer_count FROM customers"},
         )
-        assert success.status_code == 200
-        assert success.json()["data"]["result"]["rows"] == [["100"]]
-        success_run = success.json()["data"]["query_run"]
-        assert success_run["status"] == "succeeded"
-        assert success_run["referenced_objects"] == ["analytics.customers"]
 
-        safe_casts = client.post(
-            "/api/v1/query-runs",
-            json={
-                "sql": (
-                    "SELECT customer_code::varchar(20), id::bigint, created_at::date "
-                    "FROM customers ORDER BY id LIMIT 1"
-                )
-            },
-        )
-        assert safe_casts.status_code == 200
-        assert safe_casts.json()["data"]["query_run"]["status"] == "succeeded"
-        assert safe_casts.json()["data"]["query_run"]["referenced_objects"] == ["analytics.customers"]
-        assert [column["type"] for column in safe_casts.json()["data"]["result"]["columns"]] == [
-            "character varying",
-            "bigint",
-            "date",
-        ]
+        assert submitted.status_code == 202
+        payload = submitted.json()
+        assert payload["error"] is None
+        run = payload["data"]["query_run"]
+        assert run["status"] == "queued"
+        assert run["referenced_objects"] == ["analytics.customers"]
+        assert run["execution_attempt_count"] == 0
+        assert set(payload["data"]) == {"query_run"}
 
-        rejected = client.post(
-            "/api/v1/query-runs",
-            json={"sql": "DELETE FROM customers"},
-        )
-        assert rejected.status_code == 422
-        assert rejected.json()["error"]["code"] == "sql_statement_not_allowed"
-        assert rejected.json()["data"]["query_run"]["status"] == "rejected"
+        audit = client.get(f"/api/v1/query-runs/{run['id']}")
 
-        failed = client.post(
-            "/api/v1/query-runs",
-            json={"sql": "SELECT missing_column FROM customers"},
-        )
-        assert failed.status_code == 400
-        assert failed.json()["error"]["code"] == "query_semantic_error"
-        assert "column" not in failed.json()["error"]["message"].lower()
-
-        audit = client.get(f"/api/v1/query-runs/{success_run['id']}")
-        assert audit.status_code == 200
-        assert set(audit.json()["data"]) == {"query_run"}
+    assert audit.status_code == 200
+    assert audit.json()["data"]["query_run"]["status"] == "queued"
 
 
 @pytest.mark.parametrize(
@@ -87,37 +71,6 @@ def test_real_api_rejects_catalog_resolving_casts_before_execution(raw_sql: str)
     assert response.json()["error"]["code"] == "sql_object_not_allowed"
     assert response.json()["data"]["query_run"]["status"] == "rejected"
     assert response.json()["data"]["query_run"]["referenced_objects"] == []
-
-
-def test_real_api_truncates_at_configured_row_limit(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("QUERY_MAX_ROWS", "2")
-    app = create_runtime_app()
-    with TestClient(app) as client:
-        response = client.post(
-            "/api/v1/query-runs",
-            json={"sql": "SELECT id FROM orders ORDER BY id"},
-        )
-    assert response.status_code == 200
-    result = response.json()["data"]["result"]
-    assert result["rows"] == [["1"], ["2"]]
-    assert result["truncated"] is True
-
-
-def test_real_api_maps_statement_timeout_to_a_safe_terminal_failure(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("QUERY_STATEMENT_TIMEOUT_MS", "1")
-    app = create_runtime_app()
-    with TestClient(app) as client:
-        response = client.post(
-            "/api/v1/query-runs",
-            json={
-                "sql": "SELECT count(*) FROM order_items a CROSS JOIN order_items b CROSS JOIN order_items c"
-            },
-        )
-    assert response.status_code == 504
-    assert response.json()["error"]["code"] == "query_timeout"
-    assert response.json()["data"]["query_run"]["status"] == "failed"
 
 
 def test_startup_recovery_closes_interrupted_audit_records() -> None:

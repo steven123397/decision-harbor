@@ -11,7 +11,7 @@ DecisionHarbor 既要保存可写的产品状态，又要执行不可信的用�
 
 ## Decision
 
-在同一 PostgreSQL 实例中使用独立的 `platform` 与 `analytics` 逻辑数据库，并为平台写入、分析查询和就绪探测分配不同的最小权限身份。用户 SQL 只能使用 analytics 查询身份执行；API 和 Worker 不能获得引导身份。
+在同一 PostgreSQL 实例中使用独立的 `platform` 与 `analytics` 逻辑数据库，并为平台写入、平台任务、分析查询和就绪探测分配不同的最小权限身份。用户 SQL 只能使用 analytics 查询身份执行；API 和 Worker 不能获得引导身份。API 只持有平台写入与就绪探测凭据，只有 Worker 持有平台任务与分析查询凭据。
 
 ## Considered options
 
@@ -24,7 +24,7 @@ DecisionHarbor 既要保存可写的产品状态，又要执行不可信的用�
 
 ## Implementation and evidence
 
-提交 `6e3964f` 建立双数据库、运行时身份、迁移、固定数据 seed 和 Compose 初始化。`test_postgres_contract.py` 证明数据库连接范围、默认只读事务、业务表读取、写入/DDL 拒绝和维护 schema 隔离；统一测试入口在当前基座上通过。
+提交 `6e3964f` 建立双数据库、运行时身份、迁移、固定数据 seed 和 Compose 初始化。v0.2.0 的 `platform_worker` 平台任务身份把 API 与分析查询凭据分离，`test_postgres_contract.py` 证明数据库连接范围、默认只读事务、业务表读取、写入/DDL 拒绝和维护 schema 隔离；`tests/worker/test_analytics_contract.py` 在 Worker 凭据环境中证明分析只读权限与固定数据口径；统一测试入口在当前基座上通过。
 
 ## Revisit when
 

@@ -6,11 +6,11 @@ from fastapi.testclient import TestClient
 
 import decisionharbor.api as api_module
 from decisionharbor.api import create_app
-from decisionharbor.domain import QueryColumn, QueryResult, QueryRun
-from decisionharbor.service import QueryOutcome, ServiceFailure
+from decisionharbor.domain import QueryRun
+from decisionharbor.service import ServiceFailure
 
 
-def terminal_run(status: str = "succeeded", code: str | None = None) -> QueryRun:
+def terminal_run(status: str = "queued", code: str | None = None) -> QueryRun:
     now = datetime.now(timezone.utc)
     return QueryRun(
         id="75e24c21-416c-4bd8-a37d-68667f4ec753",
@@ -26,9 +26,9 @@ def terminal_run(status: str = "succeeded", code: str | None = None) -> QueryRun
         error_code=code,
         error_summary="Safe error summary." if code else None,
         created_at=now,
-        started_at=now if status != "rejected" else None,
-        finished_at=now,
-        duration_ms=4,
+        started_at=None if status in {"received", "rejected", "queued"} else now,
+        finished_at=now if status not in {"received", "queued", "running", "cancelling"} else None,
+        duration_ms=None if status in {"received", "queued", "running", "cancelling"} else 4,
     )
 
 
@@ -36,17 +36,10 @@ class FakeService:
     def __init__(self, failure: ServiceFailure | None = None) -> None:
         self.failure = failure
 
-    def run(self, raw_sql: str) -> QueryOutcome:
+    def submit(self, raw_sql: str) -> QueryRun:
         if self.failure:
             raise self.failure
-        return QueryOutcome(
-            query_run=terminal_run(),
-            result=QueryResult(
-                columns=(QueryColumn("answer", "integer"),),
-                rows=((1,),),
-                truncated=False,
-            ),
-        )
+        return terminal_run()
 
 
 class FakeRepository:
@@ -121,15 +114,15 @@ def test_ready_returns_promptly_when_a_dependency_probe_hangs(
     assert response.json()["error"]["code"] == "service_not_ready"
 
 
-def test_post_returns_terminal_audit_and_immediate_result() -> None:
+def test_post_accepts_the_run_and_returns_no_result() -> None:
     with client() as test_client:
         response = test_client.post("/api/v1/query-runs", json={"sql": "SELECT 1"})
 
-    assert response.status_code == 200
+    assert response.status_code == 202
     payload = response.json()
     assert payload["error"] is None
-    assert payload["data"]["query_run"]["status"] == "succeeded"
-    assert payload["data"]["result"]["rows"] == [[1]]
+    assert payload["data"]["query_run"]["status"] == "queued"
+    assert set(payload["data"]) == {"query_run"}
 
 
 def test_policy_rejection_uses_stable_http_mapping_and_run_id() -> None:

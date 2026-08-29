@@ -73,7 +73,7 @@ describe('query workbench', () => {
     expect(screen.getByRole('button', { name: 'Run query' })).toBeEnabled()
   })
 
-  it('disables duplicate submission while the query is running', async () => {
+  it('disables duplicate submission while the query is being submitted', async () => {
     const pending = new Promise<QueryResponse>(() => undefined)
     render(<App api={api(vi.fn().mockReturnValue(pending))} />)
     const runButton = await screen.findByRole('button', { name: 'Run query' })
@@ -81,7 +81,30 @@ describe('query workbench', () => {
     await userEvent.click(runButton)
 
     expect(runButton).toBeDisabled()
-    expect(screen.getByText('Running')).toBeInTheDocument()
+    expect(screen.getByText('Submitting')).toBeInTheDocument()
+  })
+
+  it('shows the queued run while the worker owns execution', async () => {
+    const queued: QueryResponse = {
+      data: {
+        query_run: {
+          id: '75e24c21-416c-4bd8-a37d-68667f4ec753',
+          status: 'queued',
+          returned_row_count: null,
+          result_truncated: null,
+          duration_ms: null,
+          error_code: null,
+          error_summary: null,
+        },
+      },
+      error: null,
+    }
+    render(<App api={api(vi.fn().mockResolvedValue(queued))} />)
+    await userEvent.click(await screen.findByRole('button', { name: 'Run query' }))
+
+    expect(await screen.findByText('Queued')).toBeInTheDocument()
+    expect(screen.getByText('75e24c21-416c-4bd8-a37d-68667f4ec753')).toBeInTheDocument()
+    expect(screen.queryByRole('table')).not.toBeInTheDocument()
   })
 
   it('renders the result table, audit facts, and truncation warning', async () => {

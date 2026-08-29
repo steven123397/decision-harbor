@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: partially-implemented
 date: 2026-08-22
 ---
 
@@ -24,6 +24,10 @@ platform PostgreSQL 协调带租约和递增 generation 的有效执行所有权
 ## Consequences
 
 产品可证明同一时刻最多存在 4 个有效执行所有权和每个运行最多 1 个可发布所有者，但不提供物理 exactly-once 保证。故障注入测试必须分别观测所有权上限和旧 generation 发布失效，不能把数据库会话数当作唯一判据。
+
+## Implementation and evidence
+
+v0.2.0 的 ticket 01 把执行尝试所有权落为 `query_runs` 上的 generation、租约、心跳与尝试序号列，并用 CHECK 约束与 `query_runs_lifecycle_guard` 触发器拒绝终态回退、generation 与尝试序号回退、取消意图被丢弃以及在取消后领取新尝试；`test_query_run_state_model.py` 证明这些约束。领取、心跳续租与接管由后续 ticket 交付。
 
 ## Revisit when
 

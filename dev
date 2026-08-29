@@ -18,8 +18,9 @@ case "$command" in
     ;;
   test)
     docker compose up -d --build --wait
-    docker compose --profile test build api-test web-test e2e
+    docker compose --profile test build api-test worker-test web-test e2e
     docker compose --profile test run --rm api-test
+    docker compose --profile test run --rm worker-test
     docker compose --profile test run --rm web-test
     docker compose --profile test run --rm e2e
     ;;

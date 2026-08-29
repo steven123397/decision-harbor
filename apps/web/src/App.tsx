@@ -50,7 +50,8 @@ const ERROR_MESSAGES: Record<string, string> = {
 
 type ViewState =
   | { kind: 'idle' }
-  | { kind: 'running' }
+  | { kind: 'submitting' }
+  | { kind: 'queued'; run: QueryRun }
   | { kind: 'complete'; response: QueryResponse }
 
 export function App({ api = httpApi }: { api?: ApiClient }) {
@@ -69,14 +70,19 @@ export function App({ api = httpApi }: { api?: ApiClient }) {
   }, [api])
 
   const runQuery = async () => {
-    if (!sql.trim() || view.kind === 'running' || readiness !== 'ready') return
-    setView({ kind: 'running' })
+    if (!sql.trim() || view.kind === 'submitting' || readiness !== 'ready') return
+    setView({ kind: 'submitting' })
     const response = await api.runQuery(sql)
-    setView({ kind: 'complete', response })
     if (response.error?.code === 'service_not_ready') setReadiness('unavailable')
+    const run = response.data?.query_run
+    if (!response.error && run && (run.status === 'queued' || run.status === 'received')) {
+      setView({ kind: 'queued', run })
+      return
+    }
+    setView({ kind: 'complete', response })
   }
 
-  const running = view.kind === 'running'
+  const submitting = view.kind === 'submitting'
   const checkReadiness = async () => {
     setReadiness('checking')
     setReadiness((await api.checkReady()) ? 'ready' : 'unavailable')
@@ -124,9 +130,9 @@ export function App({ api = httpApi }: { api?: ApiClient }) {
               type="button"
               className="run-button"
               onClick={runQuery}
-              disabled={running || readiness !== 'ready' || !sql.trim()}
+              disabled={submitting || readiness !== 'ready' || !sql.trim()}
             >
-              {running ? <LoaderCircle className="spin" size={17} /> : <Play size={17} fill="currentColor" />}
+              {submitting ? <LoaderCircle className="spin" size={17} /> : <Play size={17} fill="currentColor" />}
               Run query
             </button>
           </div>
@@ -135,13 +141,14 @@ export function App({ api = httpApi }: { api?: ApiClient }) {
             value={sql}
             onChange={(event) => setSql(event.target.value)}
             spellCheck={false}
-            disabled={running}
+            disabled={submitting}
           />
         </section>
 
         <section className="output" aria-live="polite">
           {view.kind === 'idle' && <IdleState />}
-          {view.kind === 'running' && <RunningState />}
+          {view.kind === 'submitting' && <SubmittingState />}
+          {view.kind === 'queued' && <QueuedState run={view.run} />}
           {view.kind === 'complete' && <CompletedState response={view.response} />}
         </section>
       </main>
@@ -158,11 +165,21 @@ function IdleState() {
   )
 }
 
-function RunningState() {
+function SubmittingState() {
   return (
     <div className="run-state running-state">
       <LoaderCircle className="spin" size={21} />
-      <div><strong>Running</strong><span>Policy and database checks are in progress.</span></div>
+      <div><strong>Submitting</strong><span>Policy checks are in progress.</span></div>
+    </div>
+  )
+}
+
+function QueuedState({ run }: { run: QueryRun }) {
+  return (
+    <div className="run-state running-state">
+      <LoaderCircle className="spin" size={21} />
+      <div><strong>Queued</strong><span>A worker will run this query shortly.</span></div>
+      <AuditFacts run={run} />
     </div>
   )
 }

@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: partially-implemented
 date: 2026-08-16
 ---
 
@@ -22,6 +22,10 @@ date: 2026-08-16
 ## Consequences
 
 任务状态与审计可以共享 PostgreSQL 事务和备份边界，本地环境无需新增基础设施。数据库同时承担队列轮询负载；Worker 的扩展能力受 platform PostgreSQL 的事务和协调能力约束。
+
+## Implementation and evidence
+
+v0.2.0 的 ticket 01 建立 `platform_0002` 迁移中的持久化状态模型与独立 `decisionharbor.worker` 进程，Compose 中 `worker` 服务在默认配置下就绪并报告健康；队列领取与执行由后续 ticket 交付。
 
 ## Revisit when
 

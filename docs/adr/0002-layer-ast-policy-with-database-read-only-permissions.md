@@ -25,7 +25,7 @@ date: 2026-07-20
 
 ## Implementation and evidence
 
-提交 `6e3964f` 实现 SQLGlot AST 策略、对象允许集和 analytics 只读执行；提交 `37764b0` 收紧对象标识类型转换。`test_policy.py` 覆盖允许形态、DML/DDL、多语句、系统对象和函数边界，`test_query_chain.py` 使用真实 API 与 PostgreSQL 覆盖允许查询、策略拒绝、未授权对象及标识转换探针。
+提交 `6e3964f` 实现 SQLGlot AST 策略、对象允许集和 analytics 只读执行；提交 `37764b0` 收紧对象标识类型转换。`test_policy.py` 覆盖允许形态、DML/DDL、多语句、系统对象和函数边界，`test_query_chain.py` 使用真实 API 覆盖策略拒绝、未授权对象及标识转换探针，`tests/worker/test_query_execution.py` 在 Worker 凭据环境中证明允许查询仍由 analytics 只读身份有界执行。v0.2.0 起策略判定发生在提交阶段，执行只发生在 Worker 进程。
 
 ## Revisit when
 

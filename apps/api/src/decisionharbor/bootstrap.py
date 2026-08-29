@@ -23,6 +23,7 @@ def _database_url(admin_url: str, database: str, *, sqlalchemy: bool = False) ->
 def _ensure_roles_and_databases(
     admin_url: str,
     platform_password: str,
+    platform_worker_password: str,
     analytics_password: str,
     readiness_password: str,
 ) -> None:
@@ -30,6 +31,7 @@ def _ensure_roles_and_databases(
         with connection.cursor() as cursor:
             for role, password in (
                 ("platform_app", platform_password),
+                ("platform_worker", platform_worker_password),
                 ("analytics_reader", analytics_password),
                 ("analytics_readiness", readiness_password),
             ):
@@ -58,14 +60,16 @@ def _ensure_roles_and_databases(
                     )
 
             cursor.execute(
-                "REVOKE CONNECT ON DATABASE postgres FROM PUBLIC, platform_app, analytics_reader, analytics_readiness"
+                "REVOKE CONNECT ON DATABASE postgres FROM PUBLIC, platform_app, platform_worker, analytics_reader, analytics_readiness"
             )
             cursor.execute(
-                "REVOKE CONNECT ON DATABASE template1 FROM PUBLIC, platform_app, analytics_reader, analytics_readiness"
+                "REVOKE CONNECT ON DATABASE template1 FROM PUBLIC, platform_app, platform_worker, analytics_reader, analytics_readiness"
             )
             cursor.execute("REVOKE CONNECT ON DATABASE platform FROM PUBLIC, analytics_reader, analytics_readiness")
-            cursor.execute("GRANT CONNECT ON DATABASE platform TO platform_app")
-            cursor.execute("REVOKE CONNECT ON DATABASE analytics FROM PUBLIC, platform_app")
+            cursor.execute("GRANT CONNECT ON DATABASE platform TO platform_app, platform_worker")
+            cursor.execute(
+                "REVOKE CONNECT ON DATABASE analytics FROM PUBLIC, platform_app, platform_worker"
+            )
             cursor.execute(
                 "REVOKE TEMPORARY ON DATABASE analytics FROM PUBLIC, analytics_reader, analytics_readiness"
             )
@@ -98,18 +102,25 @@ def main() -> None:
     admin_url = os.environ["ADMIN_DATABASE_URL"]
     dataset_root = Path(os.environ["DATASET_ROOT"])
     platform_password = os.environ["PLATFORM_APP_PASSWORD"]
+    platform_worker_password = os.environ["PLATFORM_WORKER_PASSWORD"]
     analytics_password = os.environ["ANALYTICS_READER_PASSWORD"]
     readiness_password = os.environ["ANALYTICS_READINESS_PASSWORD"]
 
     run_public_validator(dataset_root)
     dataset = load_dataset(dataset_root)
-    _ensure_roles_and_databases(admin_url, platform_password, analytics_password, readiness_password)
+    _ensure_roles_and_databases(
+        admin_url,
+        platform_password,
+        platform_worker_password,
+        analytics_password,
+        readiness_password,
+    )
 
     platform_admin_url = _database_url(admin_url, "platform")
     analytics_admin_url = _database_url(admin_url, "analytics")
     _migrate(ROOT / "alembic-platform.ini", _database_url(admin_url, "platform", sqlalchemy=True))
     _migrate(ROOT / "alembic-analytics.ini", _database_url(admin_url, "analytics", sqlalchemy=True))
-    _harden_public_schema(platform_admin_url, ("platform_app",))
+    _harden_public_schema(platform_admin_url, ("platform_app", "platform_worker"))
     _harden_public_schema(analytics_admin_url, ("analytics_readiness",))
     result = seed_dataset(analytics_admin_url, dataset)
     print(f"bootstrap complete: dataset {result}")

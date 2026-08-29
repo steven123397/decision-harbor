@@ -2,7 +2,9 @@
 
 DecisionHarbor 是一个面向企业内部业务人员的受治理数据分析平台。它让用户提交显式 SQL，并在受控规则内完成校验、只读执行、结果展示与查询审计。
 
-当前仓库已实现首轮受治理 SQL 查询链路，包括 React 查询工作台、FastAPI、两个 PostgreSQL 逻辑数据库、SQLGlot AST 策略、查询审计、迁移、固定数据 seed 和容器化测试。
+当前仓库已实现首轮受治理 SQL 查询链路，包括 React 查询工作台、FastAPI、独立 Worker 进程、两个 PostgreSQL 逻辑数据库、SQLGlot AST 策略、查询审计、迁移、固定数据 seed 和容器化测试。
+
+Web 与 API 只负责查询工作台、请求校验和策略判定；只有独立 Worker 进程持有执行用户 SQL 所需的 analytics 只读凭据。
 
 协作入口见 [Agent 工作规则](AGENTS.md)，规范术语见 [领域上下文](CONTEXT.md)。长期技术取舍记录在 [ADR](docs/adr/README.md)，当前功能规格和 tickets 记录在 `.scratch/`。
 
@@ -63,21 +65,23 @@ API_HOST_PORT=18080 \
 
 ## 查询 API
 
-提交一条同步只读查询：
+提交一条只读查询，策略允许时立即返回持久化的查询运行：
 
 ```bash
-curl -H 'content-type: application/json' \
+curl -i -H 'content-type: application/json' \
   --data '{"sql":"SELECT region, count(*) FROM customers GROUP BY region"}' \
   http://127.0.0.1:8000/api/v1/query-runs
 ```
 
-读取持久化审计事实：
+策略允许时返回 HTTP 202 和 `queued` 查询运行，由 Worker 异步执行；策略拒绝时返回 HTTP 422 和 `rejected` 查询运行。
+
+读取持久化审计事实（不返回结果单元格）：
 
 ```bash
 curl http://127.0.0.1:8000/api/v1/query-runs/<query-run-id>
 ```
 
-历史读取不返回结果单元格；结果只随成功的 POST 即时返回。
+Worker 只暴露容器内的健康检查端口，`/health` 表示进程存活，`/ready` 表示已经完成一次队列轮询。
 
 ## 测试
 

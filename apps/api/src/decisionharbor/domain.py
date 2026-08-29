@@ -39,6 +39,14 @@ class QueryRun:
     started_at: datetime | None
     finished_at: datetime | None
     duration_ms: int | None
+    cancellation_requested_at: datetime | None = None
+    execution_attempt_count: int = 0
+    attempt_number: int | None = None
+    attempt_worker_id: str | None = None
+    attempt_generation: int | None = None
+    lease_expires_at: datetime | None = None
+    heartbeat_at: datetime | None = None
+    retry_of: str | None = None
 
     @classmethod
     def received(

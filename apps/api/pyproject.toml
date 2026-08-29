@@ -28,7 +28,8 @@ where = ["src"]
 [tool.pytest.ini_options]
 addopts = "-ra"
 pythonpath = ["src"]
-testpaths = ["tests"]
+testpaths = ["tests/unit", "tests/integration"]
 markers = [
   "integration: requires the Compose PostgreSQL and API services",
+  "worker: requires the Worker credential environment (platform task and analytics reader)",
 ]

@@ -1,11 +1,17 @@
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
+from hashlib import sha256
+import re
 from typing import TypeAlias
 from uuid import uuid4
 
 
 JsonCell: TypeAlias = None | bool | int | float | str
+
+SUBMIT_IDEMPOTENCY_SCOPE = "submit"
+IDEMPOTENCY_KEY_MAX_LENGTH = 128
+VISIBLE_ASCII_KEY = re.compile(rf"^[\x21-\x7e]{{1,{IDEMPOTENCY_KEY_MAX_LENGTH}}}$")
 
 
 @dataclass(frozen=True)
@@ -74,6 +80,46 @@ class QueryRun:
             finished_at=None,
             duration_ms=None,
         )
+
+
+@dataclass(frozen=True)
+class IdempotencyClaim:
+    """The idempotency scope, key and input fingerprint of one request."""
+
+    scope: str
+    key: str
+    request_fingerprint: str
+
+
+@dataclass(frozen=True)
+class SubmitReservation:
+    """A submit request that was reserved under its idempotency key.
+
+    `is_replay` marks a reservation that reused a recorded key, so the caller
+    replays the recorded query run instead of taking a new policy decision.
+    `fingerprint_matched` only carries meaning for a replay: it says whether the
+    replayed request carries the same input as the request that recorded the key.
+    """
+
+    run: QueryRun
+    is_replay: bool = False
+    fingerprint_matched: bool = True
+
+    @classmethod
+    def created(cls, run: QueryRun) -> "SubmitReservation":
+        return cls(run=run)
+
+    @classmethod
+    def replayed(cls, run: QueryRun, fingerprint_matched: bool) -> "SubmitReservation":
+        return cls(run=run, is_replay=True, fingerprint_matched=fingerprint_matched)
+
+
+def is_valid_idempotency_key(key: str) -> bool:
+    return bool(VISIBLE_ASCII_KEY.fullmatch(key))
+
+
+def submit_request_fingerprint(raw_sql: str) -> str:
+    return sha256(raw_sql.encode("utf-8")).hexdigest()
 
 
 def finished_fields(run: QueryRun) -> dict[str, datetime | int]:

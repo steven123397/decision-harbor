@@ -3,10 +3,10 @@ from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from threading import Lock
-from typing import Protocol
+from typing import Annotated, Protocol
 from uuid import UUID
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Header, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -34,6 +34,8 @@ HTTP_STATUS_BY_CODE = {
     "sql_object_not_allowed": 422,
     "sql_function_not_allowed": 422,
     "unsupported_sql": 422,
+    "invalid_idempotency_key": 422,
+    "idempotency_conflict": 409,
     "audit_unavailable": 503,
     "service_not_ready": 503,
     "policy_internal_error": 500,
@@ -48,7 +50,7 @@ class QueryRequest(BaseModel):
 
 
 class QueryService(Protocol):
-    def submit(self, raw_sql: str) -> QueryRun: ...
+    def submit(self, raw_sql: str, idempotency_key: str | None = None) -> QueryRun: ...
 
 
 class QueryRepository(Protocol):
@@ -149,9 +151,12 @@ def create_app(
         return _envelope(data={"status": "ready"})
 
     @app.post("/api/v1/query-runs", response_model=None)
-    def create_query_run(query: QueryRequest):
+    def create_query_run(
+        query: QueryRequest,
+        idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    ):
         try:
-            run = service.submit(query.sql)
+            run = service.submit(query.sql, idempotency_key)
         except ServiceFailure as failure:
             run_id = failure.query_run.id if failure.query_run else None
             data = {"query_run": _run_payload(failure.query_run)} if failure.query_run else None

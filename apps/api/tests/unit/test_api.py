@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 from threading import Event
 from time import monotonic
 
+import pytest
 from fastapi.testclient import TestClient
 
 import decisionharbor.api as api_module
@@ -35,8 +36,10 @@ def terminal_run(status: str = "queued", code: str | None = None) -> QueryRun:
 class FakeService:
     def __init__(self, failure: ServiceFailure | None = None) -> None:
         self.failure = failure
+        self.calls: list[tuple[str, str | None]] = []
 
-    def submit(self, raw_sql: str) -> QueryRun:
+    def submit(self, raw_sql: str, idempotency_key: str | None = None) -> QueryRun:
+        self.calls.append((raw_sql, idempotency_key))
         if self.failure:
             raise self.failure
         return terminal_run()
@@ -123,6 +126,75 @@ def test_post_accepts_the_run_and_returns_no_result() -> None:
     assert payload["error"] is None
     assert payload["data"]["query_run"]["status"] == "queued"
     assert set(payload["data"]) == {"query_run"}
+
+
+def test_submit_forwards_a_valid_idempotency_key_to_the_service() -> None:
+    service = FakeService()
+    with client(service) as test_client:
+        response = test_client.post(
+            "/api/v1/query-runs",
+            json={"sql": "SELECT 1"},
+            headers={"Idempotency-Key": "submit-1"},
+        )
+
+    assert response.status_code == 202
+    assert service.calls == [("SELECT 1", "submit-1")]
+
+
+def test_submit_without_a_key_asks_the_service_for_a_new_run_each_time() -> None:
+    service = FakeService()
+    with client(service) as test_client:
+        test_client.post("/api/v1/query-runs", json={"sql": "SELECT 1"})
+        test_client.post("/api/v1/query-runs", json={"sql": "SELECT 1"})
+
+    assert service.calls == [("SELECT 1", None), ("SELECT 1", None)]
+
+
+@pytest.mark.parametrize("key", ["", "k" * 129, "key with spaces", "key\x7f"])
+def test_invalid_idempotency_keys_are_mapped_to_a_safe_envelope(key: str) -> None:
+    failure = ServiceFailure(
+        "invalid_idempotency_key",
+        "The Idempotency-Key header is invalid.",
+        None,
+    )
+    with client(FakeService(failure)) as test_client:
+        response = test_client.post(
+            "/api/v1/query-runs",
+            json={"sql": "SELECT 1"},
+            headers={"Idempotency-Key": key},
+        )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "data": None,
+        "error": {
+            "code": "invalid_idempotency_key",
+            "message": "The Idempotency-Key header is invalid.",
+        },
+    }
+
+
+def test_idempotency_conflict_returns_a_stable_409_envelope() -> None:
+    failure = ServiceFailure(
+        "idempotency_conflict",
+        "The idempotency key was already used with a different request.",
+        None,
+    )
+    with client(FakeService(failure)) as test_client:
+        response = test_client.post(
+            "/api/v1/query-runs",
+            json={"sql": "SELECT 2"},
+            headers={"Idempotency-Key": "submit-1"},
+        )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "data": None,
+        "error": {
+            "code": "idempotency_conflict",
+            "message": "The idempotency key was already used with a different request.",
+        },
+    }
 
 
 def test_policy_rejection_uses_stable_http_mapping_and_run_id() -> None:

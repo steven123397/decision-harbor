@@ -76,7 +76,7 @@ def test_real_api_rejects_catalog_resolving_casts_before_execution(raw_sql: str)
 def test_startup_recovery_closes_interrupted_audit_records() -> None:
     settings = Settings.from_env()
     repository = QueryRunRepository(settings.platform_database_url)
-    received = repository.create("SELECT 1", "policy-v1", 5_000, 500)
+    received = repository.reserve("SELECT 1", "policy-v1", 5_000, 500).run
 
     assert repository.recover_interrupted() >= 1
 

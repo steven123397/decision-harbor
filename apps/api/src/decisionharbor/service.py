@@ -1,6 +1,14 @@
 from typing import Protocol
 
-from decisionharbor.domain import QueryRun, finished_fields
+from decisionharbor.domain import (
+    SUBMIT_IDEMPOTENCY_SCOPE,
+    IdempotencyClaim,
+    QueryRun,
+    SubmitReservation,
+    finished_fields,
+    is_valid_idempotency_key,
+    submit_request_fingerprint,
+)
 from decisionharbor.policy import PolicyDecision
 
 
@@ -9,13 +17,15 @@ class Policy(Protocol):
 
 
 class Repository(Protocol):
-    def create(
+    def reserve(
         self,
         raw_sql: str,
         policy_version: str,
         statement_timeout_ms: int,
         max_rows: int,
-    ) -> QueryRun: ...
+        *,
+        idempotency: IdempotencyClaim | None,
+    ) -> SubmitReservation: ...
 
     def transition(
         self,
@@ -48,13 +58,20 @@ class QueryRunService:
         self._statement_timeout_ms = statement_timeout_ms
         self._max_rows = max_rows
 
-    def submit(self, raw_sql: str) -> QueryRun:
+    def submit(self, raw_sql: str, idempotency_key: str | None = None) -> QueryRun:
+        if idempotency_key is not None and not is_valid_idempotency_key(idempotency_key):
+            raise ServiceFailure(
+                "invalid_idempotency_key",
+                "The Idempotency-Key header is invalid.",
+                None,
+            )
         try:
-            run = self._repository.create(
+            reservation = self._repository.reserve(
                 raw_sql,
                 self._policy_version,
                 self._statement_timeout_ms,
                 self._max_rows,
+                idempotency=self._claim(raw_sql, idempotency_key),
             )
         except Exception as exc:
             raise ServiceFailure(
@@ -63,6 +80,23 @@ class QueryRunService:
                 None,
             ) from exc
 
+        if reservation.is_replay:
+            if not reservation.fingerprint_matched:
+                raise ServiceFailure(
+                    "idempotency_conflict",
+                    "The idempotency key was already used with a different request.",
+                    None,
+                )
+            replayed = reservation.run
+            if replayed.status == "rejected":
+                raise ServiceFailure(
+                    replayed.error_code or "unsupported_sql",
+                    replayed.error_summary or "SQL is not allowed.",
+                    replayed,
+                )
+            return replayed
+
+        run = reservation.run
         try:
             decision = self._policy.evaluate(raw_sql)
         except Exception as exc:
@@ -99,6 +133,15 @@ class QueryRunService:
             status="queued",
             policy_decision="allowed",
             referenced_objects=decision.referenced_objects,
+        )
+
+    def _claim(self, raw_sql: str, idempotency_key: str | None) -> IdempotencyClaim | None:
+        if idempotency_key is None:
+            return None
+        return IdempotencyClaim(
+            scope=SUBMIT_IDEMPOTENCY_SCOPE,
+            key=idempotency_key,
+            request_fingerprint=submit_request_fingerprint(raw_sql),
         )
 
     def _transition(

@@ -38,6 +38,8 @@
 - API：`Settings` 不再读取 analytics 执行凭据，`QueryRunService.run` 改为 `submit`（策略允许入队、拒绝落库），提交返回 202 且不再携带结果；移除进程内容量信号量与已不可达的 HTTP 状态映射。
 - 测试布局：`tests/worker/` 只运行于 `worker-test` 服务（持有 analytics 只读凭据），承载执行回归与 analytics 契约；`tests/unit` 与 `tests/integration` 只运行于 `api-test`（无 analytics 执行凭据），其中 `test_query_chain.py` 断言该环境变量不存在并验证 `/ready` 在 1 秒内成功。
 
+**提交 SHA：** `0e0bcd0`（分支 `v0.2.0/codebuddy-hy4-preview-high`，未推送；本行由随后的 tracker 关闭提交写入，实现提交本身不含自身 SHA）。
+
 **Review 结论：** `/code-review` 双轴复核提出 ADR 落地状态未更新、取消意图可被抹除、成功终态不要求执行尝试事实、Worker 就绪不回落等问题，均已修复；`docs/adr/0001`、`0002` 的证据与身份描述已更新，`0003`、`0005` 状态改为 `partially-implemented` 并补充实现证据。
 
 **保留风险与后续票据：**

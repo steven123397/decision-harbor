@@ -7,6 +7,9 @@ from decisionharbor.domain import QueryResult, QueryRun, finished_fields
 from decisionharbor.repository import row_to_query_run
 
 
+# Every right-hand side of the SET list reads the pre-update row, so
+# attempt_number matches the new attempt count and the generation moves forward
+# by one from the generation the run carried while it was queued or owned.
 CLAIM_QUEUED_RUN = text(
     """
     UPDATE query_runs

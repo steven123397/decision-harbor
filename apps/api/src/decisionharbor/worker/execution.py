@@ -1,16 +1,11 @@
 import logging
-from typing import Protocol
 
-from decisionharbor.domain import QueryResult, QueryRun
-from decisionharbor.executor import ExecutionFailure
+from decisionharbor.domain import QueryRun
+from decisionharbor.executor import ExecutionFailure, PostgresQueryExecutor
 from decisionharbor.worker.queue import QueryRunQueue
 
 
 LOGGER = logging.getLogger(__name__)
-
-
-class Executor(Protocol):
-    def execute(self, raw_sql: str, statement_timeout_ms: int, max_rows: int) -> QueryResult: ...
 
 
 class QueryRunProcessor:
@@ -21,7 +16,7 @@ class QueryRunProcessor:
     database message.
     """
 
-    def __init__(self, queue: QueryRunQueue, executor: Executor) -> None:
+    def __init__(self, queue: QueryRunQueue, executor: PostgresQueryExecutor) -> None:
         self._queue = queue
         self._executor = executor
 

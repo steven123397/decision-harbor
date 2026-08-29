@@ -52,6 +52,7 @@ class QueryRun:
     started_at: datetime | None
     finished_at: datetime | None
     duration_ms: int | None
+    retry_of: str | None = None
 
     @classmethod
     def received(
@@ -60,6 +61,7 @@ class QueryRun:
         policy_version: str,
         statement_timeout_ms: int,
         max_rows: int,
+        retry_of: str | None = None,
     ) -> "QueryRun":
         return cls(
             id=str(uuid4()),
@@ -78,6 +80,7 @@ class QueryRun:
             started_at=None,
             finished_at=None,
             duration_ms=None,
+            retry_of=retry_of,
         )
 
 

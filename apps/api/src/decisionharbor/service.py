@@ -8,6 +8,7 @@ from decisionharbor.repository import (
     IDEMPOTENCY_SCOPE_SUBMIT,
     IdempotencyKeyTaken,
     request_fingerprint,
+    retry_idempotency_scope,
 )
 
 
@@ -23,6 +24,8 @@ class Repository(Protocol):
         statement_timeout_ms: int,
         max_rows: int,
         idempotency_key: str | None = None,
+        idempotency_scope: str = IDEMPOTENCY_SCOPE_SUBMIT,
+        retry_of: str | None = None,
     ) -> QueryRun: ...
 
     def transition(
@@ -59,6 +62,10 @@ def _audit_unavailable(run: QueryRun | None = None) -> ServiceFailure:
     return ServiceFailure("audit_unavailable", "The audit store is unavailable.", run)
 
 
+def _retryable_failure(source: QueryRun) -> ServiceFailure:
+    return ServiceFailure("query_run_not_retryable", "The query run cannot be retried.", source)
+
+
 class QueryRunService:
     """提交路径：同步完成请求校验与策略判定，允许入队、拒绝终态化。"""
 
@@ -79,22 +86,67 @@ class QueryRunService:
     def submit(self, raw_sql: str, idempotency_key: str | None = None) -> QueryRun:
         if idempotency_key is None:
             return self._submit_new(raw_sql)
-        replay = self._replay(idempotency_key, raw_sql)
+        return self._create_with_idempotency(
+            raw_sql, IDEMPOTENCY_SCOPE_SUBMIT, idempotency_key
+        )
+
+    def retry(self, run_id: str, idempotency_key: str | None = None) -> QueryRun:
+        """重试运行：为 failed/cancelled 运行创建记录 retry_of 的新查询运行。
+
+        新运行拥有独立生命周期与审计事实，并重走完整治理链路（策略判定、
+        执行、取消均适用）；rejected 必须修改 SQL 后重新提交，其余非允许
+        状态返回 409。来源是终态时不可逆，不存在校验后的状态竞态。
+        """
+        try:
+            source = self._repository.get(run_id)
+        except ServiceFailure:
+            raise
+        except Exception as exc:
+            raise _audit_unavailable() from exc
+        if source is None:
+            raise ServiceFailure("query_run_not_found", "Query run was not found.", None)
+        if source.status not in ("failed", "cancelled"):
+            raise _retryable_failure(source)
+
+        # 重试幂等键按来源运行 ID 隔离；无键时每次重试创建新运行。
+        if idempotency_key is None:
+            return self._submit_new(source.raw_sql, retry_of=run_id)
+        return self._create_with_idempotency(
+            source.raw_sql,
+            retry_idempotency_scope(run_id),
+            idempotency_key,
+            retry_of=run_id,
+        )
+
+    def _create_with_idempotency(
+        self,
+        raw_sql: str,
+        scope: str,
+        idempotency_key: str,
+        **create_kwargs: object,
+    ) -> QueryRun:
+        """幂等创建：预检重放 → 创建（与键占用同事务）→ 竞态败者按重放返回。"""
+        replay = self._replay(scope, idempotency_key, raw_sql)
         if replay is not None:
             return replay
         try:
             # 创建与键占用在同一事务提交：并发同键请求由唯一约束分出先后。
-            return self._submit_new(raw_sql, idempotency_key=idempotency_key)
+            return self._submit_new(
+                raw_sql,
+                idempotency_key=idempotency_key,
+                idempotency_scope=scope,
+                **create_kwargs,
+            )
         except IdempotencyKeyTaken:
             # 竞态兜底：另一请求先提交了同一键，重读后按重放语义返回先到的运行。
-            replay = self._replay(idempotency_key, raw_sql)
+            replay = self._replay(scope, idempotency_key, raw_sql)
             if replay is not None:
                 return replay
             raise _conflict() from None
 
-    def _replay(self, idempotency_key: str, raw_sql: str) -> QueryRun | None:
+    def _replay(self, scope: str, idempotency_key: str, raw_sql: str) -> QueryRun | None:
         """命中已有键占用时按重放语义返回原运行；不同输入返回冲突。"""
-        record = self._repository.find_idempotency(IDEMPOTENCY_SCOPE_SUBMIT, idempotency_key)
+        record = self._repository.find_idempotency(scope, idempotency_key)
         if record is None:
             return None
         if record.request_fingerprint != request_fingerprint(raw_sql):
@@ -112,7 +164,14 @@ class QueryRunService:
             raise ServiceFailure(run.error_code or "unsupported_sql", run.error_summary or "SQL is not allowed.", run)
         return run
 
-    def _submit_new(self, raw_sql: str, *, idempotency_key: str | None = None) -> QueryRun:
+    def _submit_new(
+        self,
+        raw_sql: str,
+        *,
+        idempotency_key: str | None = None,
+        idempotency_scope: str = IDEMPOTENCY_SCOPE_SUBMIT,
+        retry_of: str | None = None,
+    ) -> QueryRun:
         try:
             run = self._repository.create(
                 raw_sql,
@@ -120,6 +179,8 @@ class QueryRunService:
                 self._statement_timeout_ms,
                 self._max_rows,
                 idempotency_key=idempotency_key,
+                idempotency_scope=idempotency_scope,
+                retry_of=retry_of,
             )
         except IdempotencyKeyTaken:
             raise

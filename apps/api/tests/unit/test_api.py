@@ -12,6 +12,7 @@ from decisionharbor.service import ServiceFailure
 
 
 RUN_ID = "75e24c21-416c-4bd8-a37d-68667f4ec753"
+SOURCE_ID = "0c9d1a56-2f28-4a29-9c34-63a0478d5e12"
 
 SNAPSHOT_PAYLOAD = '{"columns":[{"name":"answer","type":"integer"}],"rows":[[1]]}'
 
@@ -20,12 +21,14 @@ def make_run(
     status: str = "succeeded",
     code: str | None = None,
     finished_at: datetime | None = None,
+    retry_of: str | None = None,
 ) -> QueryRun:
     now = datetime.now(timezone.utc)
     terminal = status in ("succeeded", "rejected", "failed", "cancelled")
     allowed = status != "rejected"
     return QueryRun(
         id=RUN_ID,
+        retry_of=retry_of,
         raw_sql="SELECT 1",
         status=status,
         policy_decision="rejected" if status == "rejected" else ("not_evaluated" if status == "received" else "allowed"),
@@ -62,13 +65,18 @@ class FakeService:
         status: str = "queued",
         cancel_outcome: str = "cancelled",
         cancel_failure: ServiceFailure | None = None,
+        retry_failure: ServiceFailure | None = None,
+        retry_run: QueryRun | None = None,
     ) -> None:
         self.failure = failure
         self.status = status
         self.cancel_outcome = cancel_outcome
         self.cancel_failure = cancel_failure
+        self.retry_failure = retry_failure
+        self.retry_run = retry_run
         self.submitted: list[tuple[str, str | None]] = []
         self.cancelled: list[str] = []
+        self.retried: list[tuple[str, str | None]] = []
 
     def submit(self, raw_sql: str, idempotency_key: str | None = None) -> QueryRun:
         self.submitted.append((raw_sql, idempotency_key))
@@ -82,6 +90,12 @@ class FakeService:
             raise self.cancel_failure
         status_by_outcome = {"cancelled": "cancelled", "cancelling": "cancelling", "terminal": "succeeded"}
         return self.cancel_outcome, make_run(status_by_outcome[self.cancel_outcome])
+
+    def retry(self, run_id: str, idempotency_key: str | None = None) -> QueryRun:
+        self.retried.append((run_id, idempotency_key))
+        if self.retry_failure:
+            raise self.retry_failure
+        return self.retry_run if self.retry_run is not None else make_run("queued")
 
 
 class FakeRepository:
@@ -463,3 +477,96 @@ def test_cancel_maps_audit_failure_to_a_safe_envelope() -> None:
     assert response.status_code == 503
     assert response.json()["error"]["code"] == "audit_unavailable"
     assert "DSN" not in response.text
+
+
+def test_retry_returns_202_and_the_new_run_with_retry_of() -> None:
+    service = FakeService(retry_run=make_run("queued", retry_of=SOURCE_ID))
+    with client(service) as test_client:
+        response = test_client.post(f"/api/v1/query-runs/{RUN_ID}/retry")
+
+    assert response.status_code == 202
+    payload = response.json()
+    assert payload["error"] is None
+    assert payload["data"]["query_run"]["status"] == "queued"
+    assert payload["data"]["query_run"]["retry_of"] == SOURCE_ID
+    assert service.retried == [(RUN_ID, None)]
+
+
+def test_retry_of_a_not_retryable_run_maps_to_409() -> None:
+    run = make_run("succeeded")
+    service = FakeService(
+        retry_failure=ServiceFailure("query_run_not_retryable", "The query run cannot be retried.", run)
+    )
+    with client(service) as test_client:
+        response = test_client.post(f"/api/v1/query-runs/{RUN_ID}/retry")
+
+    assert response.status_code == 409
+    assert response.json()["data"] is None
+    assert response.json()["error"] == {
+        "code": "query_run_not_retryable",
+        "message": "The query run cannot be retried.",
+        "query_run_id": RUN_ID,
+    }
+
+
+def test_retry_of_an_unknown_run_is_not_found() -> None:
+    service = FakeService(
+        retry_failure=ServiceFailure("query_run_not_found", "Query run was not found.", None)
+    )
+    with client(service) as test_client:
+        response = test_client.post(f"/api/v1/query-runs/{RUN_ID}/retry")
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "query_run_not_found"
+    assert response.json()["data"] is None
+
+
+def test_retry_maps_audit_failure_to_a_safe_envelope() -> None:
+    service = FakeService(retry_failure=ServiceFailure("audit_unavailable", "The audit store is unavailable.", None))
+    with client(service) as test_client:
+        response = test_client.post(f"/api/v1/query-runs/{RUN_ID}/retry")
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "audit_unavailable"
+    assert "DSN" not in response.text
+
+
+def test_retry_returns_the_new_run_facts_when_policy_rejects_the_retried_sql() -> None:
+    run = make_run("rejected", "sql_object_not_allowed", retry_of=SOURCE_ID)
+    service = FakeService(
+        retry_failure=ServiceFailure("sql_object_not_allowed", "Object is not allowed.", run)
+    )
+    with client(service) as test_client:
+        response = test_client.post(f"/api/v1/query-runs/{RUN_ID}/retry")
+
+    # 与提交路径一致：策略拒绝仍随响应返回新运行事实（rejected 终态可读）。
+    assert response.status_code == 422
+    assert response.json()["data"]["query_run"]["status"] == "rejected"
+    assert response.json()["data"]["query_run"]["retry_of"] == SOURCE_ID
+
+
+def test_retry_forwards_the_idempotency_key_to_the_service() -> None:
+    service = FakeService()
+    with client(service) as test_client:
+        response = test_client.post(
+            f"/api/v1/query-runs/{RUN_ID}/retry",
+            headers={"Idempotency-Key": "key-1"},
+        )
+
+    assert response.status_code == 202
+    assert service.retried == [(RUN_ID, "key-1")]
+
+
+def test_invalid_idempotency_keys_are_rejected_before_the_retry_call() -> None:
+    service = FakeService()
+    with client(service) as test_client:
+        for key in ("a" * 129, "key with space", "tab\tkey", b"caf\xe9"):
+            response = test_client.post(
+                f"/api/v1/query-runs/{RUN_ID}/retry",
+                headers={"Idempotency-Key": key},
+            )
+
+            assert response.status_code == 422, key
+            assert response.json()["error"]["code"] == "invalid_idempotency_key", key
+            assert response.json()["data"] is None, key
+            assert service.retried == [], key

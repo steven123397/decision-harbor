@@ -33,6 +33,9 @@ IDEMPOTENCY_KEY_MAX_CHARS = 128
 
 TERMINAL_STATUSES = frozenset({"rejected", "succeeded", "failed", "cancelled"})
 
+# 重试动作被拒只返回错误事实；其余失败（如重试 SQL 被策略拒绝）仍附新运行。
+RETRY_ERROR_ONLY_CODES = frozenset({"query_run_not_retryable"})
+
 HTTP_STATUS_BY_CODE = {
     "invalid_request": 422,
     "invalid_idempotency_key": 422,
@@ -51,6 +54,7 @@ HTTP_STATUS_BY_CODE = {
     "result_expired": 410,
     "idempotency_conflict": 409,
     "query_run_not_cancellable": 409,
+    "query_run_not_retryable": 409,
     "query_capacity_exceeded": 429,
     "query_timeout": 504,
     "analytics_unavailable": 503,
@@ -72,6 +76,8 @@ class QueryService(Protocol):
     def submit(self, raw_sql: str, idempotency_key: str | None = None) -> QueryRun: ...
 
     def cancel(self, run_id: str) -> tuple[str, QueryRun]: ...
+
+    def retry(self, run_id: str, idempotency_key: str | None = None) -> QueryRun: ...
 
 
 class QueryRepository(Protocol):
@@ -102,6 +108,21 @@ def _idempotency_key_error(key: str) -> str | None:
     if not all(33 <= ord(character) <= 126 for character in key):
         return "The idempotency key must contain only visible ASCII characters."
     return None
+
+
+def _header_idempotency_key(request: Request) -> tuple[str | None, str | None]:
+    """读取 Idempotency-Key 头并校验；返回 (键, 非法原因)。"""
+    key = request.headers.get("Idempotency-Key")
+    if key is None:
+        return None, None
+    return key, _idempotency_key_error(key)
+
+
+def _invalid_key_response(invalid_reason: str) -> JSONResponse:
+    return JSONResponse(
+        _envelope(error=_error("invalid_idempotency_key", invalid_reason)),
+        status_code=422,
+    )
 
 
 def _failure_response(failure: ServiceFailure, *, include_run: bool) -> JSONResponse:
@@ -189,14 +210,9 @@ def create_app(
 
     @app.post("/api/v1/query-runs", response_model=None)
     def create_query_run(query: QueryRequest, request: Request):
-        idempotency_key = request.headers.get("Idempotency-Key")
-        if idempotency_key is not None:
-            invalid_reason = _idempotency_key_error(idempotency_key)
-            if invalid_reason is not None:
-                return JSONResponse(
-                    _envelope(error=_error("invalid_idempotency_key", invalid_reason)),
-                    status_code=422,
-                )
+        idempotency_key, invalid_reason = _header_idempotency_key(request)
+        if invalid_reason is not None:
+            return _invalid_key_response(invalid_reason)
         try:
             run = service.submit(query.sql, idempotency_key=idempotency_key)
         except ServiceFailure as failure:
@@ -298,6 +314,22 @@ def create_app(
         return JSONResponse(
             _envelope(data={"query_run": _run_payload(run)}),
             status_code=status_code,
+        )
+
+    @app.post("/api/v1/query-runs/{run_id}/retry", response_model=None)
+    def retry_query_run(run_id: UUID, request: Request):
+        idempotency_key, invalid_reason = _header_idempotency_key(request)
+        if invalid_reason is not None:
+            return _invalid_key_response(invalid_reason)
+        try:
+            run = service.retry(str(run_id), idempotency_key=idempotency_key)
+        except ServiceFailure as failure:
+            # 动作被拒（409 等同 cancel 只返回错误）；重试 SQL 被策略拒绝时
+            # 仍随响应返回新运行事实（与提交路径的 rejected 语义一致）。
+            return _failure_response(failure, include_run=failure.code not in RETRY_ERROR_ONLY_CODES)
+        return JSONResponse(
+            _envelope(data={"query_run": _run_payload(run)}),
+            status_code=202,
         )
 
     return app

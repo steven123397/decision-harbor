@@ -19,6 +19,11 @@ class IdempotencyKeyTaken(RuntimeError):
 # 提交幂等的实例级作用域；当前版本没有用户或租户。
 IDEMPOTENCY_SCOPE_SUBMIT = "submit"
 
+
+def retry_idempotency_scope(source_run_id: str) -> str:
+    """重试幂等键按来源运行 ID 隔离：同一键在不同来源下互不冲突。"""
+    return f"retry:{source_run_id}"
+
 # 取消请求的结果口径：取消意图与终态发布的竞态由条件更新竞争后落定的稳定结论。
 CANCEL_OUTCOME_CANCELLED = "cancelled"  # queued 直接取消为 cancelled 终态
 CANCEL_OUTCOME_CANCELLING = "cancelling"  # running 进入 cancelling 或重复取消幂等命中
@@ -62,8 +67,16 @@ class QueryRunRepository:
         statement_timeout_ms: int,
         max_rows: int,
         idempotency_key: str | None = None,
+        idempotency_scope: str = IDEMPOTENCY_SCOPE_SUBMIT,
+        retry_of: str | None = None,
     ) -> QueryRun:
-        run = QueryRun.received(raw_sql, policy_version, statement_timeout_ms, max_rows)
+        run = QueryRun.received(
+            raw_sql,
+            policy_version,
+            statement_timeout_ms,
+            max_rows,
+            retry_of=retry_of,
+        )
         try:
             with self._engine.begin() as connection:
                 row = connection.execute(
@@ -71,10 +84,11 @@ class QueryRunRepository:
                         """
                         INSERT INTO query_runs (
                             id, raw_sql, status, policy_decision, policy_version,
-                            referenced_objects, statement_timeout_ms, max_rows, created_at
+                            referenced_objects, statement_timeout_ms, max_rows, created_at, retry_of
                         ) VALUES (
                             CAST(:id AS uuid), :raw_sql, :status, :policy_decision, :policy_version,
-                            CAST(:referenced_objects AS jsonb), :statement_timeout_ms, :max_rows, :created_at
+                            CAST(:referenced_objects AS jsonb), :statement_timeout_ms, :max_rows, :created_at,
+                            CAST(:retry_of AS uuid)
                         )
                         RETURNING *
                         """
@@ -82,6 +96,7 @@ class QueryRunRepository:
                     {
                         **run.__dict__,
                         "referenced_objects": json.dumps(run.referenced_objects),
+                        "retry_of": run.retry_of,
                     },
                 ).one()
                 if idempotency_key is not None:
@@ -94,7 +109,7 @@ class QueryRunRepository:
                                 """
                             ),
                             {
-                                "scope": IDEMPOTENCY_SCOPE_SUBMIT,
+                                "scope": idempotency_scope,
                                 "key": idempotency_key,
                                 "request_fingerprint": request_fingerprint(raw_sql),
                                 "run_id": run.id,
@@ -220,6 +235,7 @@ def _row_to_query_run(row: Row) -> QueryRun:
     values = row._mapping
     return QueryRun(
         id=str(values["id"]),
+        retry_of=str(values["retry_of"]) if values["retry_of"] is not None else None,
         raw_sql=values["raw_sql"],
         status=values["status"],
         policy_decision=values["policy_decision"],

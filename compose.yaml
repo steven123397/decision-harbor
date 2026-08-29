@@ -105,6 +105,8 @@ services:
       DATASET_ROOT: /app/datasets/sales-analytics-v1
       QUERY_STATEMENT_TIMEOUT_MS: ${QUERY_STATEMENT_TIMEOUT_MS:-5000}
       QUERY_MAX_ROWS: ${QUERY_MAX_ROWS:-500}
+      NO_PROXY: api,postgres,localhost,127.0.0.1,::1
+      no_proxy: api,postgres,localhost,127.0.0.1,::1
     depends_on:
       api:
         condition: service_healthy

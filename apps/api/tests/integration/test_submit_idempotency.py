@@ -17,6 +17,7 @@ pytestmark = pytest.mark.integration
 ALLOWED_SQL = "SELECT count(*) AS customer_count FROM customers"
 OTHER_ALLOWED_SQL = "SELECT region FROM customers"
 REJECTED_SQL = "SELECT * FROM secrets"
+ASYNC_LIFECYCLE = {"queued", "running", "succeeded"}
 
 
 def platform_admin_url() -> str:
@@ -72,7 +73,7 @@ def test_identical_replay_returns_the_same_queued_run() -> None:
     assert second.json()["error"] is None
     assert set(second.json()["data"]) == {"query_run"}
     assert second.json()["data"]["query_run"]["id"] == run_id
-    assert second.json()["data"]["query_run"]["status"] == "queued"
+    assert second.json()["data"]["query_run"]["status"] in ASYNC_LIFECYCLE
     assert query_run_count() == before + 1
 
     records = submit_records(key)

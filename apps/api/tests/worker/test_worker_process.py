@@ -5,12 +5,23 @@ from urllib.request import urlopen
 
 import pytest
 
+from decisionharbor.executor import PostgresQueryExecutor
 from decisionharbor.worker.config import WorkerSettings
+from decisionharbor.worker.execution import QueryRunProcessor
 from decisionharbor.worker.health import WorkerHealthServer
+from decisionharbor.worker.queue import QueryRunQueue
 from decisionharbor.worker.runtime import PlatformProbe, WorkerRuntime
 
 
 pytestmark = pytest.mark.worker
+
+
+def runtime(settings: WorkerSettings) -> WorkerRuntime:
+    processor = QueryRunProcessor(
+        QueryRunQueue(settings.platform_database_url, settings.worker_id, settings.lease_ms),
+        PostgresQueryExecutor(settings.analytics_database_url, 1),
+    )
+    return WorkerRuntime(settings, PlatformProbe(settings.platform_database_url).check, processor)
 
 
 def test_worker_process_reports_health_and_readiness_in_the_runtime() -> None:
@@ -24,14 +35,13 @@ def test_worker_process_reports_health_and_readiness_in_the_runtime() -> None:
 
 
 def test_worker_becomes_ready_after_a_successful_queue_poll() -> None:
-    settings = WorkerSettings.from_env()
-    runtime = WorkerRuntime(settings, PlatformProbe(settings.platform_database_url).check)
+    worker = runtime(WorkerSettings.from_env())
 
-    assert runtime.ready is False
+    assert worker.ready is False
 
-    runtime.poll_once()
+    worker.poll_once()
 
-    assert runtime.ready is True
+    assert worker.ready is True
 
 
 def test_health_endpoints_follow_the_worker_readiness_state() -> None:

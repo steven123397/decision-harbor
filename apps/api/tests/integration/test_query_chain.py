@@ -1,7 +1,13 @@
+import json
 import os
-from time import monotonic
+import socket
+from time import monotonic, sleep
+from urllib.parse import urlsplit
+from urllib.request import urlopen
+from uuid import uuid4
 
 from fastapi.testclient import TestClient
+import psycopg
 import pytest
 
 from decisionharbor.api import create_runtime_app
@@ -10,6 +16,69 @@ from decisionharbor.repository import QueryRunRepository
 
 
 pytestmark = pytest.mark.integration
+
+
+ASYNC_LIFECYCLE = {"queued", "running", "succeeded"}
+TERMINAL_STATUSES = {"succeeded", "failed", "cancelled"}
+
+
+def platform_admin_url() -> str:
+    return os.environ["TEST_ADMIN_DATABASE_URL"].rsplit("/", 1)[0] + "/platform"
+
+
+def submit_and_abandon_connection(raw_sql: str) -> str:
+    """Post a query run and leave before the response can be delivered.
+
+    The client never learns the run identity from the response, so the only way
+    to read the run back is by the identifier the platform recorded.
+    """
+    base = urlsplit(os.environ["API_BASE_URL"])
+    body = json.dumps({"sql": raw_sql}).encode()
+    request = (
+        "POST /api/v1/query-runs HTTP/1.1\r\n"
+        f"Host: {base.netloc}\r\n"
+        "content-type: application/json\r\n"
+        f"content-length: {len(body)}\r\n"
+        "Connection: close\r\n\r\n"
+    ).encode() + body
+    with socket.create_connection((base.hostname or "api", base.port or 80), timeout=10) as connection:
+        connection.sendall(request)
+    return wait_for_run_id(raw_sql)
+
+
+def wait_for_run_id(raw_sql: str) -> str:
+    deadline = monotonic() + 30
+    while monotonic() < deadline:
+        with psycopg.connect(platform_admin_url()) as connection:
+            row = connection.execute(
+                "SELECT id FROM query_runs WHERE raw_sql = %s", (raw_sql,)
+            ).fetchone()
+        if row is not None:
+            return str(row[0])
+        sleep(0.1)
+    raise AssertionError(f"no query run was recorded for {raw_sql}")
+
+
+def wait_for_terminal(run_id: str) -> dict:
+    deadline = monotonic() + 30
+    while monotonic() < deadline:
+        with urlopen(f"{os.environ['API_BASE_URL']}/api/v1/query-runs/{run_id}", timeout=5) as response:
+            run = json.loads(response.read())["data"]["query_run"]
+        if run["status"] in TERMINAL_STATUSES:
+            return run
+        sleep(0.1)
+    raise AssertionError(f"query run {run_id} never reached a terminal state")
+
+
+def read_snapshot(run_id: str) -> tuple[object, object, bool] | None:
+    with psycopg.connect(platform_admin_url()) as connection:
+        return connection.execute(
+            """
+            SELECT result_columns, result_rows, truncated
+            FROM query_run_results WHERE query_run_id = %s
+            """,
+            (run_id,),
+        ).fetchone()
 
 
 def test_api_is_ready_without_analytics_execution_credentials() -> None:
@@ -46,7 +115,48 @@ def test_allowed_query_is_queued_without_returning_a_result() -> None:
         audit = client.get(f"/api/v1/query-runs/{run['id']}")
 
     assert audit.status_code == 200
-    assert audit.json()["data"]["query_run"]["status"] == "queued"
+    audit_run = audit.json()["data"]["query_run"]
+    assert audit_run["status"] in ASYNC_LIFECYCLE
+    assert audit_run["policy_decision"] == "allowed"
+    assert audit_run["referenced_objects"] == ["analytics.customers"]
+
+
+def test_submitted_run_reaches_success_after_the_submit_connection_is_abandoned() -> None:
+    alias = f"abandoned_{uuid4().hex}"
+    raw_sql = f"SELECT count(*) AS {alias} FROM customers"
+
+    run_id = submit_and_abandon_connection(raw_sql)
+
+    facts = wait_for_terminal(run_id)
+
+    assert facts["raw_sql"] == raw_sql
+    assert facts["status"] == "succeeded"
+    assert facts["returned_row_count"] == 1
+    assert facts["result_truncated"] is False
+    assert facts["started_at"] is not None
+    assert facts["finished_at"] is not None
+    assert facts["duration_ms"] is not None
+    assert facts["attempt_worker_id"]
+    assert facts["execution_attempt_count"] == 1
+    assert facts["error_code"] is None
+
+    snapshot = read_snapshot(run_id)
+    assert snapshot is not None
+    assert snapshot[0] == [{"name": alias, "type": "bigint"}]
+    assert snapshot[1] == [["100"]]
+    assert snapshot[2] is False
+
+
+def test_unknown_query_run_identifier_is_not_found() -> None:
+    app = create_runtime_app()
+    with TestClient(app) as client:
+        response = client.get(f"/api/v1/query-runs/{uuid4()}")
+
+    assert response.status_code == 404
+    assert response.json() == {
+        "data": None,
+        "error": {"code": "query_run_not_found", "message": "Query run was not found."},
+    }
 
 
 @pytest.mark.parametrize(

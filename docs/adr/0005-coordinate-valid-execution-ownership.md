@@ -27,7 +27,9 @@ platform PostgreSQL 协调带租约和递增 generation 的有效执行所有权
 
 ## Implementation and evidence
 
-v0.2.0 的 ticket 01 把执行尝试所有权落为 `query_runs` 上的 generation、租约、心跳与尝试序号列，并用 CHECK 约束与 `query_runs_lifecycle_guard` 触发器拒绝终态回退、generation 与尝试序号回退、取消意图被丢弃以及在取消后领取新尝试；`test_query_run_state_model.py` 证明这些约束。领取、心跳续租与接管由后续 ticket 交付。
+v0.2.0 的 ticket 01 把执行尝试所有权落为 `query_runs` 上的 generation、租约、心跳与尝试序号列，并用 CHECK 约束与 `query_runs_lifecycle_guard` 触发器拒绝终态回退、generation 与尝试序号回退、取消意图被丢弃以及在取消后领取新尝试；`test_query_run_state_model.py` 证明这些约束。
+
+ticket 03 让每次领取产生递增 generation 的新执行尝试，并让状态与结果发布都带 `status = 'running'`、`attempt_number` 与 `attempt_generation` 栅栏，旧 generation 的写入不产生效果。租约在领取时写入但尚未参与发布判定，心跳续租、全局容量上限与接管由 ticket 07 交付，因此当前栅栏不核对 `lease_expires_at`。
 
 ## Revisit when
 

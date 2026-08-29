@@ -71,3 +71,23 @@ def test_unsupported_result_type_is_rejected_instead_of_stringified(
         executor.execute("SELECT ARRAY[1, 2] AS items", 5_000, 500)
 
     assert caught.value.code == "unsupported_result_type"
+
+
+def test_failed_execution_paths_leave_the_pooled_connection_reusable(
+    executor: PostgresQueryExecutor,
+) -> None:
+    bounded = "SELECT id FROM orders ORDER BY id"
+    assert executor.execute(bounded, 5_000, 2).rows == (("1",), ("2",))
+
+    for raw_sql, timeout_ms in (
+        ("SELECT missing_column FROM customers", 5_000),
+        ("SELECT ARRAY[1, 2] AS items", 5_000),
+        (
+            "SELECT count(*) FROM order_items a CROSS JOIN order_items b CROSS JOIN order_items c",
+            1,
+        ),
+    ):
+        with pytest.raises(ExecutionFailure):
+            executor.execute(raw_sql, timeout_ms, 500)
+
+    assert executor.execute(bounded, 5_000, 2).rows == (("1",), ("2",))

@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: partially-implemented
 date: 2026-08-16
 ---
 
@@ -23,6 +23,10 @@ date: 2026-08-16
 ## Consequences
 
 成功终态与快照必须在同一事务中发布，清理只删除结果内容并保留长期审计。用户可能只看到截断前缀，超大单行会失败；产品必须用稳定状态区分未就绪、不可用和已过期结果。
+
+## Implementation and evidence
+
+v0.2.0 的 ticket 03 建立 `platform_0003` 迁移的 `query_run_results` 表，并在 `QueryRunQueue.publish_success()` 中把快照写入与 `succeeded` 终态放进同一个 platform 事务：先写快照再更新状态，任一步失配即整体回滚，因此不存在“已成功但无快照”的可观察中间态。迁移还加 `query_runs_require_snapshot` 触发器，把这条不变式落到数据库层——它只拦 `UPDATE` 迁移路径，不拦 `INSERT`，所以保留期清理删除快照后仍能得到 spec 要求的 `result_unavailable` 运行。行数、字节预算与读取语义分别由 ticket 04 与 05 交付。
 
 ## Revisit when
 

@@ -2,8 +2,11 @@ import logging
 import signal
 import sys
 
+from decisionharbor.executor import PostgresQueryExecutor
 from decisionharbor.worker.config import WorkerConfigurationError, WorkerSettings
+from decisionharbor.worker.execution import QueryRunProcessor
 from decisionharbor.worker.health import WorkerHealthServer
+from decisionharbor.worker.queue import QueryRunQueue
 from decisionharbor.worker.runtime import PlatformProbe, WorkerRuntime
 
 
@@ -21,7 +24,11 @@ def main() -> int:
         print(f"worker configuration error: {error}", file=sys.stderr)
         return CONFIGURATION_EXIT_CODE
 
-    runtime = WorkerRuntime(settings, PlatformProbe(settings.platform_database_url).check)
+    processor = QueryRunProcessor(
+        QueryRunQueue(settings.platform_database_url, settings.worker_id, settings.lease_ms),
+        PostgresQueryExecutor(settings.analytics_database_url, settings.max_concurrency),
+    )
+    runtime = WorkerRuntime(settings, PlatformProbe(settings.platform_database_url).check, processor)
     health_server = WorkerHealthServer(HEALTH_PORT, is_ready=lambda: runtime.ready)
     health_server.start()
     LOGGER.info(

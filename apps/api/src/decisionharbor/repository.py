@@ -111,7 +111,7 @@ class QueryRunRepository:
                     INSERT_RUN,
                     {**run.__dict__, "referenced_objects": json.dumps(run.referenced_objects)},
                 ).one()
-                created = _row_to_query_run(row)
+                created = row_to_query_run(row)
                 if idempotency is not None and not self._claim_key(connection, idempotency, run):
                     record = self._recorded_claim(connection, idempotency)
             if record is not None:
@@ -149,7 +149,7 @@ class QueryRunRepository:
         record: Row,
         idempotency: IdempotencyClaim,
     ) -> SubmitReservation:
-        run = _row_to_query_run(
+        run = row_to_query_run(
             connection.execute(SELECT_RUN, {"id": str(record.query_run_id)}).one()
         )
         transaction.rollback()
@@ -182,7 +182,7 @@ class QueryRunRepository:
             row = connection.execute(statement, parameters).one_or_none()
         if row is None:
             raise StateConflict("query run transition did not match expected state")
-        return _row_to_query_run(row)
+        return row_to_query_run(row)
 
     def get(self, run_id: str) -> QueryRun | None:
         with self._engine.connect() as connection:
@@ -190,7 +190,7 @@ class QueryRunRepository:
                 text("SELECT * FROM query_runs WHERE id = CAST(:id AS uuid)"),
                 {"id": run_id},
             ).one_or_none()
-        return _row_to_query_run(row) if row else None
+        return row_to_query_run(row) if row else None
 
     def recover_interrupted(self) -> int:
         with self._engine.begin() as connection:
@@ -209,7 +209,7 @@ class QueryRunRepository:
             )
         return result.rowcount
 
-def _row_to_query_run(row: Row) -> QueryRun:
+def row_to_query_run(row: Row) -> QueryRun:
     values = row._mapping
     return QueryRun(
         id=str(values["id"]),

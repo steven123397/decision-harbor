@@ -1,5 +1,5 @@
 ---
-status: partially-implemented
+status: implemented
 date: 2026-08-16
 ---
 
@@ -25,7 +25,7 @@ date: 2026-08-16
 
 ## Implementation and evidence
 
-v0.2.0 的 ticket 01 建立 `platform_0002` 迁移中的持久化状态模型与独立 `decisionharbor.worker` 进程，Compose 中 `worker` 服务在默认配置下就绪并报告健康；队列领取与执行由后续 ticket 交付。
+v0.2.0 的 ticket 01 建立 `platform_0002` 迁移中的持久化状态模型与独立 `decisionharbor.worker` 进程，Compose 中 `worker` 服务在默认配置下就绪并报告健康。ticket 03 交付队列领取与执行：`QueryRunQueue.claim()` 用 `FOR UPDATE SKIP LOCKED` 领取最老的 `queued` 运行并写入执行尝试所有权；`decisionharbor.worker` 是唯一使用 analytics 只读身份执行用户 SQL 的进程，API 不参与执行。`tests/worker/test_query_run_lifecycle.py` 在真实数据库与运行中 Worker 上证明领取、成功发布与失败分类。
 
 ## Revisit when
 

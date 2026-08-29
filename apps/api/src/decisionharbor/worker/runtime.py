@@ -6,6 +6,7 @@ from threading import Event
 from sqlalchemy import create_engine, text
 
 from decisionharbor.worker.config import WorkerSettings
+from decisionharbor.worker.execution import QueryRunProcessor
 
 
 LOGGER = logging.getLogger(__name__)
@@ -27,10 +28,12 @@ class WorkerRuntime:
         self,
         settings: WorkerSettings,
         platform_probe: Callable[[], None],
+        processor: QueryRunProcessor,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self._settings = settings
         self._platform_probe = platform_probe
+        self._processor = processor
         self._sleep = sleep
         self._ready = Event()
         self._stop = Event()
@@ -46,6 +49,7 @@ class WorkerRuntime:
             self._ready.clear()
             raise
         self._ready.set()
+        self._processor.process_next()
 
     def run(self) -> None:
         while not self._stop.is_set():

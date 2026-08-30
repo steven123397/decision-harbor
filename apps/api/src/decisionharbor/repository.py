@@ -4,8 +4,12 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Connection, Engine, RootTransaction, Row
 
 from decisionharbor.domain import (
+    RESULT_RETENTION,
     IdempotencyClaim,
+    QueryColumn,
+    QueryResult,
     QueryRun,
+    StoredResult,
     SubmitReservation,
 )
 
@@ -56,6 +60,27 @@ INSERT_IDEMPOTENCY = text(
 )
 
 SELECT_RUN = text("SELECT * FROM query_runs WHERE id = CAST(:id AS uuid)")
+
+# A run and its snapshot are read together so a result read never falls back to
+# the analytics database: the snapshot is either stored or it is not. Whether it
+# is still retained is decided here as well, from the `finished_at` this database
+# recorded and the clock this database keeps, so a read and the cleanup that
+# follows it can never disagree about the retention window.
+SELECT_RUN_WITH_RESULT = text(
+    """
+    SELECT run.*,
+           result.result_columns, result.result_rows, result.truncated,
+           COALESCE(
+               run.finished_at
+                   + CAST(:retention_seconds AS double precision) * INTERVAL '1 second'
+                   <= now(),
+               false
+           ) AS result_expired
+    FROM query_runs AS run
+    LEFT JOIN query_run_results AS result ON result.query_run_id = run.id
+    WHERE run.id = CAST(:id AS uuid)
+    """
+)
 
 
 TRANSITION_COLUMNS = frozenset(
@@ -192,6 +217,21 @@ class QueryRunRepository:
             ).one_or_none()
         return row_to_query_run(row) if row else None
 
+    def get_result(self, run_id: str) -> StoredResult | None:
+        """Read a query run together with the snapshot stored for it, if any."""
+        with self._engine.connect() as connection:
+            row = connection.execute(
+                SELECT_RUN_WITH_RESULT,
+                {"id": run_id, "retention_seconds": RESULT_RETENTION.total_seconds()},
+            ).one_or_none()
+        if row is None:
+            return None
+        return StoredResult(
+            run=row_to_query_run(row),
+            snapshot=snapshot_from_row(row),
+            result_expired=row._mapping["result_expired"],
+        )
+
     def recover_interrupted(self) -> int:
         with self._engine.begin() as connection:
             result = connection.execute(
@@ -208,6 +248,22 @@ class QueryRunRepository:
                 )
             )
         return result.rowcount
+
+
+def snapshot_from_row(row: Row) -> QueryResult | None:
+    """The snapshot a joined run row carries, or None when the run has none."""
+    values = row._mapping
+    columns = values["result_columns"]
+    if columns is None:
+        return None
+    return QueryResult(
+        columns=tuple(
+            QueryColumn(name=column["name"], type=column["type"]) for column in columns
+        ),
+        rows=tuple(tuple(cell) for cell in values["result_rows"]),
+        truncated=values["truncated"],
+    )
+
 
 def row_to_query_run(row: Row) -> QueryRun:
     values = row._mapping

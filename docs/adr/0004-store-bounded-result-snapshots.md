@@ -1,5 +1,5 @@
 ---
-status: partially-implemented
+status: implemented
 date: 2026-08-16
 ---
 
@@ -28,7 +28,9 @@ date: 2026-08-16
 
 v0.2.0 的 ticket 03 建立 `platform_0003` 迁移的 `query_run_results` 表，并在 `QueryRunQueue.publish_success()` 中把快照写入与 `succeeded` 终态放进同一个 platform 事务：先写快照再更新状态，任一步失配即整体回滚，因此不存在“已成功但无快照”的可观察中间态。迁移还加 `query_runs_require_snapshot` 触发器，把这条不变式落到数据库层——它只拦 `UPDATE` 迁移路径，不拦 `INSERT`，所以保留期清理删除快照后仍能得到 spec 要求的 `result_unavailable` 运行。
 
-ticket 04 交付两重边界本身。`domain.ResultSnapshotBuilder` 按 `{"columns":[...],"rows":[...]}` 的紧凑 UTF-8 JSON 计量：最多 500 行，最多 1,048,576 字节，插入行时增量累加字节，越界即停止并记录 `truncated`；列定义本身、首行或任意单行超出字节预算时抛出 `ResultTooLarge`，由 `executor` 映射为 `result_too_large` 的 `failed` 运行，不保存部分内容。`queue.publish_success()` 用同一个 `encode_json` 落库，使计量字节与存储表示一致。证据：`tests/unit/test_result_snapshot.py` 覆盖边界计算，`tests/worker/test_result_snapshot_bounds.py` 在真实 analytics 数据上覆盖 500 行边界、恰好 1 MiB 与超出 1 字节、首行与后续单行过大、多字节 UTF-8 与显式类型，`tests/integration/test_query_chain.py` 用策略允许的 1663 列宽结果证明字节预算在公开提交路径上同样生效。读取语义与保留期仍由 ticket 05 交付。
+ticket 04 交付两重边界本身。`domain.ResultSnapshotBuilder` 按 `{"columns":[...],"rows":[...]}` 的紧凑 UTF-8 JSON 计量：最多 500 行，最多 1,048,576 字节，插入行时增量累加字节，越界即停止并记录 `truncated`；列定义本身、首行或任意单行超出字节预算时抛出 `ResultTooLarge`，由 `executor` 映射为 `result_too_large` 的 `failed` 运行，不保存部分内容。`queue.publish_success()` 用同一个 `encode_json` 落库，使计量字节与存储表示一致。证据：`tests/unit/test_result_snapshot.py` 覆盖边界计算，`tests/worker/test_result_snapshot_bounds.py` 在真实 analytics 数据上覆盖 500 行边界、恰好 1 MiB 与超出 1 字节、首行与后续单行过大、多字节 UTF-8 与显式类型，`tests/integration/test_query_chain.py` 用策略允许的 1663 列宽结果证明字节预算在公开提交路径上同样生效。
+
+ticket 05 交付读取语义、保留期与幂等清理。`GET /api/v1/query-runs/{id}/result` 只回读已保存的快照，从不执行 SQL：非终态返回 409 `result_not_ready`，从未产生结果的终态返回 409 `result_unavailable`，`finished_at` 超出 24 小时的 `succeeded` 运行返回 410 `result_expired`。只有 `succeeded` 曾经有过结果，因此只有它会过期——25 小时前的 `failed` 运行仍然报告“没有结果”，不会被误报成“已过期”。保留期判据是数据库记录的 `finished_at` 加上 `domain.RESULT_RETENTION`：读写两侧都把它交给 platform 的 `now()` 计算（读取在 `SELECT_RUN_WITH_RESULT` 里顺带算出 `result_expired`，清理在 `DELETE ... USING query_runs` 里用同一表达式），因此读取与随后的清理不会就“是否仍在保留期内”给出不同答案，也不受应用进程时钟影响。清理由 Worker 承担：`platform_0004` 只给 `platform_worker` 授 `query_run_results` 的 DELETE，`platform_app` 仍只有 SELECT，所以 HTTP 层既没有执行 SQL 的身份，也没有删除结果内容的身份。`worker/retention.py` 的 `ResultRetention.delete_expired()` 是一条 `DELETE ... USING query_runs`，按保留期选择而不是按上一次清理留下的状态选择，因此重复执行、重叠调度和进程重启都收敛到同一状态；它只删快照行，`query_runs` 上的原始 SQL、策略判定、状态、时间和结果摘要全部保留。由于 `query_runs_require_snapshot` 只拦 `UPDATE` 不拦 `DELETE`，被清掉快照的 `succeeded` 运行本身继续可读，只是它的结果如实报 `result_unavailable`，超过保留期时同一运行报 `result_expired`。证据：`tests/unit/test_result_read_semantics.py` 覆盖三种语义的判定顺序，`tests/unit/test_service.py` 与 `tests/unit/test_api.py` 覆盖稳定错误码、HTTP 状态和脱敏 envelope，`tests/integration/test_result_read.py` 在公开 HTTP 上证明 200、404、409、410、23 小时仍可读、25 小时已过期与保留期内重复读取返回同一快照，`tests/worker/test_result_cleanup.py` 在真实数据库上证明重复清理、并发清理、审计事实保留，以及真实 Worker 装配在 `platform_worker` 身份下完成清理，`tests/unit/test_worker_runtime.py` 证明清理按间隔触发且失败不打断队列轮询。
 
 ## Revisit when
 

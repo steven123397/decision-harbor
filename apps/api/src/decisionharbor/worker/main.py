@@ -7,6 +7,7 @@ from decisionharbor.worker.config import WorkerConfigurationError, WorkerSetting
 from decisionharbor.worker.execution import QueryRunProcessor
 from decisionharbor.worker.health import WorkerHealthServer
 from decisionharbor.worker.queue import QueryRunQueue
+from decisionharbor.worker.retention import ResultRetention
 from decisionharbor.worker.runtime import PlatformProbe, WorkerRuntime
 
 
@@ -28,17 +29,24 @@ def main() -> int:
         QueryRunQueue(settings.platform_database_url, settings.worker_id, settings.lease_ms),
         PostgresQueryExecutor(settings.analytics_database_url, settings.max_concurrency),
     )
-    runtime = WorkerRuntime(settings, PlatformProbe(settings.platform_database_url).check, processor)
+    retention = ResultRetention(settings.platform_database_url)
+    runtime = WorkerRuntime(
+        settings,
+        PlatformProbe(settings.platform_database_url).check,
+        processor,
+        retention,
+    )
     health_server = WorkerHealthServer(HEALTH_PORT, is_ready=lambda: runtime.ready)
     health_server.start()
     LOGGER.info(
-        "worker %s started with concurrency=%d lease=%dms heartbeat=%dms poll=%dms attempts=%d",
+        "worker %s started with concurrency=%d lease=%dms heartbeat=%dms poll=%dms attempts=%d cleanup=%dms",
         settings.worker_id,
         settings.max_concurrency,
         settings.lease_ms,
         settings.heartbeat_ms,
         settings.poll_ms,
         settings.max_execution_attempts,
+        settings.cleanup_interval_ms,
     )
 
     def stop(_signum: int, _frame: object) -> None:

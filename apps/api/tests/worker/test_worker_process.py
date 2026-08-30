@@ -10,6 +10,7 @@ from decisionharbor.worker.config import WorkerSettings
 from decisionharbor.worker.execution import QueryRunProcessor
 from decisionharbor.worker.health import WorkerHealthServer
 from decisionharbor.worker.queue import QueryRunQueue
+from decisionharbor.worker.retention import ResultRetention
 from decisionharbor.worker.runtime import PlatformProbe, WorkerRuntime
 
 
@@ -21,7 +22,12 @@ def runtime(settings: WorkerSettings) -> WorkerRuntime:
         QueryRunQueue(settings.platform_database_url, settings.worker_id, settings.lease_ms),
         PostgresQueryExecutor(settings.analytics_database_url, 1),
     )
-    return WorkerRuntime(settings, PlatformProbe(settings.platform_database_url).check, processor)
+    return WorkerRuntime(
+        settings,
+        PlatformProbe(settings.platform_database_url).check,
+        processor,
+        ResultRetention(settings.platform_database_url),
+    )
 
 
 def test_worker_process_reports_health_and_readiness_in_the_runtime() -> None:

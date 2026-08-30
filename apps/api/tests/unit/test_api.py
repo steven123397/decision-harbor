@@ -7,8 +7,16 @@ from fastapi.testclient import TestClient
 
 import decisionharbor.api as api_module
 from decisionharbor.api import create_app
-from decisionharbor.domain import QueryRun
+from decisionharbor.domain import QueryColumn, QueryResult, QueryRun
 from decisionharbor.service import ServiceFailure
+
+
+KNOWN_RUN_ID = "75e24c21-416c-4bd8-a37d-68667f4ec753"
+RESULT = QueryResult(
+    columns=(QueryColumn(name="customer_count", type="bigint"),),
+    rows=(("100",),),
+    truncated=False,
+)
 
 
 def terminal_run(status: str = "queued", code: str | None = None) -> QueryRun:
@@ -43,6 +51,11 @@ class FakeService:
         if self.failure:
             raise self.failure
         return terminal_run()
+
+    def read_result(self, run_id: str) -> QueryResult:
+        if self.failure:
+            raise self.failure
+        return RESULT
 
 
 class FakeRepository:
@@ -228,9 +241,69 @@ def test_invalid_request_and_oversized_body_do_not_create_a_run() -> None:
     assert "query_run_id" not in oversized.json()["error"]
 
 
+def test_result_read_returns_the_stored_snapshot() -> None:
+    with client() as test_client:
+        response = test_client.get(f"/api/v1/query-runs/{KNOWN_RUN_ID}/result")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "data": {
+            "result": {
+                "columns": [{"name": "customer_count", "type": "bigint"}],
+                "rows": [["100"]],
+                "truncated": False,
+            }
+        },
+        "error": None,
+    }
+
+
+@pytest.mark.parametrize(
+    ("code", "status"),
+    [
+        ("result_not_ready", 409),
+        ("result_unavailable", 409),
+        ("result_expired", 410),
+        ("query_run_not_found", 404),
+    ],
+)
+def test_result_read_failures_keep_the_envelope_and_their_own_status(
+    code: str, status: int
+) -> None:
+    run = None if code == "query_run_not_found" else terminal_run("succeeded")
+    failure = ServiceFailure(code, f"The result is not readable: {code}.", run)
+
+    with client(FakeService(failure)) as test_client:
+        response = test_client.get(f"/api/v1/query-runs/{KNOWN_RUN_ID}/result")
+
+    assert response.status_code == status
+    assert response.json()["error"] == {
+        "code": code,
+        "message": f"The result is not readable: {code}.",
+        **({"query_run_id": KNOWN_RUN_ID} if run else {}),
+    }
+    if run:
+        assert response.json()["data"]["query_run"]["status"] == "succeeded"
+    else:
+        assert response.json()["data"] is None
+
+
+def test_result_read_maps_audit_store_failure_to_safe_envelope() -> None:
+    failure = ServiceFailure("audit_unavailable", "The audit store is unavailable.", None)
+
+    with client(FakeService(failure)) as test_client:
+        response = test_client.get(f"/api/v1/query-runs/{KNOWN_RUN_ID}/result")
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "data": None,
+        "error": {"code": "audit_unavailable", "message": "The audit store is unavailable."},
+    }
+
+
 def test_get_returns_audit_without_result_cells() -> None:
     with client() as test_client:
-        found = test_client.get("/api/v1/query-runs/75e24c21-416c-4bd8-a37d-68667f4ec753")
+        found = test_client.get(f"/api/v1/query-runs/{KNOWN_RUN_ID}")
         missing = test_client.get("/api/v1/query-runs/11111111-1111-4111-8111-111111111111")
 
     assert found.status_code == 200

@@ -1,15 +1,28 @@
 from typing import Protocol
 
 from decisionharbor.domain import (
+    RESULT_EXPIRED,
+    RESULT_NOT_READY,
+    RESULT_UNAVAILABLE,
     SUBMIT_IDEMPOTENCY_SCOPE,
     IdempotencyClaim,
+    QueryResult,
     QueryRun,
+    StoredResult,
     SubmitReservation,
     finished_fields,
     is_valid_idempotency_key,
+    result_read_failure,
     submit_request_fingerprint,
 )
 from decisionharbor.policy import PolicyDecision
+
+
+RESULT_READ_MESSAGES = {
+    RESULT_NOT_READY: "The query result is not ready yet.",
+    RESULT_UNAVAILABLE: "This query run has no result to read.",
+    RESULT_EXPIRED: "The query result is no longer retained.",
+}
 
 
 class Policy(Protocol):
@@ -33,6 +46,8 @@ class Repository(Protocol):
         expected_status: str,
         **changes: object,
     ) -> QueryRun: ...
+
+    def get_result(self, run_id: str) -> StoredResult | None: ...
 
 
 class ServiceFailure(Exception):
@@ -134,6 +149,32 @@ class QueryRunService:
             policy_decision="allowed",
             referenced_objects=decision.referenced_objects,
         )
+
+    def read_result(self, run_id: str) -> QueryResult:
+        """Return the stored snapshot of a run whose result is still readable.
+
+        The snapshot is only ever read back: the retained prefix is the single
+        source of the result, so a read can neither re-run the SQL nor observe
+        data from a later moment than the run it belongs to.
+        """
+        try:
+            stored = self._repository.get_result(run_id)
+        except Exception as exc:
+            raise ServiceFailure(
+                "audit_unavailable",
+                "The audit store is unavailable.",
+                None,
+            ) from exc
+        if stored is None:
+            raise ServiceFailure("query_run_not_found", "Query run was not found.", None)
+        failure = result_read_failure(
+            stored.run,
+            has_snapshot=stored.snapshot is not None,
+            expired=stored.result_expired,
+        )
+        if failure is not None:
+            raise ServiceFailure(failure, RESULT_READ_MESSAGES[failure], stored.run)
+        return stored.snapshot
 
     def _claim(self, raw_sql: str, idempotency_key: str | None) -> IdempotencyClaim | None:
         if idempotency_key is None:

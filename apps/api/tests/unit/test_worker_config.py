@@ -17,6 +17,7 @@ WORKER_ENVIRONMENT_NAMES = (
     "WORKER_HEARTBEAT_MS",
     "WORKER_POLL_MS",
     "WORKER_MAX_EXECUTION_ATTEMPTS",
+    "WORKER_CLEANUP_INTERVAL_MS",
 )
 
 
@@ -38,6 +39,7 @@ def test_default_configuration_matches_the_documented_values(
     assert settings.heartbeat_ms == 3_000
     assert settings.poll_ms == 250
     assert settings.max_execution_attempts == 3
+    assert settings.cleanup_interval_ms == 60_000
     assert settings.worker_id
     assert settings.platform_database_url == BASE_ENVIRONMENT["PLATFORM_DATABASE_URL"]
     assert settings.analytics_database_url == BASE_ENVIRONMENT["ANALYTICS_DATABASE_URL"]
@@ -57,6 +59,8 @@ def test_default_configuration_matches_the_documented_values(
         ("WORKER_POLL_MS", "0"),
         ("WORKER_MAX_EXECUTION_ATTEMPTS", "0"),
         ("WORKER_MAX_EXECUTION_ATTEMPTS", "2.5"),
+        ("WORKER_CLEANUP_INTERVAL_MS", "0"),
+        ("WORKER_CLEANUP_INTERVAL_MS", "86400001"),
     ],
 )
 def test_invalid_configuration_is_rejected_with_a_readable_reason(

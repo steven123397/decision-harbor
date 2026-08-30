@@ -37,6 +37,7 @@ class WorkerSettings:
     heartbeat_ms: int
     poll_ms: int
     max_execution_attempts: int
+    cleanup_interval_ms: int
 
     @classmethod
     def from_env(cls) -> "WorkerSettings":
@@ -49,6 +50,7 @@ class WorkerSettings:
             heartbeat_ms=_positive_int("WORKER_HEARTBEAT_MS", 3_000, 600_000),
             poll_ms=_positive_int("WORKER_POLL_MS", 250, 60_000),
             max_execution_attempts=_positive_int("WORKER_MAX_EXECUTION_ATTEMPTS", 3, 10),
+            cleanup_interval_ms=_positive_int("WORKER_CLEANUP_INTERVAL_MS", 60_000, 86_400_000),
         )
         if settings.heartbeat_ms >= settings.lease_ms:
             raise WorkerConfigurationError(

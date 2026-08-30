@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from hashlib import sha256
 import json
@@ -15,6 +15,21 @@ JsonCell: TypeAlias = None | bool | int | float | str
 # by the external contract.
 RESULT_MAX_ROWS = 500
 RESULT_MAX_BYTES = 1_048_576
+
+# A stored snapshot stays readable for this long after the run finished. The
+# window is measured from the `finished_at` the database recorded, so neither
+# the moment a client asks nor the moment the worker published it decides
+# whether a result is still being retained.
+RESULT_RETENTION = timedelta(hours=24)
+
+TERMINAL_STATUSES = frozenset({"rejected", "succeeded", "failed", "cancelled"})
+
+# The three ways a result read can fail. Each one tells the client something
+# different: keep polling, give up on this run, or accept that a result which
+# existed is no longer stored.
+RESULT_NOT_READY = "result_not_ready"
+RESULT_UNAVAILABLE = "result_unavailable"
+RESULT_EXPIRED = "result_expired"
 
 SUBMIT_IDEMPOTENCY_SCOPE = "submit"
 IDEMPOTENCY_KEY_MAX_LENGTH = 128
@@ -167,6 +182,21 @@ class QueryRun:
 
 
 @dataclass(frozen=True)
+class StoredResult:
+    """A query run together with the result snapshot stored for it, if any.
+
+    `snapshot` is None both for a run that never produced a result and for one
+    whose result the retention cleaner already removed; the run's own facts say
+    which of the two it is. `result_expired` is what the database says about the
+    retention window at the moment of this read.
+    """
+
+    run: QueryRun
+    snapshot: QueryResult | None
+    result_expired: bool
+
+
+@dataclass(frozen=True)
 class IdempotencyClaim:
     """The idempotency scope, key and input fingerprint of one request."""
 
@@ -204,6 +234,28 @@ def is_valid_idempotency_key(key: str) -> bool:
 
 def submit_request_fingerprint(raw_sql: str) -> str:
     return sha256(raw_sql.encode("utf-8")).hexdigest()
+
+
+def result_read_failure(run: QueryRun, *, has_snapshot: bool, expired: bool) -> str | None:
+    """Why a query run's result cannot be read, or None when it can.
+
+    A run that has not reached a terminal state may still produce a result, so
+    its failure is not ready rather than unavailable. Only a succeeded run ever
+    carried a result, so only its result can age out of the retention window:
+    every other terminal run reports a result that never existed, however long
+    ago it finished.
+
+    `expired` is decided where the retention window is measured, in the database
+    that also stores `finished_at`, so a read and the cleanup that follows it
+    cannot disagree about whether a result is still being retained.
+    """
+    if run.status not in TERMINAL_STATUSES:
+        return RESULT_NOT_READY
+    if run.status == "succeeded" and expired:
+        return RESULT_EXPIRED
+    if not has_snapshot:
+        return RESULT_UNAVAILABLE
+    return None
 
 
 def finished_fields(run: QueryRun) -> dict[str, datetime | int]:

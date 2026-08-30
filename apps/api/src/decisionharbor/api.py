@@ -14,7 +14,7 @@ from pydantic import BaseModel, ConfigDict
 
 from decisionharbor.config import Settings
 from decisionharbor.dataset import load_dataset
-from decisionharbor.domain import QueryRun
+from decisionharbor.domain import QueryResult, QueryRun
 from decisionharbor.policy import SqlPolicy
 from decisionharbor.readiness import AnalyticsReadinessProbe, PlatformReadinessProbe
 from decisionharbor.repository import QueryRunRepository
@@ -36,6 +36,10 @@ HTTP_STATUS_BY_CODE = {
     "unsupported_sql": 422,
     "invalid_idempotency_key": 422,
     "idempotency_conflict": 409,
+    "query_run_not_found": 404,
+    "result_not_ready": 409,
+    "result_unavailable": 409,
+    "result_expired": 410,
     "audit_unavailable": 503,
     "service_not_ready": 503,
     "policy_internal_error": 500,
@@ -51,6 +55,8 @@ class QueryRequest(BaseModel):
 
 class QueryService(Protocol):
     def submit(self, raw_sql: str, idempotency_key: str | None = None) -> QueryRun: ...
+
+    def read_result(self, run_id: str) -> QueryResult: ...
 
 
 class QueryRepository(Protocol):
@@ -72,6 +78,18 @@ def _error(code: str, message: str, query_run_id: str | None = None) -> dict[str
     if query_run_id:
         payload["query_run_id"] = query_run_id
     return payload
+
+
+def _failure_response(failure: ServiceFailure) -> JSONResponse:
+    """A service failure as a stable code, its HTTP status and the envelope."""
+    run = failure.query_run
+    return JSONResponse(
+        _envelope(
+            data={"query_run": _run_payload(run)} if run else None,
+            error=_error(failure.code, failure.message, run.id if run else None),
+        ),
+        status_code=HTTP_STATUS_BY_CODE.get(failure.code, 500),
+    )
 
 
 def create_app(
@@ -158,12 +176,7 @@ def create_app(
         try:
             run = service.submit(query.sql, idempotency_key)
         except ServiceFailure as failure:
-            run_id = failure.query_run.id if failure.query_run else None
-            data = {"query_run": _run_payload(failure.query_run)} if failure.query_run else None
-            return JSONResponse(
-                _envelope(data=data, error=_error(failure.code, failure.message, run_id)),
-                status_code=HTTP_STATUS_BY_CODE.get(failure.code, 500),
-            )
+            return _failure_response(failure)
         return JSONResponse(
             _envelope(data={"query_run": _run_payload(run)}),
             status_code=202,
@@ -174,16 +187,22 @@ def create_app(
         try:
             run = repository.get(str(run_id))
         except Exception:
-            return JSONResponse(
-                _envelope(error=_error("audit_unavailable", "The audit store is unavailable.")),
-                status_code=503,
+            return _failure_response(
+                ServiceFailure("audit_unavailable", "The audit store is unavailable.", None)
             )
         if run is None:
-            return JSONResponse(
-                _envelope(error=_error("query_run_not_found", "Query run was not found.")),
-                status_code=404,
+            return _failure_response(
+                ServiceFailure("query_run_not_found", "Query run was not found.", None)
             )
         return _envelope(data={"query_run": _run_payload(run)})
+
+    @app.get("/api/v1/query-runs/{run_id}/result", response_model=None)
+    def get_query_run_result(run_id: UUID):
+        try:
+            result = service.read_result(str(run_id))
+        except ServiceFailure as failure:
+            return _failure_response(failure)
+        return _envelope(data={"result": jsonable_encoder(asdict(result))})
 
     return app
 

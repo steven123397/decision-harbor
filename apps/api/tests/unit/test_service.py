@@ -1,17 +1,27 @@
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from decisionharbor.domain import (
     SUBMIT_IDEMPOTENCY_SCOPE,
     IdempotencyClaim,
+    QueryColumn,
+    QueryResult,
     QueryRun,
+    StoredResult,
     SubmitReservation,
     submit_request_fingerprint,
 )
 from decisionharbor.policy import PolicyDecision
 from decisionharbor.service import QueryRunService, ServiceFailure
+
+
+SNAPSHOT = QueryResult(
+    columns=(QueryColumn(name="customer_count", type="bigint"),),
+    rows=(("100",),),
+    truncated=False,
+)
 
 
 class FakePolicy:
@@ -32,10 +42,14 @@ class FakeRepository:
         *,
         fail_reserve: bool = False,
         replay: SubmitReservation | None = None,
+        stored: StoredResult | None = None,
+        fail_get_result: bool = False,
     ) -> None:
         self.events = events
         self.fail_reserve = fail_reserve
         self.replay = replay
+        self.stored = stored
+        self.fail_get_result = fail_get_result
         self.runs: dict[str, QueryRun] = {}
         self.claims: list[IdempotencyClaim | None] = []
 
@@ -67,6 +81,12 @@ class FakeRepository:
         assert run.status == expected_status
         self.runs[run_id] = replace(run, **changes)
         return self.runs[run_id]
+
+    def get_result(self, run_id: str) -> StoredResult | None:
+        self.events.append("get_result")
+        if self.fail_get_result:
+            raise RuntimeError("database DSN and secret must not escape")
+        return self.stored
 
 
 def replay_reservation(
@@ -270,3 +290,100 @@ def test_submit_without_a_key_creates_a_new_run_every_time() -> None:
 
     assert first.id != second.id
     assert events == ["reserve", "transition:queued", "reserve", "transition:queued"]
+
+
+def stored_result(status: str, *, result_expired: bool = False) -> StoredResult:
+    finished_at = datetime.now(timezone.utc) - timedelta(hours=1)
+    return StoredResult(
+        run=QueryRun(
+            id="run-stored",
+            raw_sql="SELECT count(*) AS customer_count FROM customers",
+            status=status,
+            policy_decision="allowed",
+            policy_version="policy-v1",
+            referenced_objects=("analytics.customers",),
+            statement_timeout_ms=5_000,
+            max_rows=500,
+            returned_row_count=1 if status == "succeeded" else None,
+            result_truncated=False if status == "succeeded" else None,
+            error_code=None,
+            error_summary=None,
+            created_at=finished_at - timedelta(seconds=3),
+            started_at=finished_at - timedelta(seconds=2),
+            finished_at=finished_at,
+            duration_ms=2_000,
+        ),
+        snapshot=SNAPSHOT if status == "succeeded" else None,
+        result_expired=result_expired,
+    )
+
+
+def test_reading_a_stored_result_returns_the_snapshot_without_touching_analytics() -> None:
+    events: list[str] = []
+    stored = stored_result("succeeded")
+    repository = FakeRepository(events, stored=stored)
+
+    result = build_service(repository, PolicyDecision(True, None, None, ())).read_result("run-stored")
+
+    assert result is stored.snapshot
+    assert events == ["get_result"]
+
+
+def test_reading_the_result_of_an_unknown_run_reports_it_missing() -> None:
+    events: list[str] = []
+    repository = FakeRepository(events)
+    service = build_service(repository, PolicyDecision(True, None, None, ()))
+
+    with pytest.raises(ServiceFailure) as caught:
+        service.read_result("run-missing")
+
+    assert caught.value.code == "query_run_not_found"
+    assert caught.value.query_run is None
+    assert events == ["get_result"]
+
+
+def test_a_result_read_failure_is_mapped_without_leaking_the_store() -> None:
+    repository = FakeRepository([], fail_get_result=True)
+    service = build_service(repository, PolicyDecision(True, None, None, ()))
+
+    with pytest.raises(ServiceFailure) as caught:
+        service.read_result("run-stored")
+
+    assert caught.value.code == "audit_unavailable"
+    assert caught.value.query_run is None
+    assert "DSN" not in caught.value.message
+
+
+@pytest.mark.parametrize(
+    ("status", "code"),
+    [
+        ("queued", "result_not_ready"),
+        ("running", "result_not_ready"),
+        ("rejected", "result_unavailable"),
+        ("failed", "result_unavailable"),
+        ("cancelled", "result_unavailable"),
+    ],
+)
+def test_every_unreadable_result_says_why(status: str, code: str) -> None:
+    repository = FakeRepository([], stored=stored_result(status))
+    service = build_service(repository, PolicyDecision(True, None, None, ()))
+
+    with pytest.raises(ServiceFailure) as caught:
+        service.read_result("run-stored")
+
+    assert caught.value.code == code
+    assert caught.value.query_run is not None
+    assert caught.value.query_run.status == status
+
+
+def test_a_result_the_store_reports_as_expired_is_expired() -> None:
+    # The retention window is measured by the store that keeps `finished_at`, so
+    # the service takes that verdict as it stands instead of re-checking a clock.
+    repository = FakeRepository([], stored=stored_result("succeeded", result_expired=True))
+    service = build_service(repository, PolicyDecision(True, None, None, ()))
+
+    with pytest.raises(ServiceFailure) as caught:
+        service.read_result("run-stored")
+
+    assert caught.value.code == "result_expired"
+    assert caught.value.query_run is not None

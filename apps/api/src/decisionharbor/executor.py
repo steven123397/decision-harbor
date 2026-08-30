@@ -1,6 +1,7 @@
 from collections.abc import Iterable
 from datetime import date, datetime
 from decimal import Decimal
+from threading import Lock
 from uuid import uuid4
 
 import psycopg
@@ -67,6 +68,20 @@ class PostgresQueryExecutor:
             max_overflow=0,
             pool_pre_ping=True,
         )
+        self._active_connections: set[psycopg.Connection] = set()
+        self._active_connections_lock = Lock()
+
+    def cancel(self) -> bool:
+        with self._active_connections_lock:
+            connections = tuple(self._active_connections)
+        cancellation_requested = False
+        for connection in connections:
+            try:
+                connection.cancel_safe(timeout=1.0)
+                cancellation_requested = True
+            except Exception:
+                pass
+        return cancellation_requested
 
     def execute(self, raw_sql: str, statement_timeout_ms: int, max_rows: int) -> QueryResult:
         try:
@@ -78,32 +93,38 @@ class PostgresQueryExecutor:
                         (f"{statement_timeout_ms}ms",),
                     )
                     driver_connection = connection.connection.driver_connection
-                    with driver_connection.cursor(name=f"query_{uuid4().hex}") as cursor:
-                        cursor.execute(raw_sql)
-                        description = cursor.description or ()
-                        for column in description:
-                            if column.type_code not in TYPE_NAMES:
-                                raise ExecutionFailure(
-                                    "unsupported_result_type",
-                                    "The query returned a result type that is not supported.",
-                                )
-                        columns = tuple(
-                            QueryColumn(name=column.name, type=TYPE_NAMES[column.type_code])
-                            for column in description
-                        )
+                    with self._active_connections_lock:
+                        self._active_connections.add(driver_connection)
+                    try:
+                        with driver_connection.cursor(name=f"query_{uuid4().hex}") as cursor:
+                            cursor.execute(raw_sql)
+                            description = cursor.description or ()
+                            for column in description:
+                                if column.type_code not in TYPE_NAMES:
+                                    raise ExecutionFailure(
+                                        "unsupported_result_type",
+                                        "The query returned a result type that is not supported.",
+                                    )
+                            columns = tuple(
+                                QueryColumn(name=column.name, type=TYPE_NAMES[column.type_code])
+                                for column in description
+                            )
 
-                        def serialized_rows() -> Iterable[tuple[JsonCell, ...]]:
-                            while fetched_rows := cursor.fetchmany(1):
-                                row = fetched_rows[0]
-                                yield tuple(
-                                    serialize_cell(value, description[index].type_code)
-                                    for index, value in enumerate(row)
-                                )
+                            def serialized_rows() -> Iterable[tuple[JsonCell, ...]]:
+                                while fetched_rows := cursor.fetchmany(1):
+                                    row = fetched_rows[0]
+                                    yield tuple(
+                                        serialize_cell(value, description[index].type_code)
+                                        for index, value in enumerate(row)
+                                    )
 
-                        try:
-                            return build_result_snapshot(columns, serialized_rows(), max_rows=max_rows)
-                        except ResultSnapshotTooLarge as exc:
-                            raise ExecutionFailure(exc.code, RESULT_TOO_LARGE_MESSAGE) from exc
+                            try:
+                                return build_result_snapshot(columns, serialized_rows(), max_rows=max_rows)
+                            except ResultSnapshotTooLarge as exc:
+                                raise ExecutionFailure(exc.code, RESULT_TOO_LARGE_MESSAGE) from exc
+                    finally:
+                        with self._active_connections_lock:
+                            self._active_connections.discard(driver_connection)
         except ExecutionFailure:
             raise
         except psycopg.Error as exc:

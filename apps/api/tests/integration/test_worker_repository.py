@@ -139,6 +139,32 @@ def test_postgres_executor_keeps_a_stable_prefix_and_reuses_the_connection_after
     assert reused.truncated is False
 
 
+def test_postgres_executor_can_request_cancellation_of_the_active_query() -> None:
+    settings = WorkerSettings.from_env()
+    executor = PostgresQueryExecutor(settings.analytics_database_url, 1)
+
+    assert executor.cancel() is False
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        execution = pool.submit(
+            executor.execute,
+            "SELECT pg_sleep(5) IS NULL AS slept FROM analytics.customers LIMIT 1",
+            10_000,
+            500,
+        )
+        for _ in range(100):
+            if executor.cancel():
+                break
+            sleep(0.01)
+        else:
+            pytest.fail("executor did not expose its active analytics connection")
+
+        with pytest.raises(ExecutionFailure) as caught:
+            execution.result(timeout=2)
+
+    assert caught.value.code == "query_timeout"
+    assert executor.cancel() is False
+
+
 def test_claim_records_an_attempt_and_an_unexpired_lease_cannot_be_stolen(
     ownership_database_urls,
 ) -> None:
@@ -182,23 +208,279 @@ def test_claim_records_an_attempt_and_an_unexpired_lease_cannot_be_stolen(
     assert worker_repository.release_ownership(first) is True
 
 
+def test_an_expired_running_run_is_taken_over_without_returning_to_the_queue(
+    ownership_database_urls,
+) -> None:
+    api_database_url, worker_database_url = ownership_database_urls
+    api_repository = QueryRunRepository(api_database_url)
+    worker_repository = QueryRunRepository(worker_database_url)
+    queued = queued_run(api_repository, "takeover")
+
+    first = worker_repository.claim_next(
+        "worker-a",
+        max_concurrency=4,
+        lease_ms=10,
+        max_execution_attempts=3,
+    )
+    assert first is not None
+    sleep(0.02)
+    second = worker_repository.claim_next(
+        "worker-b",
+        max_concurrency=4,
+        lease_ms=15_000,
+        max_execution_attempts=3,
+    )
+
+    assert second is not None
+    assert second.query_run.id == queued.id
+    assert second.query_run.status == "running"
+    assert second.query_run.started_at == first.query_run.started_at
+    assert second.worker_id == "worker-b"
+    assert second.generation == 2
+
+    engine = create_engine(api_database_url)
+    try:
+        with engine.connect() as connection:
+            attempts = connection.execute(
+                text(
+                    """
+                    SELECT generation, released_at IS NOT NULL, release_reason
+                    FROM query_execution_attempts
+                    WHERE query_run_id = CAST(:run_id AS uuid)
+                    ORDER BY generation
+                    """
+                ),
+                {"run_id": queued.id},
+            ).all()
+        assert attempts == [(1, True, "lease_expired"), (2, False, None)]
+    finally:
+        engine.dispose()
+
+
+def test_an_expired_run_fails_stably_when_execution_attempts_are_exhausted(
+    ownership_database_urls,
+) -> None:
+    api_database_url, worker_database_url = ownership_database_urls
+    api_repository = QueryRunRepository(api_database_url)
+    worker_repository = QueryRunRepository(worker_database_url)
+    queued = queued_run(api_repository, "attempts-exhausted")
+
+    first = worker_repository.claim_next(
+        "worker-a",
+        max_concurrency=4,
+        lease_ms=10,
+        max_execution_attempts=2,
+    )
+    assert first is not None
+    sleep(0.02)
+    second = worker_repository.claim_next(
+        "worker-b",
+        max_concurrency=4,
+        lease_ms=10,
+        max_execution_attempts=2,
+    )
+    assert second is not None
+    sleep(0.02)
+
+    assert worker_repository.claim_next(
+        "worker-c",
+        max_concurrency=4,
+        lease_ms=15_000,
+        max_execution_attempts=2,
+    ) is None
+    failed = api_repository.get(queued.id)
+    assert failed is not None
+    assert failed.status == "failed"
+    assert failed.error_code == "execution_attempts_exhausted"
+    assert failed.error_summary == "Automatic execution attempts were exhausted."
+
+    assert worker_repository.claim_next(
+        "worker-d",
+        max_concurrency=4,
+        lease_ms=15_000,
+        max_execution_attempts=2,
+    ) is None
+    assert api_repository.get(queued.id) == failed
+
+    engine = create_engine(api_database_url)
+    try:
+        with engine.connect() as connection:
+            attempts = connection.execute(
+                text(
+                    """
+                    SELECT generation, release_reason
+                    FROM query_execution_attempts
+                    WHERE query_run_id = CAST(:run_id AS uuid)
+                    ORDER BY generation
+                    """
+                ),
+                {"run_id": queued.id},
+            ).all()
+        assert attempts == [(1, "lease_expired"), (2, "attempts_exhausted")]
+    finally:
+        engine.dispose()
+
+
+def test_analytics_unavailable_releases_the_attempt_and_reuses_the_governed_run(
+    ownership_database_urls,
+) -> None:
+    api_database_url, worker_database_url = ownership_database_urls
+    api_repository = QueryRunRepository(api_database_url)
+    worker_repository = QueryRunRepository(worker_database_url)
+    queued = queued_run(api_repository, "analytics-unavailable")
+
+    first = worker_repository.claim_next(
+        "worker-a",
+        max_concurrency=4,
+        lease_ms=15_000,
+        max_execution_attempts=3,
+    )
+    assert first is not None
+    assert worker_repository.release_for_retry(first, "analytics_unavailable") is True
+
+    second = worker_repository.claim_next(
+        "worker-b",
+        max_concurrency=4,
+        lease_ms=15_000,
+        max_execution_attempts=3,
+    )
+    assert second is not None
+    assert second.query_run.id == queued.id
+    assert second.query_run.raw_sql == queued.raw_sql
+    assert second.query_run.policy_decision == queued.policy_decision
+    assert second.query_run.referenced_objects == queued.referenced_objects
+    assert second.query_run.status == "running"
+    assert second.generation == 2
+
+    engine = create_engine(api_database_url)
+    try:
+        with engine.connect() as connection:
+            attempts = connection.execute(
+                text(
+                    """
+                    SELECT generation, worker_id, release_reason
+                    FROM query_execution_attempts
+                    WHERE query_run_id = CAST(:run_id AS uuid)
+                    ORDER BY generation
+                    """
+                ),
+                {"run_id": queued.id},
+            ).all()
+        assert attempts == [
+            (1, "worker-a", "analytics_unavailable"),
+            (2, "worker-b", None),
+        ]
+    finally:
+        engine.dispose()
+
+
+def test_a_second_worker_completes_the_same_run_after_analytics_unavailable(
+    ownership_database_urls,
+) -> None:
+    class UnavailableExecutor:
+        def execute(self, raw_sql: str, statement_timeout_ms: int, max_rows: int) -> QueryResult:
+            raise ExecutionFailure(
+                "analytics_unavailable",
+                "The analytics database is unavailable.",
+            )
+
+        def cancel(self) -> bool:
+            return False
+
+    api_database_url, worker_database_url = ownership_database_urls
+    api_repository = QueryRunRepository(api_database_url)
+    queued = queued_run(api_repository, "worker-recovery")
+    settings = WorkerSettings.from_env()
+    first_worker = QueryWorker(
+        QueryRunRepository(worker_database_url),
+        UnavailableExecutor(),
+        worker_id="worker-a",
+        max_concurrency=4,
+        lease_ms=15_000,
+        heartbeat_ms=1_000,
+        max_execution_attempts=3,
+    )
+    second_worker = QueryWorker(
+        QueryRunRepository(worker_database_url),
+        PostgresQueryExecutor(settings.analytics_database_url, 1),
+        worker_id="worker-b",
+        max_concurrency=4,
+        lease_ms=15_000,
+        heartbeat_ms=1_000,
+        max_execution_attempts=3,
+    )
+
+    assert first_worker.process_one() is True
+    after_first_attempt = api_repository.get(queued.id)
+    assert after_first_attempt is not None
+    assert after_first_attempt.status == "running"
+
+    assert second_worker.process_one() is True
+    succeeded = api_repository.get(queued.id)
+    assert succeeded is not None
+    assert succeeded.status == "succeeded"
+    assert api_repository.get_result(queued.id) is not None
+
+    engine = create_engine(api_database_url)
+    try:
+        with engine.connect() as connection:
+            attempts = connection.execute(
+                text(
+                    """
+                    SELECT generation, worker_id, release_reason
+                    FROM query_execution_attempts
+                    WHERE query_run_id = CAST(:run_id AS uuid)
+                    ORDER BY generation
+                    """
+                ),
+                {"run_id": queued.id},
+            ).all()
+        assert attempts == [
+            (1, "worker-a", "analytics_unavailable"),
+            (2, "worker-b", "succeeded"),
+        ]
+    finally:
+        engine.dispose()
+
+
 def test_a_non_current_generation_cannot_publish(
     ownership_database_urls,
 ) -> None:
     api_database_url, worker_database_url = ownership_database_urls
     api_repository = QueryRunRepository(api_database_url)
     worker_repository = QueryRunRepository(worker_database_url)
-    queued_run(api_repository, "fencing")
-    current = worker_repository.claim_next("worker-a", max_concurrency=4, lease_ms=15_000)
+    queued = queued_run(api_repository, "fencing")
+    stale = worker_repository.claim_next(
+        "worker-a",
+        max_concurrency=4,
+        lease_ms=10,
+        max_execution_attempts=3,
+    )
+    assert stale is not None
+    sleep(0.02)
+    current = worker_repository.claim_next(
+        "worker-b",
+        max_concurrency=4,
+        lease_ms=15_000,
+        max_execution_attempts=3,
+    )
     assert current is not None
-    stale = replace(current, generation=current.generation - 1)
+    assert current.generation == stale.generation + 1
     result = QueryResult(
         columns=(QueryColumn(name="count", type="bigint"),),
         rows=(("100",),),
         truncated=False,
     )
     with pytest.raises(StateConflict):
+        worker_repository.publish_failure(stale, "internal_error", "Late stale failure.")
+    with pytest.raises(StateConflict):
         worker_repository.publish_success(stale, result)
+
+    unchanged = api_repository.get(queued.id)
+    assert unchanged is not None
+    assert unchanged.status == "running"
+    assert unchanged.error_code is None
+    assert api_repository.get_result(queued.id) is None
     assert worker_repository.publish_success(current, result).status == "succeeded"
 
 

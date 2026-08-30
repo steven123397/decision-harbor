@@ -4,7 +4,7 @@
 
 **Blocked by:** 03 — 协调双 Worker 的全局执行容量；04 — 原子发布精确受限的结果快照
 
-**Status:** ready-for-agent
+**Status:** claimed
 
 - [ ] 租约过期后，其他 Worker 可以为同一查询运行创建更高 generation 的执行尝试；接管期间运行保持 `running`，不回退到 `queued`。
 - [ ] 旧 generation 对状态、错误或结果的任何迟到发布均不产生效果；系统只保留一个当前可发布所有者。

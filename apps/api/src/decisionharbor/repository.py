@@ -132,13 +132,66 @@ class QueryRunRepository:
         worker_id: str,
         max_concurrency: int,
         lease_ms: int,
+        max_execution_attempts: int = 3,
     ) -> ExecutionOwnership | None:
         if not worker_id or len(worker_id) > 128:
             raise ValueError("worker_id must contain between 1 and 128 characters")
-        if max_concurrency <= 0 or lease_ms <= 0:
+        if max_concurrency <= 0 or lease_ms <= 0 or max_execution_attempts <= 0:
             raise ValueError("ownership limits must be positive")
         with self._engine.begin() as connection:
             connection.execute(text("SELECT pg_advisory_xact_lock(1146111311)"))
+            exhausted = connection.execute(
+                text(
+                    """
+                    SELECT id, current_generation
+                    FROM query_runs
+                    WHERE status = 'running'
+                      AND lease_expires_at <= now()
+                      AND current_generation >= :max_execution_attempts
+                    ORDER BY created_at, id
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT 1
+                    """
+                ),
+                {"max_execution_attempts": max_execution_attempts},
+            ).one_or_none()
+            if exhausted is not None:
+                exhausted_values = exhausted._mapping
+                connection.execute(
+                    text(
+                        """
+                        UPDATE query_execution_attempts
+                        SET released_at = now(), release_reason = 'attempts_exhausted'
+                        WHERE query_run_id = :run_id
+                          AND generation = :generation
+                          AND released_at IS NULL
+                        """
+                    ),
+                    {
+                        "run_id": exhausted_values["id"],
+                        "generation": exhausted_values["current_generation"],
+                    },
+                )
+                connection.execute(
+                    text(
+                        """
+                        UPDATE query_runs
+                        SET status = 'failed',
+                            error_code = 'execution_attempts_exhausted',
+                            error_summary = 'Automatic execution attempts were exhausted.',
+                            finished_at = now(),
+                            duration_ms = GREATEST(
+                                0,
+                                (EXTRACT(EPOCH FROM (now() - created_at)) * 1000)::integer
+                            ),
+                            owner_worker_id = NULL,
+                            heartbeat_at = NULL,
+                            lease_expires_at = NULL
+                        WHERE id = :run_id
+                        """
+                    ),
+                    {"run_id": exhausted_values["id"]},
+                )
             valid_ownerships = connection.execute(
                 text(
                     """
@@ -150,17 +203,45 @@ class QueryRunRepository:
             ).scalar_one()
             if valid_ownerships >= max_concurrency:
                 return None
+            candidate = connection.execute(
+                text(
+                    """
+                    SELECT *
+                    FROM query_runs
+                    WHERE (
+                        status = 'queued'
+                        OR (status = 'running' AND lease_expires_at <= now())
+                    )
+                      AND current_generation < :max_execution_attempts
+                    ORDER BY created_at, id
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT 1
+                    """
+                ),
+                {"max_execution_attempts": max_execution_attempts},
+            ).one_or_none()
+            if candidate is None:
+                return None
+            candidate_values = candidate._mapping
+            if candidate_values["status"] == "running":
+                connection.execute(
+                    text(
+                        """
+                        UPDATE query_execution_attempts
+                        SET released_at = now(), release_reason = 'lease_expired'
+                        WHERE query_run_id = :run_id
+                          AND generation = :generation
+                          AND released_at IS NULL
+                        """
+                    ),
+                    {
+                        "run_id": candidate_values["id"],
+                        "generation": candidate_values["current_generation"],
+                    },
+                )
             row = connection.execute(
                 text(
                     """
-                    WITH next_run AS (
-                        SELECT id
-                        FROM query_runs
-                        WHERE status = 'queued'
-                        ORDER BY created_at, id
-                        FOR UPDATE SKIP LOCKED
-                        LIMIT 1
-                    )
                     UPDATE query_runs AS run
                     SET status = 'running',
                         started_at = COALESCE(run.started_at, now()),
@@ -168,15 +249,16 @@ class QueryRunRepository:
                         owner_worker_id = :worker_id,
                         heartbeat_at = now(),
                         lease_expires_at = now() + :lease_ms * interval '1 millisecond'
-                    FROM next_run
-                    WHERE run.id = next_run.id
+                    WHERE run.id = :run_id
                     RETURNING run.*
                     """
                 ),
-                {"worker_id": worker_id, "lease_ms": lease_ms},
-            ).one_or_none()
-            if row is None:
-                return None
+                {
+                    "run_id": candidate_values["id"],
+                    "worker_id": worker_id,
+                    "lease_ms": lease_ms,
+                },
+            ).one()
             values = row._mapping
             connection.execute(
                 text(
@@ -278,6 +360,48 @@ class QueryRunRepository:
                     "id": ownership.query_run.id,
                     "generation": ownership.generation,
                     "worker_id": ownership.worker_id,
+                },
+            )
+        return True
+
+    def release_for_retry(self, ownership: ExecutionOwnership, reason: str) -> bool:
+        if reason != "analytics_unavailable":
+            raise ValueError("unsupported automatic retry reason")
+        with self._engine.begin() as connection:
+            released = connection.execute(
+                text(
+                    f"""
+                    UPDATE query_runs
+                    SET owner_worker_id = NULL,
+                        heartbeat_at = NULL,
+                        lease_expires_at = now()
+                    WHERE id = CAST(:id AS uuid)
+                      AND status = 'running'
+                      {VALID_EXECUTION_OWNERSHIP_SQL}
+                    RETURNING id
+                    """
+                ),
+                {
+                    "id": ownership.query_run.id,
+                    "generation": ownership.generation,
+                    "worker_id": ownership.worker_id,
+                },
+            ).one_or_none()
+            if released is None:
+                return False
+            connection.execute(
+                text(
+                    f"""
+                    UPDATE query_execution_attempts
+                    SET released_at = now(), release_reason = :reason
+                    {CURRENT_EXECUTION_ATTEMPT_SQL}
+                    """
+                ),
+                {
+                    "id": ownership.query_run.id,
+                    "generation": ownership.generation,
+                    "worker_id": ownership.worker_id,
+                    "reason": reason,
                 },
             )
         return True

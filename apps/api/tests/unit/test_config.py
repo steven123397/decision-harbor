@@ -21,6 +21,7 @@ def test_worker_settings_use_the_ownership_defaults(monkeypatch: pytest.MonkeyPa
     assert settings.lease_ms == 15_000
     assert settings.heartbeat_ms == 3_000
     assert settings.poll_ms == 250
+    assert settings.max_execution_attempts == 3
 
 
 @pytest.mark.parametrize(
@@ -30,7 +31,9 @@ def test_worker_settings_use_the_ownership_defaults(monkeypatch: pytest.MonkeyPa
         ("WORKER_LEASE_MS", "0"),
         ("WORKER_HEARTBEAT_MS", "0"),
         ("WORKER_POLL_MS", "0"),
+        ("WORKER_MAX_EXECUTION_ATTEMPTS", "0"),
         ("WORKER_LEASE_MS", "not-an-integer"),
+        ("WORKER_MAX_EXECUTION_ATTEMPTS", "not-an-integer"),
     ],
 )
 def test_worker_settings_reject_non_positive_or_non_integer_values(

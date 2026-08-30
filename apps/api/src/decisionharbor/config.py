@@ -41,6 +41,7 @@ class WorkerSettings:
     lease_ms: int
     heartbeat_ms: int
     poll_ms: int
+    max_execution_attempts: int
 
     @classmethod
     def from_env(cls) -> "WorkerSettings":
@@ -55,4 +56,5 @@ class WorkerSettings:
             lease_ms=lease_ms,
             heartbeat_ms=heartbeat_ms,
             poll_ms=_bounded_int("WORKER_POLL_MS", 250, 1, 60_000),
+            max_execution_attempts=_bounded_int("WORKER_MAX_EXECUTION_ATTEMPTS", 3, 1, 16),
         )

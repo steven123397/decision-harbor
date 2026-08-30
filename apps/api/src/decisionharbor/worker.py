@@ -16,6 +16,7 @@ class WorkerRepository(Protocol):
         worker_id: str,
         max_concurrency: int,
         lease_ms: int,
+        max_execution_attempts: int,
     ) -> ExecutionOwnership | None: ...
 
     def renew_lease(
@@ -25,6 +26,8 @@ class WorkerRepository(Protocol):
     ) -> ExecutionOwnership | None: ...
 
     def release_ownership(self, ownership: ExecutionOwnership) -> bool: ...
+
+    def release_for_retry(self, ownership: ExecutionOwnership, reason: str) -> bool: ...
 
     def publish_success(self, ownership: ExecutionOwnership, result: QueryResult) -> QueryRun: ...
 
@@ -38,6 +41,8 @@ class WorkerRepository(Protocol):
 
 class Executor(Protocol):
     def execute(self, raw_sql: str, statement_timeout_ms: int, max_rows: int) -> QueryResult: ...
+
+    def cancel(self) -> bool: ...
 
 
 class WorkerStopping(BaseException):
@@ -53,6 +58,7 @@ class QueryWorker:
         max_concurrency: int,
         lease_ms: int,
         heartbeat_ms: int,
+        max_execution_attempts: int = 3,
     ) -> None:
         self._repository = repository
         self._executor = executor
@@ -60,6 +66,7 @@ class QueryWorker:
         self._max_concurrency = max_concurrency
         self._lease_ms = lease_ms
         self._heartbeat_seconds = heartbeat_ms / 1_000
+        self._max_execution_attempts = max_execution_attempts
 
     def process_one(self) -> bool:
         ownership: ExecutionOwnership | None = None
@@ -68,6 +75,7 @@ class QueryWorker:
                 self._worker_id,
                 self._max_concurrency,
                 self._lease_ms,
+                self._max_execution_attempts,
             )
             if ownership is None:
                 return False
@@ -83,8 +91,16 @@ class QueryWorker:
 
         def maintain_ownership() -> None:
             while not stop_heartbeat.wait(self._heartbeat_seconds):
-                if self._repository.renew_lease(ownership, self._lease_ms) is None:
+                try:
+                    renewed = self._repository.renew_lease(ownership, self._lease_ms)
+                except Exception:
+                    renewed = None
+                if renewed is None:
                     ownership_lost.set()
+                    try:
+                        self._executor.cancel()
+                    except Exception:
+                        pass
                     return
 
         heartbeat = Thread(target=maintain_ownership, name="worker-heartbeat", daemon=True)
@@ -109,11 +125,17 @@ class QueryWorker:
             return True
         try:
             if failure is not None:
-                self._repository.publish_failure(
-                    ownership,
-                    failure.code,
-                    failure.message,
-                )
+                if (
+                    failure.code == "analytics_unavailable"
+                    and ownership.generation < self._max_execution_attempts
+                ):
+                    self._repository.release_for_retry(ownership, failure.code)
+                else:
+                    self._repository.publish_failure(
+                        ownership,
+                        failure.code,
+                        failure.message,
+                    )
             elif result is not None:
                 self._repository.publish_success(ownership, result)
         except StateConflict:
@@ -138,6 +160,7 @@ def main() -> None:
         max_concurrency=settings.max_concurrency,
         lease_ms=settings.lease_ms,
         heartbeat_ms=settings.heartbeat_ms,
+        max_execution_attempts=settings.max_execution_attempts,
     )
     poll_seconds = settings.poll_ms / 1_000
     try:

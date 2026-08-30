@@ -66,6 +66,7 @@ const knownErrorMessages = {
   unsupported_result_type: 'The query returned a result type that is not supported.',
   query_run_not_found: 'The query run was not found.',
   execution_interrupted: 'The query execution was interrupted before completion.',
+  execution_attempts_exhausted: 'Automatic execution attempts were exhausted.',
   result_not_ready: 'The query result is not ready yet.',
   result_unavailable: 'This query run has no readable result.',
 } as const

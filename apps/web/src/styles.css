@@ -69,15 +69,22 @@ tbody tr:last-child td { border-bottom: 0; }
 tbody tr:hover { background: #fafbf8; }
 .null-value { color: #8a918d; font: italic 11px ui-monospace, SFMono-Regular, Menlo, monospace; }
 
-.error-state { border-left: 3px solid; padding: 16px 18px; background: #fff; }
+.run-state .reconnecting-notice { margin-top: 4px; color: #8a6d1f; font-size: 12px; font-weight: 650; }
+.cancelled-state { min-height: 100px; color: #5c6470; }
+
+.error-state, .notice-state { padding: 16px 18px; border-left: 3px solid; background: #fff; }
 .error-rejected { border-color: #b56c22; }
 .error-failed { border-color: #b34b35; }
-.error-heading { display: flex; align-items: flex-start; gap: 10px; }
+.notice-state { border-color: #4b6b8a; }
+.error-heading, .notice-heading { display: flex; align-items: flex-start; gap: 10px; }
 .error-rejected .error-heading { color: #9a581c; }
 .error-failed .error-heading { color: #a43e2b; }
-.error-heading div { display: grid; gap: 5px; }
-.error-heading code { color: #626a65; font-size: 11px; }
-.error-state p { margin: 12px 0 18px 32px; color: #555e58; font-size: 14px; }
+.notice-heading { color: #37536e; }
+.error-heading div, .notice-heading div { display: grid; gap: 5px; }
+.error-heading code, .notice-heading code { color: #626a65; font-size: 11px; }
+.error-state p, .notice-state p { margin: 12px 0 0 32px; color: #555e58; font-size: 14px; }
+.notice-state .audit-facts { margin-top: 18px; }
+.error-next, .notice-next { font-weight: 650; }
 .spin { animation: spin 0.85s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .spin { animation: none; } }

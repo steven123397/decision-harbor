@@ -11,6 +11,76 @@ test('queues an allowed query and shows its run identity', async ({ page }) => {
 })
 
 
+test('polls a queued run and shows its result table', async ({ page }) => {
+  await page.goto('/')
+  await expect(page.getByText('Ready')).toBeVisible()
+  await page.getByRole('button', { name: 'Run query' }).click()
+
+  await expect(page.getByText('Query succeeded')).toBeVisible({ timeout: 20000 })
+  await expect(page.getByRole('table')).toBeVisible()
+  await expect(page.getByRole('row').nth(1)).toContainText('East')
+  await expect(page.getByText(/rows$/)).toBeVisible()
+  await expect(page.getByText(/ms$/)).toBeVisible()
+  await expect(page).toHaveURL(/run=[0-9a-f]{8}-[0-9a-f-]{27}/)
+})
+
+
+test('restores the same run, its SQL and its result after a reload', async ({ page }) => {
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Run query' }).click()
+  await expect(page.getByText('Query succeeded')).toBeVisible({ timeout: 20000 })
+  const runId = new URL(page.url()).searchParams.get('run')
+
+  await page.reload()
+
+  await expect(page.getByText('Query succeeded')).toBeVisible({ timeout: 20000 })
+  await expect(page.getByRole('table')).toBeVisible()
+  await expect(page.getByLabel('SQL query')).toHaveValue(/revenue/)
+  expect(new URL(page.url()).searchParams.get('run')).toBe(runId)
+})
+
+
+test('explains a result that is no longer retained', async ({ page }) => {
+  await page.route('**/api/v1/query-runs/*/result', (route) =>
+    route.fulfill({
+      status: 410,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        data: null,
+        error: { code: 'result_expired', message: 'The query result is no longer retained.' },
+      }),
+    }),
+  )
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Run query' }).click()
+
+  await expect(page.getByText('Result no longer retained')).toBeVisible({ timeout: 20000 })
+  await expect(page.getByText('result_expired')).toBeVisible()
+  await expect(page.getByText(/Run the query again/)).toBeVisible()
+  await expect(page.getByRole('table')).toHaveCount(0)
+})
+
+
+test('explains a run that has no result to read', async ({ page }) => {
+  await page.route('**/api/v1/query-runs/*/result', (route) =>
+    route.fulfill({
+      status: 409,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        data: null,
+        error: { code: 'result_unavailable', message: 'This query run has no result to read.' },
+      }),
+    }),
+  )
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Run query' }).click()
+
+  await expect(page.getByText('No result to read')).toBeVisible({ timeout: 20000 })
+  await expect(page.getByText('result_unavailable')).toBeVisible()
+  await expect(page.getByRole('table')).toHaveCount(0)
+})
+
+
 test('separates policy rejection from accepted submissions', async ({ page }) => {
   await page.goto('/')
   const editor = page.getByLabel('SQL query')

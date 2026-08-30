@@ -1,8 +1,12 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
 import {
   AlertTriangle,
   CheckCircle2,
+  CircleSlash,
+  Clock,
   Database,
+  FileQuestion,
+  FileWarning,
   LoaderCircle,
   Play,
   RefreshCw,
@@ -10,10 +14,18 @@ import {
   XCircle,
 } from 'lucide-react'
 
-import { httpApi, type ApiClient, type QueryResponse, type QueryRun } from './api'
+import { TRANSPORT_ERROR, httpApi, type ApiClient, type QueryResult, type QueryRun, type RunResponse } from './api'
+import {
+  readTrackedRunId,
+  rememberTrackedRunId,
+  trackedRun,
+  useTrackedRun,
+  type ResultProblem,
+  type TrackedRun,
+} from './runTracking'
 import './styles.css'
 
-export type { ApiClient, QueryResponse } from './api'
+export type { ApiClient, RunResponse } from './api'
 
 const DEFAULT_SQL = `SELECT
   c.region,
@@ -46,18 +58,26 @@ const ERROR_MESSAGES: Record<string, string> = {
   unsupported_result_type: 'The query returned a result type that is not supported.',
   query_run_not_found: 'The query run was not found.',
   execution_interrupted: 'The query execution was interrupted before completion.',
+  [TRANSPORT_ERROR]: 'The service could not be reached.',
 }
 
-type ViewState =
-  | { kind: 'idle' }
-  | { kind: 'submitting' }
-  | { kind: 'queued'; run: QueryRun }
-  | { kind: 'complete'; response: QueryResponse }
+const PENDING_COPY: Partial<Record<QueryRun['status'], { title: string; detail: string }>> = {
+  queued: { title: 'Queued', detail: 'A worker will run this query shortly.' },
+  running: { title: 'Running', detail: 'The query worker is executing this run.' },
+  cancelling: { title: 'Cancelling', detail: 'The query worker is stopping this run.' },
+}
+
+type Phase = 'idle' | 'submitting' | 'submit-failed' | 'tracking'
 
 export function App({ api = httpApi }: { api?: ApiClient }) {
   const [sql, setSql] = useState(DEFAULT_SQL)
   const [readiness, setReadiness] = useState<'checking' | 'ready' | 'unavailable'>('checking')
-  const [view, setView] = useState<ViewState>({ kind: 'idle' })
+  const [phase, setPhase] = useState<Phase>('idle')
+  const [submitFailure, setSubmitFailure] = useState<RunResponse | null>(null)
+  const { state: tracked, track } = useTrackedRun(api)
+  // Only a page that opened on a run identifier may overwrite the editor with
+  // the SQL of the run it restores.
+  const mayRestoreSql = useRef(readTrackedRunId() !== null)
 
   useEffect(() => {
     let active = true
@@ -69,20 +89,42 @@ export function App({ api = httpApi }: { api?: ApiClient }) {
     }
   }, [api])
 
+  useEffect(() => {
+    const restored = readTrackedRunId()
+    if (restored === null) return
+    setPhase('tracking')
+    track(restored)
+  }, [track])
+
+  useEffect(() => {
+    if (!mayRestoreSql.current) return
+    const run = trackedRun(tracked)
+    if (run === null) return
+    mayRestoreSql.current = false
+    if (run.raw_sql.trim()) setSql(run.raw_sql)
+  }, [tracked])
+
+  const submitting = phase === 'submitting'
+
   const runQuery = async () => {
-    if (!sql.trim() || view.kind === 'submitting' || readiness !== 'ready') return
-    setView({ kind: 'submitting' })
+    if (!sql.trim() || submitting || readiness !== 'ready') return
+    setPhase('submitting')
     const response = await api.runQuery(sql)
-    if (response.error?.code === 'service_not_ready') setReadiness('unavailable')
-    const run = response.data?.query_run
-    if (!response.error && run && (run.status === 'queued' || run.status === 'received')) {
-      setView({ kind: 'queued', run })
+    const run = response.data?.query_run ?? null
+    if (response.error?.code === 'service_not_ready' || response.error?.code === TRANSPORT_ERROR) {
+      setReadiness('unavailable')
+    }
+    if (run !== null) {
+      rememberTrackedRunId(run.id)
+      setPhase('tracking')
+      track(run.id, run)
+      mayRestoreSql.current = false
       return
     }
-    setView({ kind: 'complete', response })
+    setSubmitFailure(response)
+    setPhase('submit-failed')
   }
 
-  const submitting = view.kind === 'submitting'
   const checkReadiness = async () => {
     setReadiness('checking')
     setReadiness((await api.checkReady()) ? 'ready' : 'unavailable')
@@ -146,10 +188,10 @@ export function App({ api = httpApi }: { api?: ApiClient }) {
         </section>
 
         <section className="output" aria-live="polite">
-          {view.kind === 'idle' && <IdleState />}
-          {view.kind === 'submitting' && <SubmittingState />}
-          {view.kind === 'queued' && <QueuedState run={view.run} />}
-          {view.kind === 'complete' && <CompletedState response={view.response} />}
+          {phase === 'idle' && <IdleState />}
+          {phase === 'submitting' && <SubmittingState />}
+          {phase === 'submit-failed' && submitFailure && <SubmitFailureState response={submitFailure} />}
+          {phase === 'tracking' && <TrackedState state={tracked} />}
         </section>
       </main>
     </div>
@@ -174,78 +216,269 @@ function SubmittingState() {
   )
 }
 
-function QueuedState({ run }: { run: QueryRun }) {
+function SubmitFailureState({ response }: { response: RunResponse }) {
+  const code = response.error?.code ?? 'internal_error'
+  return (
+    <ErrorState
+      kind="failed"
+      title="Query not started"
+      code={code}
+      message={ERROR_MESSAGES[code] ?? ERROR_MESSAGES.internal_error}
+      nextStep="No query run was created. Check the query and the service, then run it again."
+    />
+  )
+}
+
+function TrackedState({ state }: { state: TrackedRun }) {
+  switch (state.kind) {
+    case 'idle':
+      return <SubmittingState />
+    case 'restoring':
+      return <RestoringState runId={state.runId} reconnecting={state.reconnecting} />
+    case 'pending':
+      return <PendingState run={state.run} reconnecting={state.reconnecting} />
+    case 'success':
+      return <SuccessState run={state.run} result={state.result} problem={state.problem} />
+    case 'terminal':
+      return <TerminalState run={state.run} />
+    case 'missing':
+      return <MissingState runId={state.runId} />
+  }
+}
+
+function RestoringState({ runId, reconnecting }: { runId: string; reconnecting: boolean }) {
   return (
     <div className="run-state running-state">
       <LoaderCircle className="spin" size={21} />
-      <div><strong>Queued</strong><span>A worker will run this query shortly.</span></div>
+      <div>
+        <strong>Restoring run</strong>
+        <span>Reading the query run this page address points at.</span>
+        {reconnecting && <ReconnectingNotice />}
+      </div>
+      <RunIdFact runId={runId} />
+    </div>
+  )
+}
+
+function PendingState({ run, reconnecting }: { run: QueryRun; reconnecting: boolean }) {
+  const copy = PENDING_COPY[run.status] ?? PENDING_COPY.queued!
+  return (
+    <div className="run-state running-state">
+      <LoaderCircle className="spin" size={21} />
+      <div>
+        <strong>{copy.title}</strong>
+        <span>{copy.detail}</span>
+        <span>The result is not ready yet — this page keeps polling.</span>
+        {reconnecting && <ReconnectingNotice />}
+      </div>
       <AuditFacts run={run} />
     </div>
   )
 }
 
-function CompletedState({ response }: { response: QueryResponse }) {
-  const run = response.data?.query_run
-  if (run?.status === 'succeeded' && response.data?.result) {
-    return <SuccessState run={run} result={response.data.result} />
-  }
-  if (run?.status === 'rejected') {
+function SuccessState({
+  run,
+  result,
+  problem,
+}: {
+  run: QueryRun
+  result: QueryResult | null
+  problem: ResultProblem | null
+}) {
+  return (
+    <>
+      <div className="result-summary">
+        <div className="run-state success-state">
+          <CheckCircle2 size={21} />
+          <div>
+            <strong>Query succeeded</strong>
+            {result === null && problem === null && <span>Reading the result snapshot…</span>}
+          </div>
+        </div>
+        <AuditFacts run={run} />
+      </div>
+      {problem !== null && <ResultProblemState problem={problem} />}
+      {result !== null && (
+        <>
+          {result.truncated && (
+            <div className="truncated-notice">
+              <AlertTriangle size={17} />
+              <strong>Result truncated</strong>
+              <span>Only the configured row limit is shown.</span>
+            </div>
+          )}
+          <div className="table-frame">
+            <table>
+              <thead>
+                <tr>
+                  {result.columns.map((column, index) => (
+                    <th key={`${column.name}-${index}`}><span>{column.name}</span><small>{column.type}</small></th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {result.rows.map((row, rowIndex) => (
+                  <tr key={rowIndex}>
+                    {row.map((cell, columnIndex) => (
+                      <td key={columnIndex}>
+                        {cell === null ? <span className="null-value">NULL</span> : String(cell)}
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
+    </>
+  )
+}
+
+function TerminalState({ run }: { run: QueryRun }) {
+  if (run.status === 'rejected') {
     return (
       <ErrorState
         kind="rejected"
         title="Query rejected"
-        code={response.error?.code ?? run.error_code ?? 'unsupported_sql'}
-        message={safeMessage(response)}
+        code={run.error_code ?? 'unsupported_sql'}
+        message={ERROR_MESSAGES[run.error_code ?? ''] ?? ERROR_MESSAGES.unsupported_sql}
+        nextStep="Edit the SQL so it passes the query policy, then run it again."
+        run={run}
+      />
+    )
+  }
+  if (run.status === 'failed') {
+    return (
+      <ErrorState
+        kind="failed"
+        title="Execution failed"
+        code={run.error_code ?? 'internal_error'}
+        message={ERROR_MESSAGES[run.error_code ?? ''] ?? ERROR_MESSAGES.internal_error}
+        nextStep="This query passed the policy check but did not finish. Run it again or adjust the SQL."
         run={run}
       />
     )
   }
   return (
-    <ErrorState
-      kind="failed"
-      title="Execution failed"
-      code={response.error?.code ?? run?.error_code ?? 'internal_error'}
-      message={safeMessage(response)}
-      run={run}
-    />
+    <div className="run-state cancelled-state">
+      <CircleSlash size={21} />
+      <div>
+        <strong>Query cancelled</strong>
+        <span>This run was cancelled before it published a result.</span>
+      </div>
+      <AuditFacts run={run} />
+    </div>
   )
 }
 
-function SuccessState({ run, result }: { run: QueryRun; result: NonNullable<QueryResponse['data']>['result'] }) {
-  if (!result) return null
+const RESULT_PROBLEM_COPY: Record<ResultProblem, { title: string; explanation: string }> = {
+  result_expired: {
+    title: 'Result no longer retained',
+    explanation: 'This query succeeded, but its result snapshot is older than the 24 hour retention window.',
+  },
+  result_unavailable: {
+    title: 'No result to read',
+    explanation: 'This query succeeded, but no result snapshot is stored for it any more.',
+  },
+}
+
+function ResultProblemState({ problem }: { problem: ResultProblem }) {
+  const { title, explanation } = RESULT_PROBLEM_COPY[problem]
   return (
-    <>
-      <div className="result-summary">
-        <div className="run-state success-state"><CheckCircle2 size={21} /><strong>Query succeeded</strong></div>
-        <AuditFacts run={run} />
-      </div>
-      {result.truncated && (
-        <div className="truncated-notice"><AlertTriangle size={17} /><strong>Result truncated</strong><span>Only the configured row limit is shown.</span></div>
-      )}
-      <div className="table-frame">
-        <table>
-          <thead>
-            <tr>{result.columns.map((column, index) => <th key={`${column.name}-${index}`}><span>{column.name}</span><small>{column.type}</small></th>)}</tr>
-          </thead>
-          <tbody>
-            {result.rows.map((row, rowIndex) => (
-              <tr key={rowIndex}>{row.map((cell, columnIndex) => <td key={columnIndex}>{cell === null ? <span className="null-value">NULL</span> : String(cell)}</td>)}</tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-    </>
+    <NoticeState
+      className={`notice-state notice-${problem}`}
+      icon={problem === 'result_expired' ? Clock : FileWarning}
+      title={title}
+      code={problem}
+    >
+      <p>{explanation}</p>
+      <p className="notice-next">Run the query again to create a fresh result snapshot.</p>
+    </NoticeState>
   )
 }
 
-function ErrorState({ kind, title, code, message, run }: { kind: 'rejected' | 'failed'; title: string; code: string; message: string; run?: QueryRun }) {
+function MissingState({ runId }: { runId: string }) {
+  return (
+    <NoticeState
+      className="notice-state notice-missing"
+      icon={FileQuestion}
+      title="Query run not available"
+      code="query_run_not_found"
+    >
+      <p>This query run does not exist in the audit store.</p>
+      <p className="notice-next">Run the query again to create a new query run.</p>
+      <RunIdFact runId={runId} />
+    </NoticeState>
+  )
+}
+
+/**
+ * The panel for an outcome that is a fact about the run rather than a failure
+ * of it: the run is known, and what is missing or gone is its result.
+ */
+function NoticeState({
+  className,
+  icon: Icon,
+  title,
+  code,
+  children,
+}: {
+  className: string
+  icon: typeof Clock
+  title: string
+  code: string
+  children: ReactNode
+}) {
+  return (
+    <div className={className}>
+      <div className="notice-heading">
+        <Icon size={22} />
+        <div><strong>{title}</strong><code>{code}</code></div>
+      </div>
+      {children}
+    </div>
+  )
+}
+
+function ErrorState({
+  kind,
+  title,
+  code,
+  message,
+  nextStep,
+  run,
+}: {
+  kind: 'rejected' | 'failed'
+  title: string
+  code: string
+  message: string
+  nextStep: string
+  run?: QueryRun
+}) {
   const Icon = kind === 'rejected' ? AlertTriangle : XCircle
   return (
     <div className={`error-state error-${kind}`}>
-      <div className="error-heading"><Icon size={22} /><div><strong>{title}</strong><code>{code}</code></div></div>
+      <div className="error-heading">
+        <Icon size={22} />
+        <div><strong>{title}</strong><code>{code}</code></div>
+      </div>
       <p>{message}</p>
+      <p className="error-next">{nextStep}</p>
       {run && <AuditFacts run={run} />}
     </div>
+  )
+}
+
+function ReconnectingNotice() {
+  return <span className="reconnecting-notice">Reconnecting</span>
+}
+
+function RunIdFact({ runId }: { runId: string }) {
+  return (
+    <dl className="audit-facts">
+      <div><dt>Run ID</dt><dd>{runId}</dd></div>
+    </dl>
   )
 }
 
@@ -257,9 +490,4 @@ function AuditFacts({ run }: { run: QueryRun }) {
       {run.duration_ms !== null && <div><dt>Duration</dt><dd>{run.duration_ms} ms</dd></div>}
     </dl>
   )
-}
-
-function safeMessage(response: QueryResponse): string {
-  const code = response.error?.code ?? response.data?.query_run.error_code
-  return (code && ERROR_MESSAGES[code]) ?? 'The query could not be completed.'
 }

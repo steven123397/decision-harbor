@@ -6,7 +6,7 @@ from uuid import uuid4
 
 from decisionharbor.config import WorkerSettings
 from decisionharbor.domain import ExecutionOwnership, QueryResult, QueryRun
-from decisionharbor.executor import ExecutionFailure, PostgresQueryExecutor
+from decisionharbor.executor import ExecutionCancellation, ExecutionFailure, PostgresQueryExecutor
 from decisionharbor.repository import QueryRunRepository, StateConflict
 
 
@@ -27,7 +27,7 @@ class WorkerRepository(Protocol):
 
     def release_ownership(self, ownership: ExecutionOwnership) -> bool: ...
 
-    def release_for_retry(self, ownership: ExecutionOwnership, reason: str) -> bool: ...
+    def release_for_next_attempt(self, ownership: ExecutionOwnership) -> bool: ...
 
     def publish_success(self, ownership: ExecutionOwnership, result: QueryResult) -> QueryRun: ...
 
@@ -40,7 +40,13 @@ class WorkerRepository(Protocol):
 
 
 class Executor(Protocol):
-    def execute(self, raw_sql: str, statement_timeout_ms: int, max_rows: int) -> QueryResult: ...
+    def execute(
+        self,
+        raw_sql: str,
+        statement_timeout_ms: int,
+        max_rows: int,
+        cancellation: ExecutionCancellation,
+    ) -> QueryResult: ...
 
     def cancel(self) -> bool: ...
 
@@ -88,6 +94,7 @@ class QueryWorker:
     def _process_owned(self, ownership: ExecutionOwnership) -> bool:
         stop_heartbeat = Event()
         ownership_lost = Event()
+        cancellation = ExecutionCancellation()
 
         def maintain_ownership() -> None:
             while not stop_heartbeat.wait(self._heartbeat_seconds):
@@ -97,6 +104,7 @@ class QueryWorker:
                     renewed = None
                 if renewed is None:
                     ownership_lost.set()
+                    cancellation.request()
                     try:
                         self._executor.cancel()
                     except Exception:
@@ -112,6 +120,7 @@ class QueryWorker:
                 ownership.query_run.raw_sql,
                 ownership.query_run.statement_timeout_ms,
                 ownership.query_run.max_rows,
+                cancellation,
             )
         except ExecutionFailure as exc:
             failure = exc
@@ -129,7 +138,7 @@ class QueryWorker:
                     failure.code == "analytics_unavailable"
                     and ownership.generation < self._max_execution_attempts
                 ):
-                    self._repository.release_for_retry(ownership, failure.code)
+                    self._repository.release_for_next_attempt(ownership)
                 else:
                     self._repository.publish_failure(
                         ownership,

@@ -34,7 +34,7 @@ class FakeRepository:
         self.result: QueryResult | None = None
         self.renewals = 0
         self.released = False
-        self.retry_release_reason: str | None = None
+        self.next_attempt_release_reason: str | None = None
 
     def claim_next(
         self,
@@ -77,9 +77,9 @@ class FakeRepository:
         self.released = True
         return True
 
-    def release_for_retry(self, ownership: ExecutionOwnership, reason: str) -> bool:
+    def release_for_next_attempt(self, ownership: ExecutionOwnership) -> bool:
         assert ownership.query_run.id == self.run.id
-        self.retry_release_reason = reason
+        self.next_attempt_release_reason = "analytics_unavailable"
         self.run = replace(self.run, status="running")
         return True
 
@@ -141,7 +141,7 @@ class RenewalFailureRepository(FakeRepository):
 
 
 class FakeExecutor:
-    def execute(self, raw_sql: str, statement_timeout_ms: int, max_rows: int) -> QueryResult:
+    def execute(self, raw_sql: str, statement_timeout_ms: int, max_rows: int, cancellation=None) -> QueryResult:
         assert raw_sql == "SELECT count(*) FROM customers"
         assert statement_timeout_ms == 3_000
         assert max_rows == 25
@@ -153,12 +153,12 @@ class FakeExecutor:
 
 
 class UnexpectedFailureExecutor:
-    def execute(self, raw_sql: str, statement_timeout_ms: int, max_rows: int) -> QueryResult:
+    def execute(self, raw_sql: str, statement_timeout_ms: int, max_rows: int, cancellation=None) -> QueryResult:
         raise RuntimeError("postgresql://secret@database/raw-internal-detail")
 
 
 class AnalyticsUnavailableExecutor:
-    def execute(self, raw_sql: str, statement_timeout_ms: int, max_rows: int) -> QueryResult:
+    def execute(self, raw_sql: str, statement_timeout_ms: int, max_rows: int, cancellation=None) -> QueryResult:
         raise ExecutionFailure("analytics_unavailable", "The analytics database is unavailable.")
 
 
@@ -166,31 +166,52 @@ class KnownFailureExecutor:
     def __init__(self, code: str) -> None:
         self._code = code
 
-    def execute(self, raw_sql: str, statement_timeout_ms: int, max_rows: int) -> QueryResult:
+    def execute(self, raw_sql: str, statement_timeout_ms: int, max_rows: int, cancellation=None) -> QueryResult:
         raise ExecutionFailure(self._code, f"Stable {self._code} summary.")
 
 
 class SlowExecutor(FakeExecutor):
-    def execute(self, raw_sql: str, statement_timeout_ms: int, max_rows: int) -> QueryResult:
+    def execute(self, raw_sql: str, statement_timeout_ms: int, max_rows: int, cancellation=None) -> QueryResult:
         sleep(0.03)
-        return super().execute(raw_sql, statement_timeout_ms, max_rows)
+        return super().execute(raw_sql, statement_timeout_ms, max_rows, cancellation)
 
 
 class CancelableSlowExecutor(FakeExecutor):
     def __init__(self) -> None:
         self.cancel_requested = Event()
 
-    def execute(self, raw_sql: str, statement_timeout_ms: int, max_rows: int) -> QueryResult:
+    def execute(self, raw_sql: str, statement_timeout_ms: int, max_rows: int, cancellation=None) -> QueryResult:
         self.cancel_requested.wait(0.05)
-        return super().execute(raw_sql, statement_timeout_ms, max_rows)
+        return super().execute(raw_sql, statement_timeout_ms, max_rows, cancellation)
 
     def cancel(self) -> bool:
         self.cancel_requested.set()
         return True
 
 
+class RegistrationDelayedExecutor(FakeExecutor):
+    def __init__(self) -> None:
+        self.cancel_requested_before_sql = False
+
+    def execute(
+        self,
+        raw_sql: str,
+        statement_timeout_ms: int,
+        max_rows: int,
+        cancellation,
+    ) -> QueryResult:
+        sleep(0.03)
+        self.cancel_requested_before_sql = cancellation.is_requested()
+        if self.cancel_requested_before_sql:
+            raise ExecutionFailure("internal_error", "Execution was cancelled before SQL started.")
+        return super().execute(raw_sql, statement_timeout_ms, max_rows)
+
+    def cancel(self) -> bool:
+        return False
+
+
 class StoppingExecutor:
-    def execute(self, raw_sql: str, statement_timeout_ms: int, max_rows: int) -> QueryResult:
+    def execute(self, raw_sql: str, statement_timeout_ms: int, max_rows: int, cancellation=None) -> QueryResult:
         raise WorkerStopping
 
 
@@ -251,7 +272,7 @@ def test_worker_releases_analytics_unavailable_for_another_execution_attempt() -
     assert run is not None
     assert run.status == "running"
     assert run.error_code is None
-    assert repository.retry_release_reason == "analytics_unavailable"
+    assert repository.next_attempt_release_reason == "analytics_unavailable"
 
 
 @pytest.mark.parametrize(
@@ -271,7 +292,7 @@ def test_worker_does_not_automatically_retry_permanent_failures(code: str) -> No
 
     assert repository.run.status == "failed"
     assert repository.run.error_code == code
-    assert repository.retry_release_reason is None
+    assert repository.next_attempt_release_reason is None
 
 
 def test_worker_fails_analytics_unavailable_at_the_attempt_limit() -> None:
@@ -285,7 +306,7 @@ def test_worker_fails_analytics_unavailable_at_the_attempt_limit() -> None:
 
     assert repository.run.status == "failed"
     assert repository.run.error_code == "analytics_unavailable"
-    assert repository.retry_release_reason is None
+    assert repository.next_attempt_release_reason is None
 
 
 def test_worker_renews_ownership_while_the_query_is_running() -> None:
@@ -316,6 +337,18 @@ def test_worker_treats_a_lease_renewal_error_as_lost_ownership() -> None:
 
     assert repository.renewals == 1
     assert executor.cancel_requested.is_set()
+    assert repository.run.status == "running"
+    assert repository.result is None
+
+
+def test_worker_carries_lost_ownership_into_executor_registration() -> None:
+    repository = RenewalFailureRepository()
+    executor = RegistrationDelayedExecutor()
+
+    assert worker(repository, executor).process_one() is True
+
+    assert repository.renewals == 1
+    assert executor.cancel_requested_before_sql is True
     assert repository.run.status == "running"
     assert repository.result is None
 

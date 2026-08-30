@@ -364,9 +364,7 @@ class QueryRunRepository:
             )
         return True
 
-    def release_for_retry(self, ownership: ExecutionOwnership, reason: str) -> bool:
-        if reason != "analytics_unavailable":
-            raise ValueError("unsupported automatic retry reason")
+    def release_for_next_attempt(self, ownership: ExecutionOwnership) -> bool:
         with self._engine.begin() as connection:
             released = connection.execute(
                 text(
@@ -393,7 +391,7 @@ class QueryRunRepository:
                 text(
                     f"""
                     UPDATE query_execution_attempts
-                    SET released_at = now(), release_reason = :reason
+                    SET released_at = now(), release_reason = 'analytics_unavailable'
                     {CURRENT_EXECUTION_ATTEMPT_SQL}
                     """
                 ),
@@ -401,7 +399,6 @@ class QueryRunRepository:
                     "id": ownership.query_run.id,
                     "generation": ownership.generation,
                     "worker_id": ownership.worker_id,
-                    "reason": reason,
                 },
             )
         return True

@@ -1,4 +1,5 @@
 import json
+import multiprocessing
 import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -74,6 +75,80 @@ def queued_run(repository: QueryRunRepository, suffix: str = ""):
         policy_decision="allowed",
         referenced_objects=("analytics.customers",),
     )
+
+
+def queued_sql_run(repository: QueryRunRepository, raw_sql: str):
+    run = repository.create(raw_sql, "policy-v1", 10_000, 500).query_run
+    return repository.transition(
+        run.id,
+        "received",
+        status="queued",
+        policy_decision="allowed",
+        referenced_objects=("analytics.customers", "analytics.order_items"),
+    )
+
+
+def claim_and_block(
+    worker_database_url: str,
+    claimed,
+    lease_ms: int,
+) -> None:
+    repository = QueryRunRepository(worker_database_url)
+    ownership = repository.claim_next(
+        "terminated-after-claim",
+        max_concurrency=4,
+        lease_ms=lease_ms,
+        max_execution_attempts=3,
+    )
+    if ownership is None:
+        return
+    claimed.set()
+    while True:
+        sleep(1)
+
+
+class PublishBarrierRepository:
+    def __init__(self, database_url: str, reached_publish) -> None:
+        self._repository = QueryRunRepository(database_url)
+        self._reached_publish = reached_publish
+
+    def __getattr__(self, name: str):
+        return getattr(self._repository, name)
+
+    def publish_success(self, ownership, result):
+        self._reached_publish.set()
+        while True:
+            sleep(1)
+
+
+def run_worker_process(
+    worker_database_url: str,
+    analytics_database_url: str,
+    worker_id: str,
+    lease_ms: int,
+    reached_publish=None,
+) -> None:
+    repository = (
+        PublishBarrierRepository(worker_database_url, reached_publish)
+        if reached_publish is not None
+        else QueryRunRepository(worker_database_url)
+    )
+    QueryWorker(
+        repository,
+        PostgresQueryExecutor(analytics_database_url, 1),
+        worker_id=worker_id,
+        max_concurrency=4,
+        lease_ms=lease_ms,
+        heartbeat_ms=30,
+        max_execution_attempts=3,
+    ).process_one()
+
+
+def terminate_worker_process(process: multiprocessing.Process) -> None:
+    process.terminate()
+    process.join(timeout=2)
+    assert not process.is_alive()
+    assert process.exitcode not in {None, 0}
 
 
 def test_postgres_executor_enforces_the_exact_snapshot_byte_limit() -> None:
@@ -336,7 +411,7 @@ def test_analytics_unavailable_releases_the_attempt_and_reuses_the_governed_run(
         max_execution_attempts=3,
     )
     assert first is not None
-    assert worker_repository.release_for_retry(first, "analytics_unavailable") is True
+    assert worker_repository.release_for_next_attempt(first) is True
 
     second = worker_repository.claim_next(
         "worker-b",
@@ -378,7 +453,7 @@ def test_a_second_worker_completes_the_same_run_after_analytics_unavailable(
     ownership_database_urls,
 ) -> None:
     class UnavailableExecutor:
-        def execute(self, raw_sql: str, statement_timeout_ms: int, max_rows: int) -> QueryResult:
+        def execute(self, raw_sql: str, statement_timeout_ms: int, max_rows: int, cancellation=None) -> QueryResult:
             raise ExecutionFailure(
                 "analytics_unavailable",
                 "The analytics database is unavailable.",
@@ -441,6 +516,127 @@ def test_a_second_worker_completes_the_same_run_after_analytics_unavailable(
         ]
     finally:
         engine.dispose()
+
+
+def test_terminated_worker_processes_are_recovered_at_each_execution_phase(
+    ownership_database_urls,
+) -> None:
+    api_database_url, worker_database_url = ownership_database_urls
+    api_repository = QueryRunRepository(api_database_url)
+    worker_repository = QueryRunRepository(worker_database_url)
+    settings = WorkerSettings.from_env()
+    process_context = multiprocessing.get_context("fork")
+    lease_ms = 150
+    result = QueryResult(
+        columns=(QueryColumn(name="recovered", type="boolean"),),
+        rows=((True,),),
+        truncated=False,
+    )
+
+    def recover(run_id: str):
+        ownership = None
+        for _ in range(100):
+            ownership = worker_repository.claim_next(
+                "recovery-worker",
+                max_concurrency=4,
+                lease_ms=15_000,
+                max_execution_attempts=3,
+            )
+            if ownership is not None:
+                break
+            sleep(0.01)
+        assert ownership is not None
+        assert ownership.query_run.id == run_id
+        assert ownership.query_run.status == "running"
+        assert ownership.generation == 2
+        assert worker_repository.publish_success(ownership, result).status == "succeeded"
+
+    after_claim = queued_run(api_repository, "terminated-after-claim")
+    claimed = process_context.Event()
+    process = process_context.Process(
+        target=claim_and_block,
+        args=(worker_database_url, claimed, lease_ms),
+    )
+    process.start()
+    try:
+        assert claimed.wait(timeout=2)
+    finally:
+        terminate_worker_process(process)
+    recover(after_claim.id)
+
+    execution_marker = "ticket05-terminated-during-execution"
+    during_execution = queued_sql_run(
+        api_repository,
+        """
+        SELECT count(*)::bigint AS count
+        FROM analytics.order_items AS first_items
+        CROSS JOIN analytics.order_items AS second_items
+        CROSS JOIN analytics.order_items AS third_items
+        /* ticket05-terminated-during-execution */
+        """,
+    )
+    process = process_context.Process(
+        target=run_worker_process,
+        args=(
+            worker_database_url,
+            settings.analytics_database_url,
+            "terminated-during-execution",
+            lease_ms,
+        ),
+    )
+    process.start()
+    admin_engine = create_engine(
+        os.environ["TEST_ADMIN_DATABASE_URL"].replace(
+            "postgresql://",
+            "postgresql+psycopg://",
+        )
+    )
+    try:
+        for _ in range(200):
+            with admin_engine.connect() as connection:
+                active = connection.execute(
+                    text(
+                        """
+                        SELECT count(*)
+                        FROM pg_stat_activity
+                        WHERE datname = 'analytics'
+                          AND state = 'active'
+                          AND query LIKE :marker
+                        """
+                    ),
+                    {"marker": f"%{execution_marker}%"},
+                ).scalar_one()
+            if active == 1:
+                break
+            sleep(0.01)
+        assert active == 1
+    finally:
+        admin_engine.dispose()
+        terminate_worker_process(process)
+    recover(during_execution.id)
+
+    before_publish = queued_run(api_repository, "terminated-before-publish")
+    reached_publish = process_context.Event()
+    process = process_context.Process(
+        target=run_worker_process,
+        args=(
+            worker_database_url,
+            settings.analytics_database_url,
+            "terminated-before-publish",
+            lease_ms,
+            reached_publish,
+        ),
+    )
+    process.start()
+    try:
+        assert reached_publish.wait(timeout=2)
+        unfinished = api_repository.get(before_publish.id)
+        assert unfinished is not None
+        assert unfinished.status == "running"
+        assert api_repository.get_result(before_publish.id) is None
+    finally:
+        terminate_worker_process(process)
+    recover(before_publish.id)
 
 
 def test_a_non_current_generation_cannot_publish(

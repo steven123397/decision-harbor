@@ -1,7 +1,7 @@
 from collections.abc import Iterable
 from datetime import date, datetime
 from decimal import Decimal
-from threading import Lock
+from threading import Event, Lock
 from uuid import uuid4
 
 import psycopg
@@ -36,6 +36,17 @@ class ExecutionFailure(Exception):
         super().__init__(message)
         self.code = code
         self.message = message
+
+
+class ExecutionCancellation:
+    def __init__(self) -> None:
+        self._requested = Event()
+
+    def request(self) -> None:
+        self._requested.set()
+
+    def is_requested(self) -> bool:
+        return self._requested.is_set()
 
 
 def serialize_cell(value: object, type_oid: int) -> JsonCell:
@@ -83,8 +94,17 @@ class PostgresQueryExecutor:
                 pass
         return cancellation_requested
 
-    def execute(self, raw_sql: str, statement_timeout_ms: int, max_rows: int) -> QueryResult:
+    def execute(
+        self,
+        raw_sql: str,
+        statement_timeout_ms: int,
+        max_rows: int,
+        cancellation: ExecutionCancellation | None = None,
+    ) -> QueryResult:
+        cancellation = cancellation or ExecutionCancellation()
         try:
+            if cancellation.is_requested():
+                raise ExecutionFailure("internal_error", "The query could not be completed.")
             with self._engine.connect() as connection:
                 with connection.begin():
                     connection.exec_driver_sql("SET TRANSACTION READ ONLY")
@@ -96,6 +116,8 @@ class PostgresQueryExecutor:
                     with self._active_connections_lock:
                         self._active_connections.add(driver_connection)
                     try:
+                        if cancellation.is_requested():
+                            raise ExecutionFailure("internal_error", "The query could not be completed.")
                         with driver_connection.cursor(name=f"query_{uuid4().hex}") as cursor:
                             cursor.execute(raw_sql)
                             description = cursor.description or ()

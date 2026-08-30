@@ -285,7 +285,7 @@ def test_worker_releases_analytics_unavailable_for_another_execution_attempt() -
         "internal_error",
     ],
 )
-def test_worker_does_not_automatically_retry_permanent_failures(code: str) -> None:
+def test_worker_does_not_start_another_execution_attempt_for_permanent_failures(code: str) -> None:
     repository = FakeRepository()
 
     assert worker(repository, KnownFailureExecutor(code)).process_one() is True

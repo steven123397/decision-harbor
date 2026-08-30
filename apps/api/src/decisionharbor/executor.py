@@ -7,8 +7,19 @@ from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import DBAPIError
 
-from decisionharbor.domain import JsonCell, QueryColumn, QueryResult
+from decisionharbor.domain import (
+    RESULT_MAX_ROWS,
+    JsonCell,
+    QueryColumn,
+    QueryResult,
+    ResultSnapshotBuilder,
+    ResultTooLarge,
+)
 
+
+# Rows are taken from the server-side cursor in batches, so extraction stops as
+# soon as the snapshot prefix is settled instead of pulling the whole result in.
+FETCH_BATCH_SIZE = 64
 
 TYPE_NAMES = {
     16: "boolean",
@@ -82,19 +93,37 @@ class PostgresQueryExecutor:
                                     "unsupported_result_type",
                                     "The query returned a result type that is not supported.",
                                 )
-                        fetched_rows = cursor.fetchmany(max_rows + 1)
-                        truncated = len(fetched_rows) > max_rows
-                        rows = tuple(
-                            tuple(serialize_cell(value, description[index].type_code) for index, value in enumerate(row))
-                            for row in fetched_rows[:max_rows]
-                        )
                         columns = tuple(
                             QueryColumn(name=column.name, type=TYPE_NAMES[column.type_code])
                             for column in description
                         )
-                        return QueryResult(columns=columns, rows=rows, truncated=truncated)
+                        # A run may ask for more rows than a snapshot can hold;
+                        # reading the surplus would only be thrown away.
+                        row_limit = min(max_rows, RESULT_MAX_ROWS)
+                        builder = ResultSnapshotBuilder(columns, max_rows=row_limit)
+                        while True:
+                            # One row beyond the row bound is still read, because
+                            # only an existing row can settle `truncated`.
+                            wanted = min(FETCH_BATCH_SIZE, row_limit - builder.row_count + 1)
+                            batch = cursor.fetchmany(wanted)
+                            if not batch:
+                                break
+                            for raw_row in batch:
+                                row = tuple(
+                                    serialize_cell(value, description[index].type_code)
+                                    for index, value in enumerate(raw_row)
+                                )
+                                if not builder.add(row):
+                                    break
+                            if builder.truncated or len(batch) < wanted:
+                                break
+                        return builder.build()
         except ExecutionFailure:
             raise
+        except ResultTooLarge as exc:
+            raise ExecutionFailure(
+                "result_too_large", "The query result is too large to store."
+            ) from exc
         except psycopg.Error as exc:
             raise map_database_error(exc) from exc
         except DBAPIError as exc:

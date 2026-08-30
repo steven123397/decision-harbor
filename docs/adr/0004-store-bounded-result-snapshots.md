@@ -26,7 +26,9 @@ date: 2026-08-16
 
 ## Implementation and evidence
 
-v0.2.0 的 ticket 03 建立 `platform_0003` 迁移的 `query_run_results` 表，并在 `QueryRunQueue.publish_success()` 中把快照写入与 `succeeded` 终态放进同一个 platform 事务：先写快照再更新状态，任一步失配即整体回滚，因此不存在“已成功但无快照”的可观察中间态。迁移还加 `query_runs_require_snapshot` 触发器，把这条不变式落到数据库层——它只拦 `UPDATE` 迁移路径，不拦 `INSERT`，所以保留期清理删除快照后仍能得到 spec 要求的 `result_unavailable` 运行。行数、字节预算与读取语义分别由 ticket 04 与 05 交付。
+v0.2.0 的 ticket 03 建立 `platform_0003` 迁移的 `query_run_results` 表，并在 `QueryRunQueue.publish_success()` 中把快照写入与 `succeeded` 终态放进同一个 platform 事务：先写快照再更新状态，任一步失配即整体回滚，因此不存在“已成功但无快照”的可观察中间态。迁移还加 `query_runs_require_snapshot` 触发器，把这条不变式落到数据库层——它只拦 `UPDATE` 迁移路径，不拦 `INSERT`，所以保留期清理删除快照后仍能得到 spec 要求的 `result_unavailable` 运行。
+
+ticket 04 交付两重边界本身。`domain.ResultSnapshotBuilder` 按 `{"columns":[...],"rows":[...]}` 的紧凑 UTF-8 JSON 计量：最多 500 行，最多 1,048,576 字节，插入行时增量累加字节，越界即停止并记录 `truncated`；列定义本身、首行或任意单行超出字节预算时抛出 `ResultTooLarge`，由 `executor` 映射为 `result_too_large` 的 `failed` 运行，不保存部分内容。`queue.publish_success()` 用同一个 `encode_json` 落库，使计量字节与存储表示一致。证据：`tests/unit/test_result_snapshot.py` 覆盖边界计算，`tests/worker/test_result_snapshot_bounds.py` 在真实 analytics 数据上覆盖 500 行边界、恰好 1 MiB 与超出 1 字节、首行与后续单行过大、多字节 UTF-8 与显式类型，`tests/integration/test_query_chain.py` 用策略允许的 1663 列宽结果证明字节预算在公开提交路径上同样生效。读取语义与保留期仍由 ticket 05 交付。
 
 ## Revisit when
 

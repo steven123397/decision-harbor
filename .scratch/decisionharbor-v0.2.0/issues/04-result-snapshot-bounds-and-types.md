@@ -4,7 +4,7 @@
 
 **Blocked by:** 03
 
-**Status:** ready-for-agent
+**Status:** claimed
 
 - [ ] 快照最多保存 500 行；恰好 500 行不标记为截断，第 501 行存在时截断且只保存前 500 行
 - [ ] 字节预算为 1 MiB 即 1,048,576 字节，按 `{"columns":[...],"rows":[...]}` 的紧凑 UTF-8 JSON 计算：键顺序固定为 `columns`、`rows`，每个列对象固定为 `{"name":string,"type":string}`，每行是与列位置对应的 JSON 数组，分隔符不含空格，非 ASCII 字符直接编码为 UTF-8

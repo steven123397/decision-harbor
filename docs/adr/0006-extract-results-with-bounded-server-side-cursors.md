@@ -24,7 +24,7 @@ analytics 执行器使用服务端游标按有限批次提取，并在已能判�
 
 ## Implementation and evidence
 
-提交 `6e3964f` 的 `PostgresQueryExecutor` 使用命名服务端游标、`fetchmany(max_rows + 1)`、有界连接池和事务上下文；集成测试覆盖真实 PostgreSQL 上的行数截断、只读权限和语句超时。v0.2.0 的 ticket 03 起它只由 `decisionharbor.worker` 调用，执行不再占用 HTTP 请求生命周期；`tests/worker/test_query_execution.py` 证明成功、语义错误、未知类型与超时路径之后池化连接仍可复用。取消与失租路径的游标收尾由 ticket 09 与 07 补齐。
+提交 `6e3964f` 的 `PostgresQueryExecutor` 使用命名服务端游标、`fetchmany(max_rows + 1)`、有界连接池和事务上下文；集成测试覆盖真实 PostgreSQL 上的行数截断、只读权限和语句超时。v0.2.0 的 ticket 03 起它只由 `decisionharbor.worker` 调用，执行不再占用 HTTP 请求生命周期；`tests/worker/test_query_execution.py` 证明成功、语义错误、未知类型与超时路径之后池化连接仍可复用。ticket 04 把单次 `fetchmany(max_rows + 1)` 改为以 `FETCH_BATCH_SIZE` 为上限的循环：每批只取“还能进入快照的行数 + 1”，一旦某行被 `ResultSnapshotBuilder` 拒绝就停止读取。字节预算因此没有把执行路径带回完整物化，超大结果也只累积到预算为止。取消与失租路径的游标收尾由 ticket 09 与 07 补齐。
 
 ## Revisit when
 

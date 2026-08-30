@@ -2,12 +2,19 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 from hashlib import sha256
+import json
 import re
 from typing import TypeAlias
 from uuid import uuid4
 
 
 JsonCell: TypeAlias = None | bool | int | float | str
+
+# A result snapshot is always a bounded, immutable prefix: no more than this
+# many rows and no more than this many bytes of the compact UTF-8 JSON described
+# by the external contract.
+RESULT_MAX_ROWS = 500
+RESULT_MAX_BYTES = 1_048_576
 
 SUBMIT_IDEMPOTENCY_SCOPE = "submit"
 IDEMPOTENCY_KEY_MAX_LENGTH = 128
@@ -25,6 +32,83 @@ class QueryResult:
     columns: tuple[QueryColumn, ...]
     rows: tuple[tuple[JsonCell, ...], ...]
     truncated: bool
+
+
+class ResultTooLarge(Exception):
+    """A result that cannot be stored as a bounded snapshot prefix."""
+
+
+def encode_json(value: object) -> bytes:
+    """Encode a value as the compact UTF-8 JSON the snapshot contract fixes.
+
+    Non-ASCII text stays UTF-8 encoded rather than escaped, so the measured
+    bytes are the bytes a client receives.
+    """
+    return json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def encode_snapshot_columns(columns: tuple[QueryColumn, ...]) -> bytes:
+    """The column definitions of a snapshot, as the bytes the budget counts."""
+    return encode_json([{"name": column.name, "type": column.type} for column in columns])
+
+
+class ResultSnapshotBuilder:
+    """Accumulates the longest result prefix that fits both snapshot bounds.
+
+    Rows are taken in database order until the next one would break either
+    bound. A result whose column definitions, first row, or any single row
+    cannot fit the byte budget is rejected outright: the query run fails instead
+    of persisting partial rows or partial cells.
+
+    The column definitions count together with the structure every snapshot
+    carries, because a snapshot with no rows is still stored, and a stored
+    snapshot must never measure more than the budget.
+    """
+
+    def __init__(self, columns: tuple[QueryColumn, ...], *, max_rows: int = RESULT_MAX_ROWS) -> None:
+        self._columns = columns
+        self._max_rows = max_rows
+        self._rows: list[tuple[JsonCell, ...]] = []
+        self._truncated = False
+        # Every accepted row adds its own bytes plus the comma that separates it
+        # from the previous one, so the empty snapshot is the starting size.
+        self._size = (
+            len(b'{"columns":') + len(encode_snapshot_columns(columns)) + len(b',"rows":[]}')
+        )
+        if self._size > RESULT_MAX_BYTES:
+            raise ResultTooLarge
+
+    @property
+    def row_count(self) -> int:
+        return len(self._rows)
+
+    @property
+    def truncated(self) -> bool:
+        """Whether a row was left out because it broke the row or byte bound."""
+        return self._truncated
+
+    def add(self, row: tuple[JsonCell, ...]) -> bool:
+        """Take the next row, reporting whether it still fits the snapshot."""
+        # The row bound is checked first: a row beyond it is only read to prove
+        # there is more to read, so its own size cannot fail the run.
+        if self.row_count >= self._max_rows:
+            self._truncated = True
+            return False
+        row_bytes = encode_json(list(row))
+        if len(row_bytes) > RESULT_MAX_BYTES:
+            raise ResultTooLarge
+        size = self._size + len(row_bytes) + (1 if self._rows else 0)
+        if size > RESULT_MAX_BYTES:
+            if not self._rows:
+                raise ResultTooLarge
+            self._truncated = True
+            return False
+        self._rows.append(row)
+        self._size = size
+        return True
+
+    def build(self) -> QueryResult:
+        return QueryResult(columns=self._columns, rows=tuple(self._rows), truncated=self._truncated)
 
 
 @dataclass(frozen=True)

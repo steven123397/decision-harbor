@@ -25,7 +25,7 @@ PostgreSQL 的 `bigint` 和 `numeric` 可能超出 JavaScript 安全整数或二
 
 ## Implementation and evidence
 
-提交 `6e3964f` 在 `executor.py` 中建立显式 OID 允许集和单元格序列化；`test_executor.py` 覆盖 `numeric`、`bigint`、日期时间、原生 JSON 类型与未知类型拒绝。v0.2.0 的 ticket 03 起 `PostgresQueryExecutor` 只由 `decisionharbor.worker` 调用，序列化的 `QueryResult` 直接落进结果快照，持久化边界不重新推断类型。
+提交 `6e3964f` 在 `executor.py` 中建立显式 OID 允许集和单元格序列化；`test_executor.py` 覆盖 `numeric`、`bigint`、日期时间、原生 JSON 类型与未知类型拒绝。v0.2.0 的 ticket 03 起 `PostgresQueryExecutor` 只由 `decisionharbor.worker` 调用，序列化的 `QueryResult` 直接落进结果快照，持久化边界不重新推断类型。ticket 04 让 `queue.publish_success()` 与字节预算共用 `domain.encode_json`（紧凑 UTF-8，非 ASCII 不转义），`tests/worker/test_result_snapshot_bounds.py` 证明落库的 `bigint` 与 `numeric` 仍是十进制字符串、日期与时间戳仍是 ISO 8601 字符串，布尔值、32 位整数、文本与 `null` 仍是 JSON 原生类型。
 
 ## Revisit when
 

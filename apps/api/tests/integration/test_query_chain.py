@@ -12,6 +12,7 @@ import pytest
 
 from decisionharbor.api import create_runtime_app
 from decisionharbor.config import Settings
+from decisionharbor.domain import RESULT_MAX_BYTES
 from decisionharbor.repository import QueryRunRepository
 
 
@@ -20,6 +21,20 @@ pytestmark = pytest.mark.integration
 
 ASYNC_LIFECYCLE = {"queued", "running", "succeeded"}
 TERMINAL_STATUSES = {"succeeded", "failed", "cancelled"}
+
+# Analytics accepts at most 1664 target list entries, and the sort key of the
+# `ORDER BY` below counts as one of them. Row width, not row count, is what
+# brings a policy-allowed query up against the snapshot byte budget.
+WIDE_TARGET_LIST = ", ".join(f"o.order_no AS c{index}" for index in range(1_663))
+
+
+def snapshot_bytes(columns: object, rows: object) -> bytes:
+    """The snapshot as the external contract measures it: compact UTF-8 JSON."""
+    return json.dumps(
+        {"columns": columns, "rows": rows},
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
 
 
 def platform_admin_url() -> str:
@@ -145,6 +160,29 @@ def test_submitted_run_reaches_success_after_the_submit_connection_is_abandoned(
     assert snapshot[0] == [{"name": alias, "type": "bigint"}]
     assert snapshot[1] == [["100"]]
     assert snapshot[2] is False
+
+
+def test_a_wide_result_is_truncated_by_the_byte_budget_before_the_row_budget() -> None:
+    app = create_runtime_app()
+    with TestClient(app) as client:
+        submitted = client.post(
+            "/api/v1/query-runs",
+            json={"sql": f"SELECT {WIDE_TARGET_LIST} FROM orders o ORDER BY o.id"},
+        )
+
+        assert submitted.status_code == 202
+        run_id = submitted.json()["data"]["query_run"]["id"]
+
+    facts = wait_for_terminal(run_id)
+    columns, rows, truncated = read_snapshot(run_id)
+
+    assert facts["status"] == "succeeded"
+    assert facts["result_truncated"] is True
+    assert 0 < facts["returned_row_count"] < 500
+    assert truncated is True
+    assert len(rows) == facts["returned_row_count"]
+    assert len(snapshot_bytes(columns, rows)) <= RESULT_MAX_BYTES
+    assert len(snapshot_bytes(columns, rows + [rows[0]])) > RESULT_MAX_BYTES
 
 
 def test_unknown_query_run_identifier_is_not_found() -> None:

@@ -1,9 +1,13 @@
-import json
-
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
-from decisionharbor.domain import QueryResult, QueryRun, finished_fields
+from decisionharbor.domain import (
+    QueryResult,
+    QueryRun,
+    encode_json,
+    encode_snapshot_columns,
+    finished_fields,
+)
 from decisionharbor.repository import row_to_query_run
 
 
@@ -117,10 +121,11 @@ class QueryRunQueue:
                 INSERT_RESULT_SNAPSHOT,
                 {
                     "query_run_id": run.id,
-                    "result_columns": json.dumps(
-                        [{"name": column.name, "type": column.type} for column in result.columns]
-                    ),
-                    "result_rows": json.dumps([list(row) for row in result.rows]),
+                    # The measured bytes and the stored snapshot share one
+                    # encoding, so a stored snapshot is never larger than the
+                    # budget the builder spent.
+                    "result_columns": encode_snapshot_columns(result.columns).decode("utf-8"),
+                    "result_rows": encode_json([list(row) for row in result.rows]).decode("utf-8"),
                     "truncated": result.truncated,
                     "created_at": finished["finished_at"],
                 },

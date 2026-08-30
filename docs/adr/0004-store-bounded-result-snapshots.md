@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: implemented
 date: 2026-08-16
 ---
 
@@ -23,6 +23,12 @@ date: 2026-08-16
 ## Consequences
 
 成功终态与快照必须在同一事务中发布，清理只删除结果内容并保留长期审计。用户可能只看到截断前缀，超大单行会失败；产品必须用稳定状态区分未就绪、不可用和已过期结果。
+
+## Implementation and evidence
+
+[有限结果快照 ticket](../../.scratch/decisionharbor-v0.2.0/issues/04-bounded-atomic-results.md) 以紧凑 UTF-8 JSON 精确计量 `columns` 与 `rows`，最多保留 500 行和 1,048,576 字节。Worker 通过命名服务端游标逐行构造最长有序前缀；列定义、首行或任意单行超限时以 `result_too_large` 失败且不保存结果内容。
+
+`apps/api/tests/unit/test_executor.py` 覆盖行数与字节数的精确边界、多字节 UTF-8、累计截断和无部分单元格失败。`apps/api/tests/integration/test_worker_repository.py` 使用真实 PostgreSQL 证明稳定前缀、失败后连接可复用、未释放 execution attempt 的发布栅栏，以及结果插入失败时成功终态和 attempt 释放整体回滚。
 
 ## Revisit when
 

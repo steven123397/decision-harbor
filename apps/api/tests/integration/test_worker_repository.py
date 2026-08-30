@@ -1,5 +1,6 @@
-from concurrent.futures import ThreadPoolExecutor
+import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from time import sleep
 from uuid import uuid4
@@ -8,10 +9,11 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import IntegrityError
 
 from decisionharbor.config import ApiSettings, WorkerSettings
 from decisionharbor.domain import QueryColumn, QueryResult
-from decisionharbor.executor import PostgresQueryExecutor
+from decisionharbor.executor import ExecutionFailure, PostgresQueryExecutor, RESULT_MAX_BYTES
 from decisionharbor.repository import QueryRunRepository, StateConflict
 from decisionharbor.worker import QueryWorker
 
@@ -71,6 +73,69 @@ def queued_run(repository: QueryRunRepository, suffix: str = ""):
         policy_decision="allowed",
         referenced_objects=("analytics.customers",),
     )
+
+
+def test_postgres_executor_enforces_the_exact_snapshot_byte_limit() -> None:
+    settings = WorkerSettings.from_env()
+    executor = PostgresQueryExecutor(settings.analytics_database_url, 1)
+    empty_snapshot_size = len(
+        json.dumps(
+            {
+                "columns": [{"name": "value", "type": "text"}],
+                "rows": [[""]],
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+    exact_value_size = RESULT_MAX_BYTES - empty_snapshot_size
+
+    exact = executor.execute(
+        f"SELECT repeat('x', {exact_value_size})::text AS value",
+        statement_timeout_ms=5_000,
+        max_rows=500,
+    )
+    with pytest.raises(ExecutionFailure) as caught:
+        executor.execute(
+            f"SELECT repeat('x', {exact_value_size + 1})::text AS value",
+            statement_timeout_ms=5_000,
+            max_rows=500,
+        )
+
+    assert len(exact.rows[0][0]) == exact_value_size
+    assert exact.truncated is False
+    assert caught.value.code == "result_too_large"
+
+
+def test_postgres_executor_keeps_a_stable_prefix_and_reuses_the_connection_after_failure() -> None:
+    settings = WorkerSettings.from_env()
+    executor = PostgresQueryExecutor(settings.analytics_database_url, 1)
+
+    truncated = executor.execute(
+        "SELECT repeat('x', 600000)::text AS value FROM generate_series(1, 2) ORDER BY generate_series",
+        statement_timeout_ms=5_000,
+        max_rows=500,
+    )
+    with pytest.raises(ExecutionFailure) as caught:
+        executor.execute(
+            """
+            SELECT CASE ordinal WHEN 1 THEN 'kept' ELSE repeat('x', 1048577) END::text AS value
+            FROM generate_series(1, 2) AS ordinal
+            ORDER BY ordinal
+            """,
+            statement_timeout_ms=5_000,
+            max_rows=500,
+        )
+    reused = executor.execute(
+        "SELECT 'reused'::text AS value",
+        statement_timeout_ms=5_000,
+        max_rows=500,
+    )
+
+    assert truncated.rows == (("x" * 600_000,),)
+    assert truncated.truncated is True
+    assert caught.value.code == "result_too_large"
+    assert reused.rows == (("reused",),)
+    assert reused.truncated is False
 
 
 def test_claim_records_an_attempt_and_an_unexpired_lease_cannot_be_stolen(
@@ -134,6 +199,139 @@ def test_a_non_current_generation_cannot_publish(
     with pytest.raises(StateConflict):
         worker_repository.publish_success(stale, result)
     assert worker_repository.publish_success(current, result).status == "succeeded"
+
+
+def test_a_released_execution_attempt_cannot_publish(
+    ownership_database_urls,
+) -> None:
+    api_database_url, worker_database_url = ownership_database_urls
+    api_repository = QueryRunRepository(api_database_url)
+    worker_repository = QueryRunRepository(worker_database_url)
+    queued_run(api_repository, "released-attempt")
+    ownership = worker_repository.claim_next("worker-a", max_concurrency=4, lease_ms=15_000)
+    assert ownership is not None
+    result = QueryResult(
+        columns=(QueryColumn(name="count", type="bigint"),),
+        rows=(("100",),),
+        truncated=False,
+    )
+    engine = create_engine(worker_database_url)
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    UPDATE query_execution_attempts
+                    SET released_at = now(), release_reason = 'worker_stopped'
+                    WHERE query_run_id = CAST(:run_id AS uuid)
+                      AND generation = :generation
+                    """
+                ),
+                {"run_id": ownership.query_run.id, "generation": ownership.generation},
+            )
+    finally:
+        engine.dispose()
+
+    with pytest.raises(StateConflict):
+        worker_repository.publish_success(ownership, result)
+
+    unchanged = api_repository.get(ownership.query_run.id)
+    assert unchanged is not None
+    assert unchanged.status == "running"
+    assert api_repository.get_result(ownership.query_run.id) is None
+
+
+def test_success_publication_rolls_back_if_the_snapshot_insert_fails(
+    ownership_database_urls,
+) -> None:
+    api_database_url, worker_database_url = ownership_database_urls
+    api_repository = QueryRunRepository(api_database_url)
+    worker_repository = QueryRunRepository(worker_database_url)
+    queued_run(api_repository, "atomic-rollback")
+    ownership = worker_repository.claim_next("worker-a", max_concurrency=4, lease_ms=15_000)
+    assert ownership is not None
+    original = QueryResult(
+        columns=(QueryColumn(name="value", type="text"),),
+        rows=(("original",),),
+        truncated=False,
+    )
+    replacement = replace(original, rows=(("replacement",),))
+    engine = create_engine(worker_database_url)
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO query_results (query_run_id, columns_json, rows_json, truncated)
+                    VALUES (CAST(:run_id AS uuid), '[{"name":"value","type":"text"}]', '[["original"]]', false)
+                    """
+                ),
+                {"run_id": ownership.query_run.id},
+            )
+
+        with pytest.raises(IntegrityError):
+            worker_repository.publish_success(ownership, replacement)
+
+        with engine.connect() as connection:
+            attempt = connection.execute(
+                text(
+                    """
+                    SELECT released_at, release_reason
+                    FROM query_execution_attempts
+                    WHERE query_run_id = CAST(:run_id AS uuid) AND generation = :generation
+                    """
+                ),
+                {"run_id": ownership.query_run.id, "generation": ownership.generation},
+            ).one()
+    finally:
+        engine.dispose()
+
+    unchanged = api_repository.get(ownership.query_run.id)
+    assert unchanged is not None
+    assert unchanged.status == "running"
+    assert api_repository.get_result(ownership.query_run.id) == original
+    assert attempt == (None, None)
+
+
+@pytest.mark.parametrize(
+    ("raw_sql", "expected_code"),
+    [
+        ("SELECT repeat('x', 1048577)::text AS value", "result_too_large"),
+        ("SELECT '{}'::jsonb AS value", "unsupported_result_type"),
+    ],
+)
+def test_worker_publishes_stable_snapshot_failures_without_result_content(
+    ownership_database_urls,
+    raw_sql: str,
+    expected_code: str,
+) -> None:
+    api_database_url, worker_database_url = ownership_database_urls
+    api_repository = QueryRunRepository(api_database_url)
+    run = api_repository.create(raw_sql, "policy-v1", 5_000, 500).query_run
+    api_repository.transition(
+        run.id,
+        "received",
+        status="queued",
+        policy_decision="allowed",
+        referenced_objects=(),
+    )
+    settings = WorkerSettings.from_env()
+    worker = QueryWorker(
+        QueryRunRepository(worker_database_url),
+        PostgresQueryExecutor(settings.analytics_database_url, 1),
+        worker_id="snapshot-worker",
+        max_concurrency=1,
+        lease_ms=15_000,
+        heartbeat_ms=1_000,
+    )
+
+    assert worker.process_one() is True
+
+    failed = api_repository.get(run.id)
+    assert failed is not None
+    assert failed.status == "failed"
+    assert failed.error_code == expected_code
+    assert api_repository.get_result(run.id) is None
 
 
 def test_heartbeat_extends_current_ownership_and_prevents_takeover(

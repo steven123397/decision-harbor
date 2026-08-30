@@ -26,6 +26,8 @@ analytics 执行器使用服务端游标按有限批次提取，并在已能判�
 
 提交 `6e3964f` 的 `PostgresQueryExecutor` 使用命名服务端游标、`fetchmany(max_rows + 1)`、有界连接池和事务上下文；集成测试覆盖真实 PostgreSQL 上的行数截断、只读权限和语句超时。
 
+[有限结果快照 ticket](../../.scratch/decisionharbor-v0.2.0/issues/04-bounded-atomic-results.md) 将提取方式收紧为逐行 `fetchmany(1)`：执行器在同时满足 500 行和 1 MiB 的最长稳定前缀确定后停止读取。超限、未知类型和成功路径均由游标及事务上下文收敛；真实 PostgreSQL 测试证明失败后的池连接可以继续执行查询。
+
 ## Revisit when
 
 结果改为数据库原生导出或流入外部对象存储，且新链路能提供等价的内存、连接和事务边界时，重新评估服务端游标。

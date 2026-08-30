@@ -193,6 +193,14 @@ class QueryRunRepository:
                       AND current_generation = :generation
                       AND owner_worker_id = :worker_id
                       AND lease_expires_at > now()
+                      AND EXISTS (
+                          SELECT 1
+                          FROM query_execution_attempts AS attempt
+                          WHERE attempt.query_run_id = query_runs.id
+                            AND attempt.generation = :generation
+                            AND attempt.worker_id = :worker_id
+                            AND attempt.released_at IS NULL
+                      )
                     RETURNING *
                     """
                 ),
@@ -256,10 +264,15 @@ class QueryRunRepository:
                     SET released_at = now(), release_reason = 'worker_stopped'
                     WHERE query_run_id = CAST(:id AS uuid)
                       AND generation = :generation
+                      AND worker_id = :worker_id
                       AND released_at IS NULL
                     """
                 ),
-                {"id": ownership.query_run.id, "generation": ownership.generation},
+                {
+                    "id": ownership.query_run.id,
+                    "generation": ownership.generation,
+                    "worker_id": ownership.worker_id,
+                },
             )
         return True
 
@@ -288,6 +301,14 @@ class QueryRunRepository:
                       AND current_generation = :generation
                       AND owner_worker_id = :worker_id
                       AND lease_expires_at > now()
+                      AND EXISTS (
+                          SELECT 1
+                          FROM query_execution_attempts AS attempt
+                          WHERE attempt.query_run_id = query_runs.id
+                            AND attempt.generation = :generation
+                            AND attempt.worker_id = :worker_id
+                            AND attempt.released_at IS NULL
+                      )
                     RETURNING *
                     """
                 ),
@@ -308,10 +329,15 @@ class QueryRunRepository:
                     SET released_at = now(), release_reason = 'succeeded'
                     WHERE query_run_id = CAST(:id AS uuid)
                       AND generation = :generation
+                      AND worker_id = :worker_id
                       AND released_at IS NULL
                     """
                 ),
-                {"id": ownership.query_run.id, "generation": ownership.generation},
+                {
+                    "id": ownership.query_run.id,
+                    "generation": ownership.generation,
+                    "worker_id": ownership.worker_id,
+                },
             )
             connection.execute(
                 text(
@@ -353,6 +379,14 @@ class QueryRunRepository:
                       AND current_generation = :generation
                       AND owner_worker_id = :worker_id
                       AND lease_expires_at > now()
+                      AND EXISTS (
+                          SELECT 1
+                          FROM query_execution_attempts AS attempt
+                          WHERE attempt.query_run_id = query_runs.id
+                            AND attempt.generation = :generation
+                            AND attempt.worker_id = :worker_id
+                            AND attempt.released_at IS NULL
+                      )
                     RETURNING *
                     """
                 ),
@@ -373,10 +407,15 @@ class QueryRunRepository:
                     SET released_at = now(), release_reason = 'failed'
                     WHERE query_run_id = CAST(:id AS uuid)
                       AND generation = :generation
+                      AND worker_id = :worker_id
                       AND released_at IS NULL
                     """
                 ),
-                {"id": ownership.query_run.id, "generation": ownership.generation},
+                {
+                    "id": ownership.query_run.id,
+                    "generation": ownership.generation,
+                    "worker_id": ownership.worker_id,
+                },
             )
         return _row_to_query_run(row)
 

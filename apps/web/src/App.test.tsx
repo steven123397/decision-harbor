@@ -62,6 +62,7 @@ const knownErrorMessages = {
   service_not_ready: 'The service is not ready.',
   policy_internal_error: 'The query policy could not complete.',
   internal_error: 'The query could not be completed.',
+  result_too_large: 'The query result is too large to store.',
   unsupported_result_type: 'The query returned a result type that is not supported.',
   query_run_not_found: 'The query run was not found.',
   execution_interrupted: 'The query execution was interrupted before completion.',

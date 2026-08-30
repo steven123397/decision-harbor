@@ -4,6 +4,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine, Row
 
 from decisionharbor.domain import ExecutionOwnership, QueryColumn, QueryResult, QueryRun, QueryRunCreation
+from decisionharbor.result_snapshot import encode_result_snapshot
 
 
 class StateConflict(RuntimeError):
@@ -24,6 +25,27 @@ TRANSITION_COLUMNS = frozenset(
         "duration_ms",
     }
 )
+
+VALID_EXECUTION_OWNERSHIP_SQL = """
+  AND current_generation = :generation
+  AND owner_worker_id = :worker_id
+  AND lease_expires_at > now()
+  AND EXISTS (
+      SELECT 1
+      FROM query_execution_attempts AS attempt
+      WHERE attempt.query_run_id = query_runs.id
+        AND attempt.generation = :generation
+        AND attempt.worker_id = :worker_id
+        AND attempt.released_at IS NULL
+  )
+"""
+
+CURRENT_EXECUTION_ATTEMPT_SQL = """
+WHERE query_run_id = CAST(:id AS uuid)
+  AND generation = :generation
+  AND worker_id = :worker_id
+  AND released_at IS NULL
+"""
 
 
 class QueryRunRepository:
@@ -184,23 +206,13 @@ class QueryRunRepository:
         with self._engine.begin() as connection:
             row = connection.execute(
                 text(
-                    """
+                    f"""
                     UPDATE query_runs
                     SET heartbeat_at = now(),
                         lease_expires_at = now() + :lease_ms * interval '1 millisecond'
                     WHERE id = CAST(:id AS uuid)
                       AND status = 'running'
-                      AND current_generation = :generation
-                      AND owner_worker_id = :worker_id
-                      AND lease_expires_at > now()
-                      AND EXISTS (
-                          SELECT 1
-                          FROM query_execution_attempts AS attempt
-                          WHERE attempt.query_run_id = query_runs.id
-                            AND attempt.generation = :generation
-                            AND attempt.worker_id = :worker_id
-                            AND attempt.released_at IS NULL
-                      )
+                      {VALID_EXECUTION_OWNERSHIP_SQL}
                     RETURNING *
                     """
                 ),
@@ -216,13 +228,10 @@ class QueryRunRepository:
             values = row._mapping
             connection.execute(
                 text(
-                    """
+                    f"""
                     UPDATE query_execution_attempts
                     SET heartbeat_at = :heartbeat_at, lease_expires_at = :lease_expires_at
-                    WHERE query_run_id = CAST(:id AS uuid)
-                      AND generation = :generation
-                      AND worker_id = :worker_id
-                      AND released_at IS NULL
+                    {CURRENT_EXECUTION_ATTEMPT_SQL}
                     """
                 ),
                 {
@@ -259,13 +268,10 @@ class QueryRunRepository:
                 return False
             connection.execute(
                 text(
-                    """
+                    f"""
                     UPDATE query_execution_attempts
                     SET released_at = now(), release_reason = 'worker_stopped'
-                    WHERE query_run_id = CAST(:id AS uuid)
-                      AND generation = :generation
-                      AND worker_id = :worker_id
-                      AND released_at IS NULL
+                    {CURRENT_EXECUTION_ATTEMPT_SQL}
                     """
                 ),
                 {
@@ -277,16 +283,11 @@ class QueryRunRepository:
         return True
 
     def publish_success(self, ownership: ExecutionOwnership, result: QueryResult) -> QueryRun:
-        columns_json = json.dumps(
-            [{"name": column.name, "type": column.type} for column in result.columns],
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-        rows_json = json.dumps(result.rows, ensure_ascii=False, separators=(",", ":"))
+        encoded_result = encode_result_snapshot(result)
         with self._engine.begin() as connection:
             row = connection.execute(
                 text(
-                    """
+                    f"""
                     UPDATE query_runs
                     SET status = 'succeeded',
                         returned_row_count = :returned_row_count,
@@ -298,17 +299,7 @@ class QueryRunRepository:
                         lease_expires_at = NULL
                     WHERE id = CAST(:id AS uuid)
                       AND status = 'running'
-                      AND current_generation = :generation
-                      AND owner_worker_id = :worker_id
-                      AND lease_expires_at > now()
-                      AND EXISTS (
-                          SELECT 1
-                          FROM query_execution_attempts AS attempt
-                          WHERE attempt.query_run_id = query_runs.id
-                            AND attempt.generation = :generation
-                            AND attempt.worker_id = :worker_id
-                            AND attempt.released_at IS NULL
-                      )
+                      {VALID_EXECUTION_OWNERSHIP_SQL}
                     RETURNING *
                     """
                 ),
@@ -324,13 +315,10 @@ class QueryRunRepository:
                 raise StateConflict("query run success publication did not match valid ownership")
             connection.execute(
                 text(
-                    """
+                    f"""
                     UPDATE query_execution_attempts
                     SET released_at = now(), release_reason = 'succeeded'
-                    WHERE query_run_id = CAST(:id AS uuid)
-                      AND generation = :generation
-                      AND worker_id = :worker_id
-                      AND released_at IS NULL
+                    {CURRENT_EXECUTION_ATTEMPT_SQL}
                     """
                 ),
                 {
@@ -348,8 +336,8 @@ class QueryRunRepository:
                 ),
                 {
                     "id": ownership.query_run.id,
-                    "columns_json": columns_json,
-                    "rows_json": rows_json,
+                    "columns_json": encoded_result.columns_json,
+                    "rows_json": encoded_result.rows_json,
                     "truncated": result.truncated,
                 },
             )
@@ -364,7 +352,7 @@ class QueryRunRepository:
         with self._engine.begin() as connection:
             row = connection.execute(
                 text(
-                    """
+                    f"""
                     UPDATE query_runs
                     SET status = 'failed',
                         error_code = :code,
@@ -376,17 +364,7 @@ class QueryRunRepository:
                         lease_expires_at = NULL
                     WHERE id = CAST(:id AS uuid)
                       AND status = 'running'
-                      AND current_generation = :generation
-                      AND owner_worker_id = :worker_id
-                      AND lease_expires_at > now()
-                      AND EXISTS (
-                          SELECT 1
-                          FROM query_execution_attempts AS attempt
-                          WHERE attempt.query_run_id = query_runs.id
-                            AND attempt.generation = :generation
-                            AND attempt.worker_id = :worker_id
-                            AND attempt.released_at IS NULL
-                      )
+                      {VALID_EXECUTION_OWNERSHIP_SQL}
                     RETURNING *
                     """
                 ),
@@ -402,13 +380,10 @@ class QueryRunRepository:
                 raise StateConflict("query run failure publication did not match valid ownership")
             connection.execute(
                 text(
-                    """
+                    f"""
                     UPDATE query_execution_attempts
                     SET released_at = now(), release_reason = 'failed'
-                    WHERE query_run_id = CAST(:id AS uuid)
-                      AND generation = :generation
-                      AND worker_id = :worker_id
-                      AND released_at IS NULL
+                    {CURRENT_EXECUTION_ATTEMPT_SQL}
                     """
                 ),
                 {

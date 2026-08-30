@@ -13,8 +13,9 @@ from sqlalchemy.exc import IntegrityError
 
 from decisionharbor.config import ApiSettings, WorkerSettings
 from decisionharbor.domain import QueryColumn, QueryResult
-from decisionharbor.executor import ExecutionFailure, PostgresQueryExecutor, RESULT_MAX_BYTES
+from decisionharbor.executor import ExecutionFailure, PostgresQueryExecutor
 from decisionharbor.repository import QueryRunRepository, StateConflict
+from decisionharbor.result_snapshot import RESULT_MAX_BYTES
 from decisionharbor.worker import QueryWorker
 
 

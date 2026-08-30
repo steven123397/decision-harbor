@@ -1,4 +1,3 @@
-import json
 from collections.abc import Iterable
 from datetime import date, datetime
 from decimal import Decimal
@@ -10,6 +9,11 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import DBAPIError
 
 from decisionharbor.domain import JsonCell, QueryColumn, QueryResult
+from decisionharbor.result_snapshot import (
+    RESULT_TOO_LARGE_MESSAGE,
+    ResultSnapshotTooLarge,
+    build_result_snapshot,
+)
 
 
 TYPE_NAMES = {
@@ -25,10 +29,6 @@ TYPE_NAMES = {
     1184: "timestamp with time zone",
     1700: "numeric",
 }
-
-RESULT_MAX_ROWS = 500
-RESULT_MAX_BYTES = 1_048_576
-
 
 class ExecutionFailure(Exception):
     def __init__(self, code: str, message: str) -> None:
@@ -57,42 +57,6 @@ def serialize_cell(value: object, type_oid: int) -> JsonCell:
         "unsupported_result_type",
         "The query returned a result type that is not supported.",
     )
-
-
-def build_result_snapshot(
-    columns: tuple[QueryColumn, ...],
-    rows: Iterable[tuple[JsonCell, ...]],
-    max_rows: int = RESULT_MAX_ROWS,
-) -> QueryResult:
-    if max_rows <= 0:
-        raise ValueError("max_rows must be positive")
-    row_limit = min(max_rows, RESULT_MAX_ROWS)
-    columns_bytes = json.dumps(
-        [{"name": column.name, "type": column.type} for column in columns],
-        ensure_ascii=False,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    snapshot_size = len(b'{"columns":') + len(columns_bytes) + len(b',"rows":[]}')
-    if snapshot_size > RESULT_MAX_BYTES:
-        raise ExecutionFailure("result_too_large", "The query result is too large to store.")
-
-    retained_rows: list[tuple[JsonCell, ...]] = []
-    for row in rows:
-        row_size = len(
-            json.dumps(row, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        )
-        if row_size > RESULT_MAX_BYTES:
-            raise ExecutionFailure("result_too_large", "The query result is too large to store.")
-        if len(retained_rows) == row_limit:
-            return QueryResult(columns=columns, rows=tuple(retained_rows), truncated=True)
-        candidate_size = snapshot_size + row_size + (1 if retained_rows else 0)
-        if candidate_size > RESULT_MAX_BYTES:
-            if not retained_rows:
-                raise ExecutionFailure("result_too_large", "The query result is too large to store.")
-            return QueryResult(columns=columns, rows=tuple(retained_rows), truncated=True)
-        retained_rows.append(row)
-        snapshot_size = candidate_size
-    return QueryResult(columns=columns, rows=tuple(retained_rows), truncated=False)
 
 
 class PostgresQueryExecutor:
@@ -136,7 +100,10 @@ class PostgresQueryExecutor:
                                     for index, value in enumerate(row)
                                 )
 
-                        return build_result_snapshot(columns, serialized_rows(), max_rows=max_rows)
+                        try:
+                            return build_result_snapshot(columns, serialized_rows(), max_rows=max_rows)
+                        except ResultSnapshotTooLarge as exc:
+                            raise ExecutionFailure(exc.code, RESULT_TOO_LARGE_MESSAGE) from exc
         except ExecutionFailure:
             raise
         except psycopg.Error as exc:

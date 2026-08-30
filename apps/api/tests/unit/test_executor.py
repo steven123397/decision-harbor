@@ -8,10 +8,14 @@ import psycopg
 from decisionharbor.domain import QueryColumn, QueryResult
 from decisionharbor.executor import (
     ExecutionFailure,
-    RESULT_MAX_BYTES,
-    build_result_snapshot,
     map_database_error,
     serialize_cell,
+)
+from decisionharbor.result_snapshot import (
+    RESULT_MAX_BYTES,
+    ResultSnapshotTooLarge,
+    build_result_snapshot,
+    encode_result_snapshot,
 )
 
 
@@ -85,6 +89,19 @@ def test_result_snapshot_keeps_the_first_500_rows_in_order() -> None:
     )
 
 
+def test_result_snapshot_uses_one_canonical_compact_json_encoding() -> None:
+    result = QueryResult(
+        columns=(QueryColumn(name="列", type="text"),),
+        rows=(("值",),),
+        truncated=False,
+    )
+
+    encoded = encode_result_snapshot(result)
+
+    assert encoded.columns_json == '[{"name":"列","type":"text"}]'
+    assert encoded.rows_json == '[["值"]]'
+
+
 def test_result_snapshot_accepts_exactly_500_rows_without_truncation() -> None:
     columns = (QueryColumn(name="position", type="integer"),)
 
@@ -110,7 +127,7 @@ def test_result_snapshot_rejects_a_first_row_one_byte_over_the_limit() -> None:
     columns = (QueryColumn(name="value", type="text"),)
     value = single_text_value_for_snapshot_size(RESULT_MAX_BYTES + 1)
 
-    with pytest.raises(ExecutionFailure) as caught:
+    with pytest.raises(ResultSnapshotTooLarge) as caught:
         build_result_snapshot(columns, ((value,),))
 
     assert caught.value.code == "result_too_large"
@@ -128,7 +145,7 @@ def test_result_snapshot_keeps_the_longest_prefix_on_cumulative_byte_overflow() 
 def test_result_snapshot_rejects_oversized_columns_without_rows() -> None:
     columns = (QueryColumn(name="x" * RESULT_MAX_BYTES, type="text"),)
 
-    with pytest.raises(ExecutionFailure) as caught:
+    with pytest.raises(ResultSnapshotTooLarge) as caught:
         build_result_snapshot(columns, ())
 
     assert caught.value.code == "result_too_large"
@@ -137,7 +154,7 @@ def test_result_snapshot_rejects_oversized_columns_without_rows() -> None:
 def test_result_snapshot_rejects_an_oversized_later_row_instead_of_publishing_a_prefix() -> None:
     columns = (QueryColumn(name="value", type="text"),)
 
-    with pytest.raises(ExecutionFailure) as caught:
+    with pytest.raises(ResultSnapshotTooLarge) as caught:
         build_result_snapshot(columns, (("kept",), ("x" * (RESULT_MAX_BYTES + 1),)))
 
     assert caught.value.code == "result_too_large"

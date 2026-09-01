@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from threading import Event
 from time import monotonic
@@ -7,7 +8,8 @@ import pytest
 
 import decisionharbor.api as api_module
 from decisionharbor.api import create_app
-from decisionharbor.domain import QueryRun, ResultSnapshot
+from decisionharbor.domain import HistoryCursor, HistoryPage, QueryRun, ResultSnapshot
+from decisionharbor.pagination import encode_cursor
 from decisionharbor.service import ServiceFailure
 
 
@@ -105,10 +107,15 @@ class FakeRepository:
         fail_get: bool = False,
         run: QueryRun | None = None,
         snapshot: ResultSnapshot | None = None,
+        history_page: HistoryPage | None = None,
+        fail_history: bool = False,
     ) -> None:
         self.fail_get = fail_get
         self.run = run if run is not None else make_run()
         self.snapshot = snapshot
+        self.history_page = history_page
+        self.fail_history = fail_history
+        self.history_calls: list[tuple[int, HistoryCursor | None]] = []
 
     def get(self, run_id: str) -> QueryRun | None:
         if self.fail_get:
@@ -119,6 +126,14 @@ class FakeRepository:
         if self.fail_get:
             raise RuntimeError("database DSN must not escape")
         return self.snapshot if run_id == RUN_ID else None
+
+    def list_history(self, limit: int, cursor: HistoryCursor | None = None) -> HistoryPage:
+        self.history_calls.append((limit, cursor))
+        if self.fail_history:
+            raise RuntimeError("database DSN must not escape")
+        if self.history_page is not None:
+            return self.history_page
+        return HistoryPage(runs=(), next_cursor=None)
 
 
 def client(
@@ -570,3 +585,112 @@ def test_invalid_idempotency_keys_are_rejected_before_the_retry_call() -> None:
             assert response.json()["error"]["code"] == "invalid_idempotency_key", key
             assert response.json()["data"] is None, key
             assert service.retried == [], key
+
+
+def make_history_page(
+    count: int,
+    *,
+    next_cursor: HistoryCursor | None,
+    created_at: datetime | None = None,
+) -> HistoryPage:
+    now = created_at if created_at is not None else datetime.now(timezone.utc)
+    runs = tuple(
+        replace(
+            make_run("queued"),
+            id=RUN_ID,
+            created_at=now,
+        )
+        for _ in range(count)
+    )
+    return HistoryPage(runs=runs, next_cursor=next_cursor)
+
+
+def test_list_history_returns_the_page_and_the_opaque_next_cursor() -> None:
+    next_cursor = HistoryCursor(created_at=datetime.now(timezone.utc), id=RUN_ID)
+    repository = FakeRepository(history_page=make_history_page(2, next_cursor=next_cursor))
+    with client(repository=repository) as test_client:
+        response = test_client.get("/api/v1/query-runs")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert set(payload) == {"data", "error"}
+    assert payload["error"] is None
+    assert [run["id"] for run in payload["data"]["query_runs"]] == [RUN_ID, RUN_ID]
+    assert payload["data"]["next_cursor"] == encode_cursor(next_cursor)
+    assert repository.history_calls == [(20, None)]
+
+
+def test_list_history_without_a_next_page_omits_the_cursor() -> None:
+    repository = FakeRepository(history_page=make_history_page(2, next_cursor=None))
+    with client(repository=repository) as test_client:
+        response = test_client.get("/api/v1/query-runs")
+
+    assert response.status_code == 200
+    assert response.json()["data"]["next_cursor"] is None
+
+
+def test_list_history_forwards_limit_and_cursor_to_the_repository() -> None:
+    next_cursor = HistoryCursor(created_at=datetime.now(timezone.utc), id=SOURCE_ID)
+    repository = FakeRepository(
+        history_page=make_history_page(1, next_cursor=next_cursor),
+    )
+    with client(repository=repository) as test_client:
+        response = test_client.get(
+            "/api/v1/query-runs",
+            params={"limit": 5, "cursor": encode_cursor(next_cursor)},
+        )
+
+    assert response.status_code == 200
+    assert repository.history_calls == [(5, next_cursor)]
+
+
+def test_list_history_invalid_limit_is_422_invalid_pagination() -> None:
+    repository = FakeRepository()
+    with client(repository=repository) as test_client:
+        for raw in ("0", "-1", "101", "", "abc", "1.5", " 5", "+5"):
+            response = test_client.get("/api/v1/query-runs", params={"limit": raw})
+
+            assert response.status_code == 422, raw
+            assert response.json()["error"]["code"] == "invalid_pagination", raw
+            assert response.json()["data"] is None, raw
+    # 非法参数不触碰审计存储。
+    assert repository.history_calls == []
+
+
+def test_list_history_invalid_cursor_is_422_invalid_pagination() -> None:
+    repository = FakeRepository()
+    with client(repository=repository) as test_client:
+        for raw in ("", "not-a-cursor", "!!!!!", "eyJ2IjoyfQ"):
+            response = test_client.get("/api/v1/query-runs", params={"cursor": raw})
+
+            assert response.status_code == 422, raw
+            assert response.json()["error"]["code"] == "invalid_pagination", raw
+            assert response.json()["data"] is None, raw
+    assert repository.history_calls == []
+
+
+def test_list_history_limit_boundaries_are_accepted() -> None:
+    repository = FakeRepository()
+    with client(repository=repository) as test_client:
+        for raw in ("1", "100"):
+            response = test_client.get("/api/v1/query-runs", params={"limit": raw})
+
+            assert response.status_code == 200, raw
+
+    assert [call[0] for call in repository.history_calls] == [1, 100]
+
+
+def test_list_history_maps_audit_store_failure_to_a_safe_envelope() -> None:
+    repository = FakeRepository(fail_history=True)
+    with client(repository=repository) as test_client:
+        response = test_client.get("/api/v1/query-runs")
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "data": None,
+        "error": {
+            "code": "audit_unavailable",
+            "message": "The audit store is unavailable.",
+        },
+    }
+    assert "DSN" not in response.text

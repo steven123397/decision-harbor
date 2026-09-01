@@ -35,6 +35,26 @@ class IdempotencyRecord:
 
 
 @dataclass(frozen=True)
+class HistoryCursor:
+    """历史分页的键集位置：页面末条记录的 (created_at, id)。"""
+
+    created_at: datetime
+    id: str
+
+    @classmethod
+    def from_run(cls, run: "QueryRun") -> "HistoryCursor":
+        return cls(created_at=run.created_at, id=run.id)
+
+
+@dataclass(frozen=True)
+class HistoryPage:
+    """一页运行历史：严格位于游标之后的连续片段与下一页位置。"""
+
+    runs: tuple["QueryRun", ...]
+    next_cursor: HistoryCursor | None
+
+
+@dataclass(frozen=True)
 class QueryRun:
     id: str
     raw_sql: str

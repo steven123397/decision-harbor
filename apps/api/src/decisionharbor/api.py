@@ -16,7 +16,8 @@ from pydantic import BaseModel, ConfigDict
 from decisionharbor.cleanup import is_expired
 from decisionharbor.config import Settings
 from decisionharbor.dataset import load_dataset
-from decisionharbor.domain import QueryRun, ResultSnapshot
+from decisionharbor.domain import HistoryCursor, HistoryPage, QueryRun, ResultSnapshot
+from decisionharbor.pagination import decode_cursor, encode_cursor, parse_limit
 from decisionharbor.policy import SqlPolicy
 from decisionharbor.readiness import AnalyticsReadinessProbe, PlatformReadinessProbe
 from decisionharbor.repository import (
@@ -39,6 +40,7 @@ RETRY_ERROR_ONLY_CODES = frozenset({"query_run_not_retryable"})
 HTTP_STATUS_BY_CODE = {
     "invalid_request": 422,
     "invalid_idempotency_key": 422,
+    "invalid_pagination": 422,
     "sql_empty": 422,
     "sql_too_large": 422,
     "sql_parse_error": 422,
@@ -85,6 +87,8 @@ class QueryRepository(Protocol):
 
     def get_result_snapshot(self, run_id: str) -> ResultSnapshot | None: ...
 
+    def list_history(self, limit: int, cursor: HistoryCursor | None = None) -> HistoryPage: ...
+
 
 def _envelope(data: object = None, error: object = None) -> dict[str, object]:
     return {"data": data, "error": error}
@@ -122,6 +126,25 @@ def _invalid_key_response(invalid_reason: str) -> JSONResponse:
     return JSONResponse(
         _envelope(error=_error("invalid_idempotency_key", invalid_reason)),
         status_code=422,
+    )
+
+
+def _invalid_pagination_response() -> JSONResponse:
+    return JSONResponse(
+        _envelope(
+            error=_error(
+                "invalid_pagination",
+                "The pagination parameters are invalid.",
+            )
+        ),
+        status_code=422,
+    )
+
+
+def _audit_unavailable_response() -> JSONResponse:
+    return JSONResponse(
+        _envelope(error=_error("audit_unavailable", "The audit store is unavailable.")),
+        status_code=503,
     )
 
 
@@ -223,15 +246,38 @@ def create_app(
             status_code=202,
         )
 
+    @app.get("/api/v1/query-runs", response_model=None)
+    def list_query_runs(request: Request):
+        # 手动解析查询参数：非法 limit 或 cursor 是 422 invalid_pagination，
+        # 而不是框架默认的 invalid_request。
+        limit = parse_limit(request.query_params.get("limit"))
+        if limit is None:
+            return _invalid_pagination_response()
+        raw_cursor = request.query_params.get("cursor")
+        cursor: HistoryCursor | None = None
+        if raw_cursor is not None:
+            cursor = decode_cursor(raw_cursor)
+            if cursor is None:
+                return _invalid_pagination_response()
+        try:
+            page = repository.list_history(limit, cursor)
+        except Exception:
+            return _audit_unavailable_response()
+        return _envelope(
+            data={
+                "query_runs": [_run_payload(run) for run in page.runs],
+                "next_cursor": encode_cursor(page.next_cursor)
+                if page.next_cursor is not None
+                else None,
+            }
+        )
+
     @app.get("/api/v1/query-runs/{run_id}", response_model=None)
     def get_query_run(run_id: UUID):
         try:
             run = repository.get(str(run_id))
         except Exception:
-            return JSONResponse(
-                _envelope(error=_error("audit_unavailable", "The audit store is unavailable.")),
-                status_code=503,
-            )
+            return _audit_unavailable_response()
         if run is None:
             return JSONResponse(
                 _envelope(error=_error("query_run_not_found", "Query run was not found.")),
@@ -245,10 +291,7 @@ def create_app(
             run = repository.get(str(run_id))
             snapshot = repository.get_result_snapshot(str(run_id)) if run is not None else None
         except Exception:
-            return JSONResponse(
-                _envelope(error=_error("audit_unavailable", "The audit store is unavailable.")),
-                status_code=503,
-            )
+            return _audit_unavailable_response()
         if run is None:
             return JSONResponse(
                 _envelope(error=_error("query_run_not_found", "Query run was not found.")),

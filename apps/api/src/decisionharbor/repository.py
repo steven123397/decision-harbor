@@ -5,7 +5,14 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine, Row
 from sqlalchemy.exc import IntegrityError
 
-from decisionharbor.domain import IdempotencyRecord, QueryRun, ResultSnapshot, finished_fields
+from decisionharbor.domain import (
+    HistoryCursor,
+    HistoryPage,
+    IdempotencyRecord,
+    QueryRun,
+    ResultSnapshot,
+    finished_fields,
+)
 
 
 class StateConflict(RuntimeError):
@@ -217,6 +224,32 @@ class QueryRunRepository:
                 {"id": run_id},
             ).one_or_none()
         return _row_to_result_snapshot(row) if row else None
+
+    def list_history(self, limit: int, cursor: HistoryCursor | None = None) -> HistoryPage:
+        """按 (created_at DESC, id DESC) 键集分页读取运行历史。
+
+        键集条件取下一页严格位于游标记录之后：同一 created_at 内以 id DESC 打破
+        平局，游标之后的新插入不会使后续页面重复或跳过游标取得时的记录。
+        """
+        parameters: dict[str, object] = {"limit": limit}
+        keyset = ""
+        if cursor is not None:
+            keyset = "WHERE (created_at, id) < (:cursor_created_at, CAST(:cursor_id AS uuid))"
+            parameters["cursor_created_at"] = cursor.created_at
+            parameters["cursor_id"] = cursor.id
+        statement = text(
+            f"""
+            SELECT * FROM query_runs
+            {keyset}
+            ORDER BY created_at DESC, id DESC
+            LIMIT :limit
+            """
+        )
+        with self._engine.connect() as connection:
+            rows = connection.execute(statement, parameters).all()
+        runs = tuple(_row_to_query_run(row) for row in rows)
+        next_cursor = HistoryCursor.from_run(runs[-1]) if len(runs) == limit else None
+        return HistoryPage(runs=runs, next_cursor=next_cursor)
 
 
 def _row_to_result_snapshot(row: Row) -> ResultSnapshot:

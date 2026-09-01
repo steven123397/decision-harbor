@@ -219,6 +219,21 @@ describe('query workbench', () => {
     expect(screen.queryByRole('table')).not.toBeInTheDocument()
   })
 
+  it('distinguishes an expired persisted result from an unavailable result', async () => {
+    const expiredApi = api(vi.fn().mockResolvedValue(queued))
+    expiredApi.getQueryResult = vi.fn().mockResolvedValue({
+      data: null,
+      error: { code: 'result_expired', message: 'Internal retention detail.' },
+    })
+    render(<App api={expiredApi} />)
+
+    await userEvent.click(await screen.findByRole('button', { name: 'Run query' }))
+
+    expect(await screen.findByText('Result expired')).toBeInTheDocument()
+    expect(screen.getByText('This result expired after the retention window. Run the query again to refresh it.')).toBeInTheDocument()
+    expect(screen.queryByRole('table')).not.toBeInTheDocument()
+  })
+
   it.each(Object.entries(knownErrorMessages))(
     'maps known API error code %s to its stable display message',
     async (code, expectedMessage) => {

@@ -22,6 +22,7 @@ def test_worker_settings_use_the_ownership_defaults(monkeypatch: pytest.MonkeyPa
     assert settings.heartbeat_ms == 3_000
     assert settings.poll_ms == 250
     assert settings.max_execution_attempts == 3
+    assert settings.cleanup_interval_ms == 60_000
 
 
 @pytest.mark.parametrize(
@@ -32,6 +33,7 @@ def test_worker_settings_use_the_ownership_defaults(monkeypatch: pytest.MonkeyPa
         ("WORKER_HEARTBEAT_MS", "0"),
         ("WORKER_POLL_MS", "0"),
         ("WORKER_MAX_EXECUTION_ATTEMPTS", "0"),
+        ("WORKER_CLEANUP_INTERVAL_MS", "0"),
         ("WORKER_LEASE_MS", "not-an-integer"),
         ("WORKER_MAX_EXECUTION_ATTEMPTS", "not-an-integer"),
     ],

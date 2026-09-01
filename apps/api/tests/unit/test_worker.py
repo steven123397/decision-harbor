@@ -215,6 +215,29 @@ class StoppingExecutor:
         raise WorkerStopping
 
 
+class FakeRetention:
+    def __init__(self, *, fail: bool = False) -> None:
+        self.calls = 0
+        self.fail = fail
+
+    def delete_expired(self) -> int:
+        self.calls += 1
+        if self.fail:
+            raise RuntimeError("platform cleanup failed")
+        return 0
+
+
+class Clock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
 def worker(
     repository: FakeRepository,
     executor,
@@ -229,6 +252,49 @@ def worker(
         heartbeat_ms=5,
         max_execution_attempts=max_execution_attempts,
     )
+
+
+def test_worker_cleans_expired_results_once_per_interval() -> None:
+    repository = FakeRepository()
+    retention = FakeRetention()
+    clock = Clock()
+    query_worker = QueryWorker(
+        repository,
+        FakeExecutor(),
+        worker_id="worker-a",
+        max_concurrency=4,
+        lease_ms=100,
+        heartbeat_ms=5,
+        retention=retention,
+        cleanup_interval_ms=1_000,
+        monotonic_clock=clock,
+    )
+
+    query_worker.process_one()
+    query_worker.process_one()
+    assert retention.calls == 1
+
+    clock.advance(1)
+    query_worker.process_one()
+    assert retention.calls == 2
+
+
+def test_cleanup_failure_does_not_block_query_processing() -> None:
+    repository = FakeRepository()
+    retention = FakeRetention(fail=True)
+    query_worker = QueryWorker(
+        repository,
+        FakeExecutor(),
+        worker_id="worker-a",
+        max_concurrency=4,
+        lease_ms=100,
+        heartbeat_ms=5,
+        retention=retention,
+    )
+
+    assert query_worker.process_one() is True
+    assert repository.run.status == "succeeded"
+    assert retention.calls == 1
 
 
 def test_worker_claims_a_queued_run_and_publishes_its_result() -> None:

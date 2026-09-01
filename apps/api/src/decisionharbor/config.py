@@ -42,6 +42,7 @@ class WorkerSettings:
     heartbeat_ms: int
     poll_ms: int
     max_execution_attempts: int
+    cleanup_interval_ms: int = 60_000
 
     @classmethod
     def from_env(cls) -> "WorkerSettings":
@@ -57,4 +58,5 @@ class WorkerSettings:
             heartbeat_ms=heartbeat_ms,
             poll_ms=_bounded_int("WORKER_POLL_MS", 250, 1, 60_000),
             max_execution_attempts=_bounded_int("WORKER_MAX_EXECUTION_ATTEMPTS", 3, 1, 16),
+            cleanup_interval_ms=_bounded_int("WORKER_CLEANUP_INTERVAL_MS", 60_000, 1, 86_400_000),
         )

@@ -1,13 +1,19 @@
 import signal
 import socket
+import logging
+from time import monotonic
 from threading import Event, Thread
-from typing import Protocol
+from typing import Callable, Protocol
 from uuid import uuid4
 
 from decisionharbor.config import WorkerSettings
 from decisionharbor.domain import ExecutionOwnership, QueryResult, QueryRun
 from decisionharbor.executor import ExecutionCancellation, ExecutionFailure, PostgresQueryExecutor
 from decisionharbor.repository import QueryRunRepository, StateConflict
+from decisionharbor.retention import ResultRetention
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class WorkerRepository(Protocol):
@@ -65,6 +71,9 @@ class QueryWorker:
         lease_ms: int,
         heartbeat_ms: int,
         max_execution_attempts: int = 3,
+        retention: ResultRetention | None = None,
+        cleanup_interval_ms: int = 60_000,
+        monotonic_clock: Callable[[], float] = monotonic,
     ) -> None:
         self._repository = repository
         self._executor = executor
@@ -73,8 +82,15 @@ class QueryWorker:
         self._lease_ms = lease_ms
         self._heartbeat_seconds = heartbeat_ms / 1_000
         self._max_execution_attempts = max_execution_attempts
+        if cleanup_interval_ms <= 0:
+            raise ValueError("cleanup_interval_ms must be positive")
+        self._retention = retention
+        self._cleanup_interval_seconds = cleanup_interval_ms / 1_000
+        self._monotonic = monotonic_clock
+        self._next_cleanup_at = 0.0
 
     def process_one(self) -> bool:
+        self._clean_expired_results()
         ownership: ExecutionOwnership | None = None
         try:
             ownership = self._repository.claim_next(
@@ -90,6 +106,25 @@ class QueryWorker:
             if ownership is not None:
                 self._repository.release_ownership(ownership)
             raise
+
+    def _clean_expired_results(self) -> None:
+        if self._retention is None:
+            return
+        now = self._monotonic()
+        if now < self._next_cleanup_at:
+            return
+        self._next_cleanup_at = now + self._cleanup_interval_seconds
+        try:
+            deleted = self._retention.delete_expired()
+        except Exception:
+            LOGGER.warning("worker %s could not clean expired result snapshots", self._worker_id)
+            return
+        if deleted:
+            LOGGER.info(
+                "worker %s removed %d expired result snapshots",
+                self._worker_id,
+                deleted,
+            )
 
     def _process_owned(self, ownership: ExecutionOwnership) -> bool:
         stop_heartbeat = Event()
@@ -170,6 +205,8 @@ def main() -> None:
         lease_ms=settings.lease_ms,
         heartbeat_ms=settings.heartbeat_ms,
         max_execution_attempts=settings.max_execution_attempts,
+        retention=ResultRetention(settings.platform_database_url),
+        cleanup_interval_ms=settings.cleanup_interval_ms,
     )
     poll_seconds = settings.poll_ms / 1_000
     try:

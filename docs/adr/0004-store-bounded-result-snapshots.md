@@ -30,6 +30,8 @@ date: 2026-08-16
 
 `apps/api/tests/unit/test_executor.py` 覆盖行数与字节数的精确边界、多字节 UTF-8、累计截断和无部分单元格失败。`apps/api/tests/integration/test_worker_repository.py` 使用真实 PostgreSQL 证明稳定前缀、失败后连接可复用、未释放 execution attempt 的发布栅栏，以及结果插入失败时成功终态和 attempt 释放整体回滚。
 
+Ticket 06 增加了以 platform 数据库 `finished_at + 24h` 和数据库 `now()` 共同判定的结果读取语义。读取、过期清理和并发竞争只操作 platform 快照，不重新执行 analytics SQL；Worker 仅获 `query_run_id` 列读取权与快照 DELETE 权，清理重复执行时保留查询运行、执行尝试和审计事实。真实 PostgreSQL 集成测试覆盖保留期边界、重复与重叠清理、并发读写和权限边界。
+
 ## Revisit when
 
 出现大结果导出、长期留存或跨运行结果共享需求时，重新评估对象存储或分层存储；在此之前不扩大 platform 快照上限来替代正式导出能力。

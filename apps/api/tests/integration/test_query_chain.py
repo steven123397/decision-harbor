@@ -8,6 +8,7 @@ import pytest
 from sqlalchemy import create_engine, text
 
 from decisionharbor.config import ApiSettings
+from support import backdate_finished_at
 
 
 pytestmark = pytest.mark.integration
@@ -217,6 +218,30 @@ def test_live_api_and_worker_complete_allowed_rejected_and_failed_runs() -> None
         assert failed["error_summary"] == "The query is not valid for this dataset."
         assert "column" not in failed["error_summary"].lower()
         assert "raw_sql" not in failed
+
+
+def test_live_result_read_uses_database_time_at_the_retention_boundary() -> None:
+    with live_client() as client:
+        accepted = client.post(
+            "/api/v1/query-runs",
+            json={"sql": "SELECT count(*) AS retained_count FROM customers"},
+        )
+        assert accepted.status_code == 202
+        run = wait_for_terminal(client, accepted.json()["data"]["query_run"]["id"])
+        assert run["status"] == "succeeded"
+
+        backdate_finished_at(ApiSettings.from_env().platform_database_url, run["id"], 23)
+        assert client.get(f"/api/v1/query-runs/{run['id']}/result").status_code == 200
+
+        backdate_finished_at(ApiSettings.from_env().platform_database_url, run["id"], 24)
+        expired = client.get(f"/api/v1/query-runs/{run['id']}/result")
+        audit = client.get(f"/api/v1/query-runs/{run['id']}")
+
+    assert expired.status_code == 410
+    assert expired.json()["error"]["code"] == "result_expired"
+    assert expired.json()["error"]["query_run_id"] == run["id"]
+    assert audit.status_code == 200
+    assert audit.json()["data"]["query_run"]["status"] == "succeeded"
 
 
 @pytest.mark.parametrize(

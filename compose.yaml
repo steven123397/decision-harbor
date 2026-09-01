@@ -64,6 +64,7 @@ services:
       WORKER_HEARTBEAT_MS: ${WORKER_HEARTBEAT_MS:-3000}
       WORKER_POLL_MS: ${WORKER_POLL_MS:-250}
       WORKER_MAX_EXECUTION_ATTEMPTS: ${WORKER_MAX_EXECUTION_ATTEMPTS:-3}
+      WORKER_CLEANUP_INTERVAL_MS: ${WORKER_CLEANUP_INTERVAL_MS:-60000}
     depends_on:
       init:
         condition: service_completed_successfully

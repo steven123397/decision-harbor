@@ -1,11 +1,18 @@
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import TypeAlias
 from uuid import uuid4
 
 
 JsonCell: TypeAlias = None | bool | int | float | str
+
+
+RESULT_RETENTION = timedelta(hours=24)
+TERMINAL_STATUSES = frozenset({"rejected", "succeeded", "failed", "cancelled"})
+RESULT_NOT_READY = "result_not_ready"
+RESULT_UNAVAILABLE = "result_unavailable"
+RESULT_EXPIRED = "result_expired"
 
 
 @dataclass(frozen=True)
@@ -19,6 +26,15 @@ class QueryResult:
     columns: tuple[QueryColumn, ...]
     rows: tuple[tuple[JsonCell, ...], ...]
     truncated: bool
+
+
+@dataclass(frozen=True)
+class StoredResult:
+    """A query run and its snapshot as observed by one platform statement."""
+
+    run: "QueryRun"
+    snapshot: QueryResult | None
+    result_expired: bool
 
 
 @dataclass(frozen=True)
@@ -81,6 +97,23 @@ class ExecutionOwnership:
     generation: int
     heartbeat_at: datetime
     lease_expires_at: datetime
+
+
+def result_read_failure(
+    run: QueryRun,
+    *,
+    has_snapshot: bool,
+    expired: bool,
+) -> str | None:
+    """Return the stable reason a run's result cannot be read."""
+
+    if run.status not in TERMINAL_STATUSES:
+        return RESULT_NOT_READY
+    if run.status == "succeeded" and expired:
+        return RESULT_EXPIRED
+    if not has_snapshot:
+        return RESULT_UNAVAILABLE
+    return None
 
 
 def finished_fields(run: QueryRun) -> dict[str, datetime | int]:

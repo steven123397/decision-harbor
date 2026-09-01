@@ -3,6 +3,7 @@ import multiprocessing
 import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from threading import Barrier
 from time import sleep
 from uuid import uuid4
 
@@ -16,8 +17,10 @@ from decisionharbor.config import ApiSettings, WorkerSettings
 from decisionharbor.domain import QueryColumn, QueryResult
 from decisionharbor.executor import ExecutionFailure, PostgresQueryExecutor
 from decisionharbor.repository import QueryRunRepository, StateConflict
+from decisionharbor.retention import ResultRetention
 from decisionharbor.result_snapshot import RESULT_MAX_BYTES
 from decisionharbor.worker import QueryWorker
+from support import backdate_finished_at
 
 
 pytestmark = pytest.mark.integration
@@ -820,11 +823,11 @@ def test_heartbeat_extends_current_ownership_and_prevents_takeover(
     api_repository = QueryRunRepository(api_database_url)
     worker_repository = QueryRunRepository(worker_database_url)
     queued_run(api_repository, "heartbeat")
-    claim = worker_repository.claim_next("worker-a", max_concurrency=4, lease_ms=50)
+    claim = worker_repository.claim_next("worker-a", max_concurrency=4, lease_ms=500)
     assert claim is not None
     sleep(0.03)
 
-    renewed = worker_repository.renew_lease(claim, lease_ms=100)
+    renewed = worker_repository.renew_lease(claim, lease_ms=1_000)
     sleep(0.04)
 
     assert renewed is not None
@@ -930,3 +933,120 @@ def test_two_query_workers_observe_one_current_owner_at_the_global_limit(
             assert sorted(future.result() for future in futures) == [False, True]
         finally:
             engine.dispose()
+
+
+def _succeeded_snapshot(
+    api_repository: QueryRunRepository,
+    worker_repository: QueryRunRepository,
+    suffix: str,
+) -> str:
+    run = queued_run(api_repository, suffix)
+    ownership = worker_repository.claim_next("retention-worker", max_concurrency=4, lease_ms=15_000)
+    assert ownership is not None
+    worker_repository.publish_success(
+        ownership,
+        QueryResult(
+            columns=(QueryColumn(name="value", type="bigint"),),
+            rows=(("100",),),
+            truncated=False,
+        ),
+    )
+    return run.id
+
+
+def test_expired_snapshot_is_unreadable_but_audit_facts_survive(ownership_database_urls) -> None:
+    api_database_url, worker_database_url = ownership_database_urls
+    api_repository = QueryRunRepository(api_database_url)
+    worker_repository = QueryRunRepository(worker_database_url)
+    run_id = _succeeded_snapshot(api_repository, worker_repository, "retention-expired")
+    backdate_finished_at(worker_database_url, run_id, 25)
+
+    before = api_repository.get(run_id)
+    state = api_repository.get_result_state(run_id)
+    assert before is not None
+    assert state is not None
+    assert state.result_expired is True
+    assert state.snapshot is None
+
+    assert ResultRetention(worker_database_url).delete_expired() == 1
+
+    after = api_repository.get(run_id)
+    assert after is not None
+    assert after.status == "succeeded"
+    assert after.finished_at == before.finished_at
+    assert after.returned_row_count == 1
+    assert api_repository.get_result(run_id) is None
+    engine = create_engine(api_database_url)
+    try:
+        with engine.connect() as connection:
+            attempt_count = connection.execute(
+                text(
+                    "SELECT count(*) FROM query_execution_attempts "
+                    "WHERE query_run_id = CAST(:run_id AS uuid)"
+                ),
+                {"run_id": run_id},
+            ).scalar_one()
+    finally:
+        engine.dispose()
+    assert attempt_count == 1
+
+
+def test_cleanup_keeps_retained_results_and_is_idempotent(ownership_database_urls) -> None:
+    api_database_url, worker_database_url = ownership_database_urls
+    api_repository = QueryRunRepository(api_database_url)
+    worker_repository = QueryRunRepository(worker_database_url)
+    expired_id = _succeeded_snapshot(api_repository, worker_repository, "retention-idempotent-expired")
+    retained_id = _succeeded_snapshot(api_repository, worker_repository, "retention-idempotent-retained")
+    backdate_finished_at(worker_database_url, expired_id, 25)
+    backdate_finished_at(worker_database_url, retained_id, 23)
+
+    cleaner = ResultRetention(worker_database_url)
+    assert cleaner.delete_expired() == 1
+    assert cleaner.delete_expired() == 0
+    assert api_repository.get_result(expired_id) is None
+    assert api_repository.get_result(retained_id) is not None
+
+
+def test_overlapping_cleanups_delete_an_expired_snapshot_at_most_once(ownership_database_urls) -> None:
+    api_database_url, worker_database_url = ownership_database_urls
+    api_repository = QueryRunRepository(api_database_url)
+    worker_repository = QueryRunRepository(worker_database_url)
+    run_id = _succeeded_snapshot(api_repository, worker_repository, "retention-overlap")
+    backdate_finished_at(worker_database_url, run_id, 25)
+    cleaners = [ResultRetention(worker_database_url) for _ in range(2)]
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        deleted = list(executor.map(lambda cleaner: cleaner.delete_expired(), cleaners))
+
+    assert sum(deleted) <= 1
+    assert api_repository.get(run_id) is not None
+    assert api_repository.get_result(run_id) is None
+
+
+def test_concurrent_read_and_cleanup_never_returns_expired_content(ownership_database_urls) -> None:
+    api_database_url, worker_database_url = ownership_database_urls
+    api_repository = QueryRunRepository(api_database_url)
+    worker_repository = QueryRunRepository(worker_database_url)
+    run_id = _succeeded_snapshot(api_repository, worker_repository, "retention-read-race")
+    backdate_finished_at(worker_database_url, run_id, 25)
+    start = Barrier(2)
+
+    def read_state():
+        start.wait()
+        return api_repository.get_result_state(run_id)
+
+    def clean() -> int:
+        start.wait()
+        return ResultRetention(worker_database_url).delete_expired()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        read = executor.submit(read_state)
+        deleted = executor.submit(clean)
+        state = read.result()
+        deleted_count = deleted.result()
+
+    assert state is not None
+    assert state.result_expired is True
+    assert state.snapshot is None
+    assert deleted_count in {0, 1}
+    assert api_repository.get_result(run_id) is None

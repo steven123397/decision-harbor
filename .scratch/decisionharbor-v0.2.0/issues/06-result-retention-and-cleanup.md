@@ -4,7 +4,7 @@
 
 **Blocked by:** 04 — 原子发布精确受限的结果快照
 
-**Status:** ready-for-agent
+**Status:** claimed
 
 - [ ] 结果保留期以数据库记录的 `finished_at + 24h` 为准；保留期内读取成功快照返回 HTTP 200，边界到达后返回 HTTP 410 `result_expired`。
 - [ ] 未完成运行返回 HTTP 409 `result_not_ready`，终态但没有可读快照返回 HTTP 409 `result_unavailable`；不存在仍返回 `query_run_not_found`，各种语义互不混淆。

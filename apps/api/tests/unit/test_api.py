@@ -36,8 +36,9 @@ def terminal_run(status: str = "succeeded", code: str | None = None) -> QueryRun
 
 
 class FakeService:
-    def __init__(self, failure: ServiceFailure | None = None) -> None:
+    def __init__(self, failure: ServiceFailure | None = None, repository=None) -> None:
         self.failure = failure
+        self.repository = repository
         self.submissions: list[tuple[str, str | None]] = []
 
     def submit(self, raw_sql: str, idempotency_key: str | None = None) -> QueryRun:
@@ -53,6 +54,40 @@ class FakeService:
             result_truncated=None,
             duration_ms=None,
         )
+
+    def read_result(self, run_id: str) -> QueryResult:
+        if self.failure:
+            raise self.failure
+        if self.repository is None:
+            return QueryResult(
+                columns=(QueryColumn(name="answer", type="integer"),),
+                rows=((1,),),
+                truncated=False,
+            )
+        run = self.repository.get(run_id)
+        if run is None:
+            raise ServiceFailure("query_run_not_found", "Query run was not found.", None)
+        result = self.repository.get_result(run_id)
+        if result is not None:
+            return result
+        if run.status in {"received", "queued", "running", "cancelling"}:
+            raise ServiceFailure("result_not_ready", "The query result is not ready yet.", run)
+        raise ServiceFailure("result_unavailable", "This query run has no readable result.", run)
+
+
+class ResultService(FakeService):
+    def __init__(self, result: QueryResult | None = None, failure: ServiceFailure | None = None) -> None:
+        super().__init__(failure)
+        self.result = result or QueryResult(
+            columns=(QueryColumn(name="answer", type="integer"),),
+            rows=((1,),),
+            truncated=False,
+        )
+
+    def read_result(self, run_id: str) -> QueryResult:
+        if self.failure:
+            raise self.failure
+        return self.result
 
 
 class FakeRepository:
@@ -82,9 +117,10 @@ def client(
     ready: bool = True,
     repository: FakeRepository | None = None,
 ) -> TestClient:
+    selected_repository = repository or FakeRepository()
     app = create_app(
-        service=service or FakeService(),
-        repository=repository or FakeRepository(),
+        service=service or FakeService(repository=selected_repository),
+        repository=selected_repository,
         readiness_check=lambda: ready,
     )
     return TestClient(app)
@@ -290,6 +326,23 @@ def test_get_result_reports_that_a_failed_run_has_no_snapshot() -> None:
 
     assert response.status_code == 409
     assert response.json()["error"]["code"] == "result_unavailable"
+
+
+def test_service_result_read_maps_expiry_to_http_410_and_preserves_run_facts() -> None:
+    run = terminal_run("succeeded")
+    failure = ServiceFailure("result_expired", "The query result has expired.", run)
+    with client(service=ResultService(failure=failure)) as test_client:
+        response = test_client.get(
+            "/api/v1/query-runs/75e24c21-416c-4bd8-a37d-68667f4ec753/result"
+        )
+
+    assert response.status_code == 410
+    assert response.json()["error"] == {
+        "code": "result_expired",
+        "message": "The query result has expired.",
+        "query_run_id": run.id,
+    }
+    assert response.json()["data"]["query_run"]["status"] == "succeeded"
 
 
 def test_get_maps_audit_store_failure_to_safe_envelope() -> None:

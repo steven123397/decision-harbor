@@ -50,6 +50,7 @@ const ERROR_MESSAGES: Record<string, string> = {
   execution_attempts_exhausted: 'Automatic execution attempts were exhausted.',
   result_not_ready: 'The query result is not ready yet.',
   result_unavailable: 'This query run has no readable result.',
+  result_expired: 'This result expired after the retention window. Run the query again to refresh it.',
 }
 
 type ViewState =
@@ -251,11 +252,12 @@ function CompletedState({ response }: { response: QueryResponse }) {
   const run = response.data?.query_run
   if (run?.status === 'succeeded') {
     if (response.data?.result) return <SuccessState run={run} result={response.data.result} />
+    const resultCode = response.error?.code ?? 'result_unavailable'
     return (
       <ErrorState
         kind="failed"
-        title="Result unavailable"
-        code={response.error?.code ?? 'result_unavailable'}
+        title={resultTitle(resultCode)}
+        code={resultCode}
         message={safeMessage(response)}
         run={run}
       />
@@ -281,6 +283,12 @@ function CompletedState({ response }: { response: QueryResponse }) {
       run={run}
     />
   )
+}
+
+function resultTitle(code: string): string {
+  if (code === 'result_expired') return 'Result expired'
+  if (code === 'result_not_ready') return 'Result not ready'
+  return 'Result unavailable'
 }
 
 function SuccessState({ run, result }: { run: QueryRun; result: NonNullable<QueryResponse['data']>['result'] }) {

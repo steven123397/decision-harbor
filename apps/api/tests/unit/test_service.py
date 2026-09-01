@@ -2,7 +2,7 @@ from dataclasses import replace
 
 import pytest
 
-from decisionharbor.domain import QueryRun, QueryRunCreation
+from decisionharbor.domain import QueryColumn, QueryResult, QueryRun, QueryRunCreation, StoredResult
 from decisionharbor.policy import PolicyDecision
 from decisionharbor.service import QueryRunService, ServiceFailure
 
@@ -48,6 +48,15 @@ class FakeRepository:
 
     def get(self, run_id: str) -> QueryRun | None:
         return self.run if run_id == self.run.id else None
+
+
+class ResultRepository(FakeRepository):
+    def __init__(self, stored: StoredResult | None) -> None:
+        super().__init__([])
+        self.stored = stored
+
+    def get_result_state(self, run_id: str) -> StoredResult | None:
+        return self.stored if self.stored is None or run_id == self.stored.run.id else None
 
 
 def build_service(
@@ -111,3 +120,62 @@ def test_allowed_submission_is_queued_without_executing() -> None:
     assert run.policy_decision == "allowed"
     assert run.referenced_objects == ("analytics.customers",)
     assert events == ["create", "transition:queued"]
+
+
+def test_result_read_returns_the_retained_snapshot() -> None:
+    snapshot = QueryResult(
+        columns=(QueryColumn(name="answer", type="integer"),),
+        rows=((1,),),
+        truncated=False,
+    )
+    repository = ResultRepository(None)
+    succeeded = replace(
+        repository.run,
+        status="succeeded",
+        policy_decision="allowed",
+        started_at=repository.run.created_at,
+        finished_at=repository.run.created_at,
+        returned_row_count=1,
+        result_truncated=False,
+        duration_ms=0,
+    )
+    repository.stored = StoredResult(
+        run=succeeded,
+        snapshot=snapshot,
+        result_expired=False,
+    )
+    service = build_service(
+        repository,
+        PolicyDecision(True, None, None, ("analytics.customers",)),
+    )
+
+    assert service.read_result(succeeded.id) == snapshot
+
+
+def test_result_read_reports_a_cleaned_succeeded_snapshot_as_expired() -> None:
+    repository = ResultRepository(None)
+    succeeded = replace(
+        repository.run,
+        status="succeeded",
+        policy_decision="allowed",
+        started_at=repository.run.created_at,
+        finished_at=repository.run.created_at,
+        returned_row_count=1,
+        result_truncated=False,
+        duration_ms=0,
+    )
+    repository.stored = StoredResult(
+        run=succeeded,
+        snapshot=None,
+        result_expired=True,
+    )
+    service = build_service(
+        repository,
+        PolicyDecision(True, None, None, ("analytics.customers",)),
+    )
+
+    with pytest.raises(ServiceFailure) as caught:
+        service.read_result(succeeded.id)
+
+    assert caught.value.code == "result_expired"
+    assert caught.value.query_run == succeeded

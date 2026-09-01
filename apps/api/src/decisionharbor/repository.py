@@ -3,8 +3,17 @@ import json
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine, Row
 
-from decisionharbor.domain import ExecutionOwnership, QueryColumn, QueryResult, QueryRun, QueryRunCreation
+from decisionharbor.domain import (
+    RESULT_RETENTION,
+    ExecutionOwnership,
+    QueryColumn,
+    QueryResult,
+    QueryRun,
+    QueryRunCreation,
+    StoredResult,
+)
 from decisionharbor.result_snapshot import encode_result_snapshot
+from decisionharbor.retention import RETENTION_PREDICATE_SQL
 
 
 class StateConflict(RuntimeError):
@@ -46,6 +55,22 @@ WHERE query_run_id = CAST(:id AS uuid)
   AND worker_id = :worker_id
   AND released_at IS NULL
 """
+
+SELECT_RUN_WITH_RESULT = text(
+    f"""
+    SELECT run.*,
+           result.columns_json AS result_columns,
+           result.rows_json AS result_rows,
+           result.truncated AS result_truncated_snapshot,
+           COALESCE(
+               {RETENTION_PREDICATE_SQL},
+               false
+           ) AS result_expired
+    FROM query_runs AS run
+    LEFT JOIN query_results AS result ON result.query_run_id = run.id
+    WHERE run.id = CAST(:id AS uuid)
+    """
+)
 
 
 class QueryRunRepository:
@@ -515,26 +540,41 @@ class QueryRunRepository:
             )
         return _row_to_query_run(row)
 
-    def get_result(self, run_id: str) -> QueryResult | None:
+    def get_result_state(self, run_id: str) -> StoredResult | None:
+        """Read run facts and its snapshot under one database-time decision."""
+
         with self._engine.connect() as connection:
             row = connection.execute(
-                text(
-                    """
-                    SELECT columns_json, rows_json, truncated
-                    FROM query_results
-                    WHERE query_run_id = CAST(:id AS uuid)
-                    """
-                ),
-                {"id": run_id},
+                SELECT_RUN_WITH_RESULT,
+                {"id": run_id, "retention_seconds": RESULT_RETENTION.total_seconds()},
             ).one_or_none()
         if row is None:
             return None
         values = row._mapping
-        return QueryResult(
-            columns=tuple(QueryColumn(name=column["name"], type=column["type"]) for column in values["columns_json"]),
-            rows=tuple(tuple(cell for cell in result_row) for result_row in values["rows_json"]),
-            truncated=values["truncated"],
+        expired = bool(values["result_expired"])
+        return StoredResult(
+            run=_row_to_query_run(row),
+            snapshot=None if expired else _snapshot_from_row(row),
+            result_expired=expired,
         )
+
+    def get_result(self, run_id: str) -> QueryResult | None:
+        """Return a retained snapshot for callers using the legacy read API."""
+
+        state = self.get_result_state(run_id)
+        return state.snapshot if state is not None else None
+
+
+def _snapshot_from_row(row: Row) -> QueryResult | None:
+    values = row._mapping
+    columns = values["result_columns"]
+    if columns is None:
+        return None
+    return QueryResult(
+        columns=tuple(QueryColumn(name=column["name"], type=column["type"]) for column in columns),
+        rows=tuple(tuple(cell for cell in result_row) for result_row in values["result_rows"]),
+        truncated=bool(values["result_truncated_snapshot"]),
+    )
 
 
 def _row_to_query_run(row: Row) -> QueryRun:

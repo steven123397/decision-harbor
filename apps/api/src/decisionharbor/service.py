@@ -1,6 +1,16 @@
 from typing import Protocol
 
-from decisionharbor.domain import QueryRun, QueryRunCreation, finished_fields
+from decisionharbor.domain import (
+    RESULT_EXPIRED,
+    RESULT_NOT_READY,
+    RESULT_UNAVAILABLE,
+    QueryResult,
+    QueryRun,
+    QueryRunCreation,
+    StoredResult,
+    finished_fields,
+    result_read_failure,
+)
 from decisionharbor.policy import PolicyDecision
 
 
@@ -26,6 +36,8 @@ class Repository(Protocol):
     ) -> QueryRun: ...
 
     def get(self, run_id: str) -> QueryRun | None: ...
+
+    def get_result_state(self, run_id: str) -> StoredResult | None: ...
 
 
 class ServiceFailure(Exception):
@@ -119,6 +131,35 @@ class QueryRunService:
                 replay_on_conflict=idempotency_key is not None,
             )
         )
+
+    def read_result(self, run_id: str) -> QueryResult:
+        """Read a retained snapshot without re-executing the query."""
+
+        try:
+            stored = self._repository.get_result_state(run_id)
+        except Exception as exc:
+            raise ServiceFailure(
+                "audit_unavailable",
+                "The audit store is unavailable.",
+                None,
+            ) from exc
+        if stored is None:
+            raise ServiceFailure("query_run_not_found", "Query run was not found.", None)
+
+        failure = result_read_failure(
+            stored.run,
+            has_snapshot=stored.snapshot is not None,
+            expired=stored.result_expired,
+        )
+        if failure is not None:
+            messages = {
+                RESULT_NOT_READY: "The query result is not ready yet.",
+                RESULT_UNAVAILABLE: "This query run has no readable result.",
+                RESULT_EXPIRED: "The query result has expired.",
+            }
+            raise ServiceFailure(failure, messages[failure], stored.run)
+        assert stored.snapshot is not None
+        return stored.snapshot
 
     def _replay(self, run: QueryRun) -> QueryRun:
         if run.status == "rejected":

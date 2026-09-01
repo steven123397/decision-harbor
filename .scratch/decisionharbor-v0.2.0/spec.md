@@ -1,6 +1,6 @@
 # DecisionHarbor v0.2.0：可恢复的异步查询运行
 
-**Status:** ready-for-agent
+**Status:** resolved
 
 ## Problem Statement
 

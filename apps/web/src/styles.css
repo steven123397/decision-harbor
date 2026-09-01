@@ -69,17 +69,50 @@ tbody tr:last-child td { border-bottom: 0; }
 tbody tr:hover { background: #fafbf8; }
 .null-value { color: #8a918d; font: italic 11px ui-monospace, SFMono-Regular, Menlo, monospace; }
 
+.history-panel { margin-top: 30px; border-top: 1px solid #d7dad4; padding-top: 20px; }
+.history-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+.history-head h2 { margin: 0; font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; color: #69716c; }
+.history-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.history-row { width: 100%; display: flex; align-items: center; gap: 12px; padding: 10px 12px; border: 1px solid #d5d9d3; border-radius: 5px; background: #fff; cursor: pointer; text-align: left; font-size: 13px; color: #373e3a; }
+.history-row:hover { border-color: #9caaa3; }
+.status-chip { flex: none; padding: 3px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; background: #eef0ec; color: #59615d; }
+.chip-succeeded { background: #e7f4ec; color: #237248; }
+.chip-failed { background: #fbeeea; color: #a43e2b; }
+.chip-rejected { background: #fff3e4; color: #9a581c; }
+.chip-cancelled { background: #ededf0; color: #555e58; }
+.chip-queued, .chip-running, .chip-cancelling { background: #e4f1f0; color: #126f67; }
+.history-meta { flex: 1; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; min-width: 0; color: #68716c; font-size: 12px; }
+.history-error { color: #a43e2b; font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
+.history-id { flex: none; color: #7a827d; font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
+.history-empty { margin: 0; color: #7b827e; font-size: 13px; }
+.load-more-button { margin-top: 12px; min-height: 32px; padding: 0 12px; border: 1px solid #cfd3cd; border-radius: 5px; background: #fff; color: #4e5752; font-weight: 650; cursor: pointer; }
+.load-more-button:hover:not(:disabled) { border-color: #9caaa3; color: #126f67; }
+.load-more-button:disabled { cursor: default; opacity: 0.6; }
+
 .error-state { border-left: 3px solid; padding: 16px 18px; background: #fff; }
 .error-rejected { border-color: #b56c22; }
 .error-failed { border-color: #b34b35; }
 .error-cancelled { border-color: #6b7280; }
+.error-expired { border-color: #b56c22; }
+.error-unavailable { border-color: #6b7280; }
 .error-heading { display: flex; align-items: flex-start; gap: 10px; }
-.error-rejected .error-heading { color: #9a581c; }
+.error-rejected .error-heading, .error-expired .error-heading { color: #9a581c; }
 .error-failed .error-heading { color: #a43e2b; }
-.error-cancelled .error-heading { color: #555e58; }
+.error-cancelled .error-heading, .error-unavailable .error-heading { color: #555e58; }
 .error-heading div { display: grid; gap: 5px; }
 .error-heading code { color: #626a65; font-size: 11px; }
 .error-state p { margin: 12px 0 18px 32px; color: #555e58; font-size: 14px; }
+.next-step { font-size: 13px; }
+.poll-note { margin: 10px 0 0; color: #68716c; font-size: 13px; }
+.run-actions { display: flex; gap: 10px; margin-top: 16px; flex-wrap: wrap; }
+.cancel-button, .retry-button { min-height: 34px; border-radius: 5px; padding: 0 14px; display: inline-flex; align-items: center; justify-content: center; gap: 7px; font-weight: 700; cursor: pointer; }
+.cancel-button { border: 1px solid #b34b35; color: #a43e2b; background: #fff; }
+.cancel-button:hover:not(:disabled) { background: #fbf1ef; }
+.cancel-button:disabled { cursor: not-allowed; opacity: 0.55; }
+.retry-button { border: 1px solid #0d5d56; color: #fff; background: #126f67; }
+.retry-button:hover:not(:disabled) { background: #0d5d56; }
+.retry-button:disabled { cursor: not-allowed; opacity: 0.55; }
+.action-error { margin: 12px 0 0; color: #a43e2b; font-size: 13px; font-weight: 600; }
 .spin { animation: spin 0.85s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .spin { animation: none; } }
@@ -94,4 +127,8 @@ tbody tr:hover { background: #fafbf8; }
   .audit-facts { gap: 14px; }
   .audit-facts div:first-child { width: 100%; }
   .truncated-notice { align-items: flex-start; flex-wrap: wrap; }
+  .run-actions { flex-direction: column; align-items: stretch; }
+  .history-row { flex-wrap: wrap; row-gap: 6px; }
+  .history-meta { flex-basis: 100%; order: 3; }
+  .history-id { margin-left: auto; }
 }

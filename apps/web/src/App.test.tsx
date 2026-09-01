@@ -3,20 +3,32 @@ import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { App, type ApiClient } from './App'
-import type { QueryRun, QueryResponse, ResultResponse } from './api'
+import type { HistoryResponse, QueryRun, QueryResponse, ResultResponse } from './api'
 
 
 const RUN_ID = '75e24c21-416c-4bd8-a37d-68667f4ec753'
+const NEW_RUN_ID = 'a1b2c3d4-416c-4bd8-a37d-68667f4ec753'
+const CREATED_AT = '2026-09-01T10:00:00+00:00'
 
 function runOf(status: QueryRun['status'], overrides: Partial<QueryRun> = {}): QueryRun {
   return {
     id: RUN_ID,
+    raw_sql: 'SELECT 1',
     status,
+    policy_decision: 'allowed',
+    policy_version: '1.0.0',
+    referenced_objects: ['analytics.customers'],
+    statement_timeout_ms: 5000,
+    max_rows: 500,
     returned_row_count: null,
     result_truncated: null,
-    duration_ms: null,
     error_code: null,
     error_summary: null,
+    created_at: CREATED_AT,
+    started_at: null,
+    finished_at: null,
+    duration_ms: null,
+    retry_of: null,
     ...overrides,
   }
 }
@@ -68,9 +80,11 @@ const knownErrorMessages = {
   result_too_large: 'The query result exceeds the supported size limit.',
   result_not_ready: 'The query result is not ready yet.',
   result_unavailable: 'The query result is not available for this run.',
+  result_expired: 'The query result has expired.',
   query_run_not_found: 'The query run was not found.',
 } as const
 
+const emptyHistory: HistoryResponse = { data: { query_runs: [], next_cursor: null }, error: null }
 
 function api(overrides: Partial<ApiClient> = {}): ApiClient {
   return {
@@ -78,6 +92,9 @@ function api(overrides: Partial<ApiClient> = {}): ApiClient {
     submitQuery: vi.fn().mockResolvedValue(queued),
     getQueryRun: vi.fn().mockResolvedValue({ data: { query_run: succeededRun }, error: null }),
     getQueryResult: vi.fn().mockResolvedValue(result),
+    cancelRun: vi.fn().mockResolvedValue({ data: { query_run: runOf('cancelled') }, error: null }),
+    retryRun: vi.fn().mockResolvedValue({ data: { query_run: runOf('queued', { id: NEW_RUN_ID }) }, error: null }),
+    listHistory: vi.fn().mockResolvedValue(emptyHistory),
     ...overrides,
   }
 }
@@ -256,5 +273,340 @@ describe('query workbench', () => {
 
     expect(await screen.findByText('Ready')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Run query' })).toBeEnabled()
+  })
+})
+
+describe('cancellation', () => {
+  beforeEach(() => {
+    sessionStorage.clear()
+  })
+
+  it('offers cancel while the run is queued or running and settles immediately when cancel wins', async () => {
+    let resolveFirstGet: (response: QueryResponse) => void = () => undefined
+    const pendingFirstGet = new Promise<QueryResponse>((resolve) => {
+      resolveFirstGet = resolve
+    })
+    const getQueryRun = vi
+      .fn()
+      .mockReturnValueOnce(pendingFirstGet)
+      .mockResolvedValue({ data: { query_run: runOf('running') }, error: null })
+    renderApp(api({ getQueryRun }))
+
+    await userEvent.click(await screen.findByRole('button', { name: 'Run query' }))
+    expect(await screen.findByText('Queued')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Cancel run' })).toBeEnabled()
+
+    await userEvent.click(screen.getByRole('button', { name: 'Cancel run' }))
+
+    expect(await screen.findByText('Query cancelled')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Retry run' })).toBeEnabled()
+    expect(sessionStorage.getItem('decisionharbor.active-run')).toBeNull()
+    resolveFirstGet({ data: { query_run: runOf('running') }, error: null })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(screen.getByText('Query cancelled')).toBeInTheDocument()
+  })
+
+  it('keeps polling while the run is cancelling and settles once it is cancelled', async () => {
+    let resolveFirstGet: (response: QueryResponse) => void = () => undefined
+    const pendingFirstGet = new Promise<QueryResponse>((resolve) => {
+      resolveFirstGet = resolve
+    })
+    const getQueryRun = vi
+      .fn()
+      .mockReturnValueOnce(pendingFirstGet)
+      .mockResolvedValueOnce({ data: { query_run: runOf('cancelling') }, error: null })
+      .mockResolvedValue({ data: { query_run: runOf('cancelled') }, error: null })
+    const cancelRun = vi.fn().mockResolvedValue({ data: { query_run: runOf('cancelling') }, error: null })
+    renderApp(api({ getQueryRun, cancelRun }))
+
+    await userEvent.click(await screen.findByRole('button', { name: 'Run query' }))
+    await userEvent.click(await screen.findByRole('button', { name: 'Cancel run' }))
+
+    const cancelling = await screen.findByText('Cancelling')
+    expect(cancelling).toBeInTheDocument()
+    // 取消中不重复提供取消按钮。
+    expect(screen.queryByRole('button', { name: 'Cancel run' })).not.toBeInTheDocument()
+    resolveFirstGet({ data: { query_run: runOf('cancelling') }, error: null })
+
+    expect(await screen.findByText('Query cancelled')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Retry run' })).toBeEnabled()
+  })
+
+  it('shows a stable action error when the run is no longer cancellable', async () => {
+    let resolveFirstGet: (response: QueryResponse) => void = () => undefined
+    const pendingFirstGet = new Promise<QueryResponse>((resolve) => {
+      resolveFirstGet = resolve
+    })
+    const getQueryRun = vi
+      .fn()
+      .mockReturnValueOnce(pendingFirstGet)
+      .mockResolvedValue({ data: { query_run: runOf('running') }, error: null })
+    const cancelRun = vi.fn().mockResolvedValue({
+      data: null,
+      error: { code: 'query_run_not_cancellable', message: 'Run is not cancellable.' },
+    })
+    renderApp(api({ getQueryRun, cancelRun }))
+
+    await userEvent.click(await screen.findByRole('button', { name: 'Run query' }))
+    await userEvent.click(await screen.findByRole('button', { name: 'Cancel run' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('This run can no longer be cancelled.')
+    resolveFirstGet({ data: { query_run: runOf('running') }, error: null })
+  })
+})
+
+describe('retry', () => {
+  beforeEach(() => {
+    sessionStorage.clear()
+  })
+
+  it.each([
+    ['failed', 'Execution failed'],
+    ['cancelled', 'Query cancelled'],
+  ] as const)('offers retry for a %s run', async (status, title) => {
+    renderApp(api({ submitQuery: vi.fn().mockResolvedValue({ data: { query_run: runOf(status) }, error: null }) }))
+
+    await userEvent.click(await screen.findByRole('button', { name: 'Run query' }))
+
+    expect(await screen.findByText(title)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Retry run' })).toBeEnabled()
+    expect(screen.queryByRole('button', { name: 'Cancel run' })).not.toBeInTheDocument()
+  })
+
+  it.each([
+    ['succeeded', 'Query succeeded'],
+    ['rejected', 'Query rejected'],
+  ] as const)('offers no retry for a %s run', async (status, title) => {
+    const client = api({ submitQuery: vi.fn().mockResolvedValue({ data: { query_run: runOf(status) }, error: null }) })
+    if (status === 'succeeded') {
+      client.getQueryResult = vi.fn().mockResolvedValue(result)
+    }
+    renderApp(client)
+
+    await userEvent.click(await screen.findByRole('button', { name: 'Run query' }))
+
+    expect(await screen.findByText(title)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Retry run' })).not.toBeInTheDocument()
+  })
+
+  it('retries a failed run as a new linked run and polls it to success', async () => {
+    const failedRun = runOf('failed', { error_code: 'query_semantic_error' })
+    const getQueryRun = vi
+      .fn()
+      .mockResolvedValueOnce({ data: { query_run: runOf('running', { id: NEW_RUN_ID, retry_of: RUN_ID }) }, error: null })
+      .mockResolvedValue({
+        data: {
+          query_run: runOf('succeeded', {
+            id: NEW_RUN_ID,
+            retry_of: RUN_ID,
+            returned_row_count: 2,
+            result_truncated: true,
+            duration_ms: 14,
+          }),
+        },
+        error: null,
+      })
+    const getQueryResult = vi.fn().mockResolvedValue(result)
+    const retryRun = vi.fn().mockResolvedValue({
+      data: { query_run: runOf('queued', { id: NEW_RUN_ID, retry_of: RUN_ID }) },
+      error: null,
+    })
+    renderApp(api({
+      submitQuery: vi.fn().mockResolvedValue({ data: { query_run: failedRun }, error: null }),
+      getQueryRun,
+      getQueryResult,
+      retryRun,
+    }))
+
+    await userEvent.click(await screen.findByRole('button', { name: 'Run query' }))
+    await userEvent.click(await screen.findByRole('button', { name: 'Retry run' }))
+
+    expect(await screen.findByText('East')).toBeInTheDocument()
+    expect(retryRun).toHaveBeenCalledWith(RUN_ID)
+    expect(screen.getByText('Retry of')).toBeInTheDocument()
+    expect(screen.getByText(RUN_ID)).toBeInTheDocument()
+    expect(sessionStorage.getItem('decisionharbor.active-run')).toBeNull()
+    expect(getQueryRun).toHaveBeenCalledWith(NEW_RUN_ID)
+  })
+
+  it('renders a rejected run when the retried SQL is policy-rejected', async () => {
+    const retryRun = vi.fn().mockResolvedValue({
+      data: { query_run: runOf('rejected', { id: NEW_RUN_ID, retry_of: RUN_ID, error_code: 'sql_statement_not_allowed' }) },
+      error: { code: 'sql_statement_not_allowed', message: 'Statement is not allowed.', query_run_id: NEW_RUN_ID },
+    })
+    renderApp(api({
+      submitQuery: vi.fn().mockResolvedValue({ data: { query_run: runOf('failed') }, error: null }),
+      retryRun,
+    }))
+
+    await userEvent.click(await screen.findByRole('button', { name: 'Run query' }))
+    await userEvent.click(await screen.findByRole('button', { name: 'Retry run' }))
+
+    expect(await screen.findByText('Query rejected')).toBeInTheDocument()
+    expect(screen.getByText('sql_statement_not_allowed')).toBeInTheDocument()
+  })
+
+  it('shows a stable action error when the source run cannot be retried', async () => {
+    const retryRun = vi.fn().mockResolvedValue({
+      data: null,
+      error: { code: 'query_run_not_retryable', message: 'Run is not retryable.' },
+    })
+    renderApp(api({
+      submitQuery: vi.fn().mockResolvedValue({ data: { query_run: runOf('failed') }, error: null }),
+      retryRun,
+    }))
+    await userEvent.click(await screen.findByRole('button', { name: 'Run query' }))
+    await userEvent.click(await screen.findByRole('button', { name: 'Retry run' }))
+
+    expect(await screen.findByText('This run cannot be retried.')).toBeInTheDocument()
+  })
+})
+
+describe('run history', () => {
+  beforeEach(() => {
+    sessionStorage.clear()
+  })
+
+  it('lists recent runs and opens a succeeded run with its result', async () => {
+    const getQueryRun = vi.fn().mockResolvedValue({ data: { query_run: succeededRun }, error: null })
+    const listHistory = vi.fn().mockResolvedValue({
+      data: { query_runs: [succeededRun], next_cursor: null },
+      error: null,
+    })
+    renderApp(api({ getQueryRun, listHistory }))
+
+    const history = await screen.findByRole('region', { name: 'Run history' })
+    await userEvent.click(await screen.findByRole('button', { name: /Succeeded/ }))
+
+    expect(await screen.findByText('Query succeeded')).toBeInTheDocument()
+    expect(screen.getByRole('table')).toBeInTheDocument()
+    expect(getQueryRun).toHaveBeenCalledWith(RUN_ID)
+    expect(listHistory).toHaveBeenCalledWith()
+  })
+
+  it('opens an active run from history and resumes polling as the session run', async () => {
+    const getQueryRun = vi.fn().mockResolvedValue({ data: { query_run: runOf('running') }, error: null })
+    renderApp(api({
+      getQueryRun,
+      listHistory: vi.fn().mockResolvedValue({ data: { query_runs: [runOf('running')], next_cursor: null }, error: null }),
+    }))
+
+    await userEvent.click(await screen.findByRole('button', { name: /Running/ }))
+
+    expect((await screen.findAllByText('Running')).length).toBeGreaterThan(0)
+    expect(sessionStorage.getItem('decisionharbor.active-run')).toBe(RUN_ID)
+  })
+
+  it('loads further pages through the paginated history contract', async () => {
+    const firstPage: HistoryResponse = {
+      data: { query_runs: [runOf('succeeded'), runOf('failed', { error_code: 'query_timeout' })], next_cursor: 'cursor-1' },
+      error: null,
+    }
+    const secondPage: HistoryResponse = {
+      data: { query_runs: [runOf('cancelled', { id: NEW_RUN_ID })], next_cursor: null },
+      error: null,
+    }
+    const listHistory = vi.fn()
+      .mockResolvedValueOnce(firstPage)
+      .mockResolvedValueOnce(secondPage)
+    renderApp(api({ listHistory }))
+
+    expect(await screen.findByRole('button', { name: /Succeeded/ })).toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: 'Load more' }))
+
+    expect(await screen.findByRole('button', { name: /Cancelled/ })).toBeInTheDocument()
+    expect(listHistory).toHaveBeenNthCalledWith(2, 'cursor-1')
+    expect(screen.getByRole('button', { name: /Succeeded/ })).toBeInTheDocument()
+  })
+
+  it('keeps the history list when the history store is unavailable', async () => {
+    renderApp(api({
+      listHistory: vi.fn().mockResolvedValue({
+        data: null,
+        error: { code: 'audit_unavailable', message: 'The audit store is unavailable.' },
+      }),
+    }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('The audit store is unavailable.')
+  })
+})
+
+describe('result feedback', () => {
+  beforeEach(() => {
+    sessionStorage.clear()
+  })
+
+  it('distinguishes an expired result from execution failure', async () => {
+    renderApp(api({
+      getQueryRun: vi.fn().mockResolvedValue({ data: { query_run: succeededRun }, error: null }),
+      getQueryResult: vi.fn().mockResolvedValue({
+        data: null,
+        error: { code: 'result_expired', message: 'The query result has expired.', query_run_id: RUN_ID },
+      }),
+    }))
+
+    await userEvent.click(await screen.findByRole('button', { name: 'Run query' }))
+
+    expect(await screen.findByText('Result expired')).toBeInTheDocument()
+    expect(screen.getByText('result_expired')).toBeInTheDocument()
+    expect(screen.queryByRole('table')).not.toBeInTheDocument()
+  })
+
+  it('distinguishes an unavailable result from an expired one', async () => {
+    renderApp(api({
+      getQueryRun: vi.fn().mockResolvedValue({ data: { query_run: succeededRun }, error: null }),
+      getQueryResult: vi.fn().mockResolvedValue({
+        data: null,
+        error: { code: 'result_unavailable', message: 'The query result is not available for this run.', query_run_id: RUN_ID },
+      }),
+    }))
+
+    await userEvent.click(await screen.findByRole('button', { name: 'Run query' }))
+
+    expect(await screen.findByText('Result unavailable')).toBeInTheDocument()
+    expect(screen.getByText('result_unavailable')).toBeInTheDocument()
+    expect(screen.queryByText('Result expired')).not.toBeInTheDocument()
+  })
+})
+
+describe('polling errors', () => {
+  beforeEach(() => {
+    sessionStorage.clear()
+  })
+
+  it('keeps polling through transient availability errors', async () => {
+    const transient = { data: null, error: { code: 'service_not_ready', message: 'The service is not ready.' } }
+    const getQueryRun = vi
+      .fn()
+      .mockResolvedValueOnce(transient)
+      .mockResolvedValueOnce(transient)
+      .mockResolvedValue({ data: { query_run: succeededRun }, error: null })
+    renderApp(api({ getQueryRun }))
+
+    await userEvent.click(await screen.findByRole('button', { name: 'Run query' }))
+
+    expect(await screen.findByText('Query succeeded')).toBeInTheDocument()
+    await waitFor(() => {
+      expect(getQueryRun).toHaveBeenCalledTimes(3)
+    })
+  })
+
+  it('stops polling on unrecoverable errors', async () => {
+    const getQueryRun = vi.fn().mockResolvedValue({
+      data: null,
+      error: { code: 'query_run_not_found', message: 'Query run was not found.' },
+    })
+    renderApp(api({ getQueryRun }))
+
+    await userEvent.click(await screen.findByRole('button', { name: 'Run query' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('The query run was not found.')
+    await waitFor(
+      () => {
+        expect(getQueryRun).toHaveBeenCalledTimes(1)
+      },
+      { timeout: 200 },
+    )
+    expect(sessionStorage.getItem('decisionharbor.active-run')).toBeNull()
   })
 })

@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+import sys
 from urllib.parse import urlsplit, urlunsplit
 
 from alembic import command
@@ -8,7 +9,7 @@ import psycopg
 from psycopg import sql
 
 from decisionharbor.dataset import load_dataset, run_public_validator
-from decisionharbor.seed import seed_dataset
+from decisionharbor.seed import SeedConflict, seed_dataset
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -122,7 +123,12 @@ def main() -> None:
     _migrate(ROOT / "alembic-analytics.ini", _database_url(admin_url, "analytics", sqlalchemy=True))
     _harden_public_schema(platform_admin_url, ("platform_app", "platform_worker"))
     _harden_public_schema(analytics_admin_url, ("analytics_readiness",))
-    result = seed_dataset(analytics_admin_url, dataset)
+    try:
+        result = seed_dataset(analytics_admin_url, dataset)
+    except SeedConflict as exc:
+        # 已知冲突按 ADR-0008 fail-closed：稳定消息 + 非零退出，不留堆栈。
+        print(f"bootstrap failed: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
     print(f"bootstrap complete: dataset {result}")
 
 

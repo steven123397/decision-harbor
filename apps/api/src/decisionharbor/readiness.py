@@ -1,3 +1,7 @@
+from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
+from threading import Lock
+
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.pool import NullPool
@@ -7,8 +11,36 @@ from decisionharbor.dataset import DatasetContract
 
 READINESS_CONNECT_TIMEOUT_SECONDS = 1
 READINESS_STATEMENT_TIMEOUT_MS = 1_000
+READINESS_DEADLINE_SECONDS = 1.0
 PLATFORM_MIGRATION_VERSION = "platform_0008"
 ANALYTICS_MIGRATION_VERSION = "analytics_0002"
+
+
+class DeadlineBoundedCheck:
+    """就绪判定的截止时间包装：超时或异常一律视为未就绪。
+
+    超时的探测继续执行到自然结束；期间新的判定立即返回未就绪，不叠加并发探测。
+    """
+
+    def __init__(self, check: Callable[[], bool], deadline_seconds: float) -> None:
+        self._check = check
+        self._deadline_seconds = deadline_seconds
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="readiness")
+        self._lock = Lock()
+        self._future: Future[bool] | None = None
+
+    def __call__(self) -> bool:
+        with self._lock:
+            if self._future is not None and not self._future.done():
+                return False
+            self._future = self._executor.submit(self._check)
+        try:
+            return bool(self._future.result(timeout=self._deadline_seconds))
+        except Exception:
+            return False
+
+    def shutdown(self) -> None:
+        self._executor.shutdown(wait=False, cancel_futures=True)
 
 
 def _readiness_engine(database_url: str) -> Engine:

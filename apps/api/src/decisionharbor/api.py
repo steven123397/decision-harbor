@@ -1,9 +1,8 @@
-from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 import json
-from threading import Lock
+import logging
 from typing import Protocol
 from uuid import UUID
 
@@ -14,12 +13,17 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 
 from decisionharbor.cleanup import is_expired
-from decisionharbor.config import Settings
+from decisionharbor.config import Settings, load_or_exit
 from decisionharbor.dataset import load_dataset
 from decisionharbor.domain import HistoryCursor, HistoryPage, QueryRun, ResultSnapshot
 from decisionharbor.pagination import decode_cursor, encode_cursor, parse_limit
 from decisionharbor.policy import SqlPolicy
-from decisionharbor.readiness import AnalyticsReadinessProbe, PlatformReadinessProbe
+from decisionharbor.readiness import (
+    READINESS_DEADLINE_SECONDS,
+    AnalyticsReadinessProbe,
+    DeadlineBoundedCheck,
+    PlatformReadinessProbe,
+)
 from decisionharbor.repository import (
     CANCEL_OUTCOME_CANCELLED,
     CANCEL_OUTCOME_TERMINAL,
@@ -28,8 +32,9 @@ from decisionharbor.repository import (
 from decisionharbor.service import QueryRunService, ServiceFailure
 
 
+logger = logging.getLogger("decisionharbor.api")
+
 MAX_REQUEST_BYTES = 128 * 1024
-READINESS_TIMEOUT_SECONDS = 1.0
 IDEMPOTENCY_KEY_MAX_CHARS = 128
 
 TERMINAL_STATUSES = frozenset({"rejected", "succeeded", "failed", "cancelled"})
@@ -163,30 +168,16 @@ def create_app(
     service: QueryService,
     repository: QueryRepository,
     readiness_check: Callable[[], bool],
+    readiness_deadline_seconds: float = READINESS_DEADLINE_SECONDS,
 ) -> FastAPI:
-    readiness_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="readiness")
-    readiness_lock = Lock()
-    readiness_future: Future[bool] | None = None
-
-    def check_readiness_with_deadline() -> bool:
-        nonlocal readiness_future
-        with readiness_lock:
-            if readiness_future is not None and not readiness_future.done():
-                return False
-            readiness_future = readiness_executor.submit(readiness_check)
-        try:
-            return bool(readiness_future.result(timeout=READINESS_TIMEOUT_SECONDS))
-        except TimeoutError:
-            return False
-        except Exception:
-            return False
+    readiness = DeadlineBoundedCheck(readiness_check, readiness_deadline_seconds)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         try:
             yield
         finally:
-            readiness_executor.shutdown(wait=False, cancel_futures=True)
+            readiness.shutdown()
 
     app = FastAPI(title="DecisionHarbor API", version="1.1.0", lifespan=lifespan)
 
@@ -211,6 +202,21 @@ def create_app(
                 )
         return await call_next(request)
 
+    @app.middleware("http")
+    async def converge_unhandled_errors(request: Request, call_next):
+        # 未知异常收敛为 internal_error envelope：外部响应与默认日志都不得
+        # 泄漏堆栈或数据库原始消息；日志只记录方法、路径与稳定摘要。
+        try:
+            return await call_next(request)
+        except Exception:
+            logger.error(
+                "unhandled exception on %s %s", request.method, request.url.path
+            )
+            return JSONResponse(
+                _envelope(error=_error("internal_error", "The request could not be completed.")),
+                status_code=500,
+            )
+
     @app.exception_handler(RequestValidationError)
     async def validation_error(_: Request, __: RequestValidationError) -> JSONResponse:
         return JSONResponse(
@@ -224,7 +230,7 @@ def create_app(
 
     @app.get("/ready", response_model=None)
     def ready():
-        if not check_readiness_with_deadline():
+        if not readiness():
             return JSONResponse(
                 _envelope(error=_error("service_not_ready", "The service is not ready.")),
                 status_code=503,
@@ -379,7 +385,7 @@ def create_app(
 
 
 def create_runtime_app() -> FastAPI:
-    settings = Settings.from_env()
+    settings = load_or_exit(Settings.from_env, process="api")
     dataset = load_dataset(settings.dataset_root)
     repository = QueryRunRepository(settings.platform_database_url)
     platform_readiness = PlatformReadinessProbe(settings.platform_database_url)

@@ -36,6 +36,8 @@ python3 validate.py
 - API 健康检查：`http://127.0.0.1:8000/health`
 - API 就绪检查：`http://127.0.0.1:8000/ready`
 
+一次 `./dev up` 启动三个应用进程和一个 PostgreSQL 实例（其中包含 platform 与 analytics 两个逻辑数据库）：Web 工作台（反向代理 API）、API（策略判定、入队与运行状态）和 Worker（领取执行查询、维护租约与结果清理，就绪探测在容器内 8001 端口）。`init` 一次性完成角色、数据库、授权、迁移与固定数据 seed 后退出；重复执行 seed 为无操作，检测到未知状态时按 [ADR-0008](docs/adr/0008-fail-closed-when-seeding-fixed-data.md) 以 `seed_conflict` 失败而不覆盖数据。
+
 默认宿主地址只绑定回环接口。首轮没有应用鉴权，不得直接用于共享网络或生产部署。
 
 停止服务但保留当前实例的数据卷：

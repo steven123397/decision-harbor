@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 import pytest
 
 import decisionharbor.api as api_module
-from decisionharbor.api import create_app
+from decisionharbor.api import create_app, create_runtime_app
 from decisionharbor.domain import HistoryCursor, HistoryPage, QueryRun, ResultSnapshot
 from decisionharbor.pagination import encode_cursor
 from decisionharbor.service import ServiceFailure
@@ -165,9 +165,7 @@ def test_ready_failure_is_safe_and_does_not_change_health() -> None:
         assert test_client.get("/health").status_code == 200
 
 
-def test_ready_returns_promptly_when_a_dependency_probe_hangs(
-    monkeypatch,
-) -> None:
+def test_ready_returns_promptly_when_a_dependency_probe_hangs() -> None:
     started = Event()
     release = Event()
 
@@ -176,11 +174,11 @@ def test_ready_returns_promptly_when_a_dependency_probe_hangs(
         release.wait(timeout=1)
         return False
 
-    monkeypatch.setattr(api_module, "READINESS_TIMEOUT_SECONDS", 0.01, raising=False)
     app = create_app(
         service=FakeService(),
         repository=FakeRepository(),
         readiness_check=blocked_readiness_check,
+        readiness_deadline_seconds=0.01,
     )
     try:
         with TestClient(app) as test_client:
@@ -694,3 +692,62 @@ def test_list_history_maps_audit_store_failure_to_a_safe_envelope() -> None:
         },
     }
     assert "DSN" not in response.text
+
+
+def test_unknown_exceptions_converge_to_internal_error_without_leaking_details() -> None:
+    # 快照负载损坏是端点内未被业务映射覆盖的未知异常形态。
+    repository = FakeRepository(snapshot=replace(make_snapshot(), payload="not json {"))
+    with client(repository=repository) as test_client:
+        response = test_client.get(f"/api/v1/query-runs/{RUN_ID}/result")
+
+    assert response.status_code == 500
+    assert response.json() == {
+        "data": None,
+        "error": {
+            "code": "internal_error",
+            "message": "The request could not be completed.",
+        },
+    }
+    # 原始解析错误不进入外部响应。
+    assert "Expecting" not in response.text
+    assert "not json" not in response.text
+
+
+def api_env(monkeypatch: pytest.MonkeyPatch, **overrides: str) -> None:
+    environment = {
+        "PLATFORM_DATABASE_URL": "postgresql+psycopg://platform_app:x@postgres:5432/platform",
+        "ANALYTICS_READINESS_DATABASE_URL": "postgresql+psycopg://analytics_readiness:x@postgres:5432/analytics",
+        "DATASET_ROOT": "/app/datasets/sales-analytics-v1",
+    }
+    environment.update(overrides)
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+
+
+def test_runtime_app_exits_cleanly_on_invalid_configuration(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    api_env(monkeypatch, QUERY_MAX_ROWS="0")
+
+    with pytest.raises(SystemExit) as caught:
+        create_runtime_app()
+
+    assert caught.value.code == 2
+    error = capsys.readouterr().err
+    assert "QUERY_MAX_ROWS" in error
+    assert "Traceback" not in error
+
+
+def test_runtime_app_exits_cleanly_on_missing_configuration(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    api_env(monkeypatch)
+    monkeypatch.delenv("PLATFORM_DATABASE_URL", raising=False)
+
+    with pytest.raises(SystemExit) as caught:
+        create_runtime_app()
+
+    assert caught.value.code == 2
+    error = capsys.readouterr().err
+    assert "PLATFORM_DATABASE_URL" in error
+    assert "Traceback" not in error

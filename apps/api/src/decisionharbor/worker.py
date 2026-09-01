@@ -1,10 +1,10 @@
 """独立 Worker：从持久队列领取查询运行，用 analytics 只读身份执行并原子发布终态。"""
 
 from collections.abc import Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 import logging
 import socket
-import sys
 import threading
 from uuid import uuid4
 
@@ -15,10 +15,15 @@ from sqlalchemy.engine import Connection, Engine
 import uvicorn
 
 from decisionharbor.cleanup import ResultRetentionCleaner
-from decisionharbor.config import WorkerSettings
+from decisionharbor.config import WorkerSettings, load_or_exit
 from decisionharbor.dataset import load_dataset
 from decisionharbor.executor import ExecutionFailure, PostgresQueryExecutor
-from decisionharbor.readiness import AnalyticsReadinessProbe, PlatformReadinessProbe
+from decisionharbor.readiness import (
+    READINESS_DEADLINE_SECONDS,
+    AnalyticsReadinessProbe,
+    DeadlineBoundedCheck,
+    PlatformReadinessProbe,
+)
 from decisionharbor.snapshots import BuiltSnapshot
 
 
@@ -324,9 +329,9 @@ class QueryWorker:
         for run_id in pending:
             try:
                 requested = self._executor.cancel_active(run_id)
-            except Exception:
+            except Exception as exc:
                 # 取消是 best effort：单次失败不撤销取消意图，也不中断其余维护。
-                logger.warning("database cancellation request failed for run %s", run_id, exc_info=True)
+                _warn_maintenance(f"database cancellation request failed for run {run_id}", exc)
                 continue
             if requested:
                 logger.info("database cancellation requested for run %s", run_id)
@@ -445,15 +450,15 @@ class QueryWorker:
             while not stop.wait(self._settings.heartbeat_ms / 1_000):
                 try:
                     self.renew_leases()
-                except Exception:
-                    logger.warning("lease renewal failed", exc_info=True)
+                except Exception as exc:
+                    _warn_maintenance("lease renewal failed", exc)
                 # 心跳线程独立于主循环：执行占用主循环时仍按心跳周期
                 # 请求取消并收敛失联的 cancelling 运行。
                 try:
                     self.request_pending_cancellations()
                     self.converge_expired_cancellations()
-                except Exception:
-                    logger.warning("cancellation maintenance failed", exc_info=True)
+                except Exception as exc:
+                    _warn_maintenance("cancellation maintenance failed", exc)
 
         def cleanup_loop() -> None:
             while not stop.wait(self._settings.cleanup_interval_ms / 1_000):
@@ -461,8 +466,8 @@ class QueryWorker:
                     removed = self._cleaner.cleanup_once()
                     if removed:
                         logger.info("retention cleanup removed %s expired snapshots", removed)
-                except Exception:
-                    logger.warning("retention cleanup failed", exc_info=True)
+                except Exception as exc:
+                    _warn_maintenance("retention cleanup failed", exc)
 
         heartbeat = threading.Thread(target=heartbeat_loop, name="worker-heartbeat", daemon=True)
         cleanup = threading.Thread(target=cleanup_loop, name="worker-cleanup", daemon=True)
@@ -473,8 +478,8 @@ class QueryWorker:
             while not stop.is_set():
                 try:
                     busy = self.run_once()
-                except Exception:
-                    logger.warning("claim failed", exc_info=True)
+                except Exception as exc:
+                    _warn_maintenance("worker iteration failed", exc)
                     busy = False
                 if not busy:
                     stop.wait(self._settings.poll_ms / 1_000)
@@ -491,8 +496,26 @@ class QueryWorker:
         )
 
 
-def create_worker_ready_app(readiness_check: Callable[[], bool]) -> FastAPI:
-    app = FastAPI(title="DecisionHarbor Worker", version="1.0.0")
+def _warn_maintenance(event: str, exc: Exception) -> None:
+    """维护失败只记录事件与异常类型：默认日志不得泄漏堆栈、数据库原始消息或 DSN。"""
+    logger.warning("%s (%s)", event, type(exc).__name__)
+
+
+def create_worker_ready_app(
+    readiness_check: Callable[[], bool],
+    *,
+    readiness_deadline_seconds: float = READINESS_DEADLINE_SECONDS,
+) -> FastAPI:
+    bounded = DeadlineBoundedCheck(readiness_check, readiness_deadline_seconds)
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI):
+        try:
+            yield
+        finally:
+            bounded.shutdown()
+
+    app = FastAPI(title="DecisionHarbor Worker", version="1.0.0", lifespan=lifespan)
 
     @app.get("/health")
     def health() -> dict[str, object]:
@@ -500,7 +523,7 @@ def create_worker_ready_app(readiness_check: Callable[[], bool]) -> FastAPI:
 
     @app.get("/ready", response_model=None)
     def ready():
-        if not readiness_check():
+        if not bounded():
             return JSONResponse(
                 {"data": None, "error": {"code": "service_not_ready", "message": "The service is not ready."}},
                 status_code=503,
@@ -512,14 +535,7 @@ def create_worker_ready_app(readiness_check: Callable[[], bool]) -> FastAPI:
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s [%(name)s] %(message)s")
-    try:
-        settings = WorkerSettings.from_env()
-    except KeyError as exc:
-        print(f"worker configuration error: missing environment variable {exc}", file=sys.stderr)
-        raise SystemExit(2) from exc
-    except ValueError as exc:
-        print(f"worker configuration error: {exc}", file=sys.stderr)
-        raise SystemExit(2) from exc
+    settings = load_or_exit(WorkerSettings.from_env, process="worker")
 
     dataset = load_dataset(settings.dataset_root)
     platform_readiness = PlatformReadinessProbe(settings.platform_database_url)

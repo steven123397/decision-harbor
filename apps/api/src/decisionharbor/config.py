@@ -1,6 +1,24 @@
+from collections.abc import Callable
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import sys
+from typing import TypeVar
+
+
+T = TypeVar("T")
+
+
+def load_or_exit(load: Callable[[], T], *, process: str) -> T:
+    """进程启动配置加载：非法配置以稳定消息退出码 2 失败，不在默认日志留下堆栈。"""
+    try:
+        return load()
+    except KeyError as exc:
+        print(f"{process} configuration error: missing environment variable {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
+    except ValueError as exc:
+        print(f"{process} configuration error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
 
 
 def _bounded_int(name: str, default: int, minimum: int, maximum: int) -> int:

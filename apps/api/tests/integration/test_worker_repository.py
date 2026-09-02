@@ -4,21 +4,25 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from threading import Barrier, Event
-from time import sleep
+from time import monotonic, sleep
 from uuid import uuid4
 
 import pytest
 from alembic import command
 from alembic.config import Config
+from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError
 
+from decisionharbor.api import create_app
 from decisionharbor.config import ApiSettings, WorkerSettings
 from decisionharbor.domain import QueryColumn, QueryResult
 from decisionharbor.executor import ExecutionFailure, PostgresQueryExecutor
+from decisionharbor.policy import SqlPolicy
 from decisionharbor.repository import QueryRunRepository, StateConflict
 from decisionharbor.retention import ResultRetention
 from decisionharbor.result_snapshot import RESULT_MAX_BYTES
+from decisionharbor.service import QueryRunService
 from decisionharbor.worker import QueryWorker
 from support import backdate_finished_at
 
@@ -91,6 +95,23 @@ def queued_sql_run(repository: QueryRunRepository, raw_sql: str):
     )
 
 
+def wait_for_lock_waiters(database_url: str, minimum: int, timeout: float = 5) -> None:
+    engine = create_engine(database_url)
+    deadline = monotonic() + timeout
+    try:
+        while monotonic() < deadline:
+            with engine.connect() as connection:
+                waiting = connection.execute(
+                    text("SELECT count(*) FROM pg_locks WHERE NOT granted AND pid <> pg_backend_pid()")
+                ).scalar_one()
+            if waiting >= minimum:
+                return
+            sleep(0.01)
+    finally:
+        engine.dispose()
+    raise AssertionError(f"expected {minimum} PostgreSQL lock waiters before timeout")
+
+
 def test_queued_cancellation_is_a_stable_terminal_fact_and_is_not_claimable(
     ownership_database_urls,
 ) -> None:
@@ -128,6 +149,53 @@ def test_queued_cancellation_is_a_stable_terminal_fact_and_is_not_claimable(
         engine.dispose()
 
 
+def test_cancel_http_contract_uses_real_repository(ownership_database_urls) -> None:
+    api_database_url, _ = ownership_database_urls
+    repository = QueryRunRepository(api_database_url)
+    queued = queued_run(repository, "cancel-http")
+    received = repository.create(
+        "SELECT count(*) FROM customers /* received cancel-http */",
+        "policy-v1",
+        5_000,
+        500,
+    ).query_run
+    service = QueryRunService(
+        repository=repository,
+        policy=SqlPolicy(set()),
+        policy_version="policy-v1",
+        statement_timeout_ms=5_000,
+        max_rows=500,
+    )
+
+    with TestClient(
+        create_app(service=service, repository=repository, readiness_check=lambda: True)
+    ) as client:
+        cancelled_response = client.post(f"/api/v1/query-runs/{queued.id}/cancel")
+        assert cancelled_response.status_code == 200
+        cancelled_body = cancelled_response.json()
+        cancelled_payload = cancelled_body["data"]["query_run"]
+        assert cancelled_body["error"] is None
+        assert cancelled_payload["status"] == "cancelled"
+        assert cancelled_payload["finished_at"] is not None
+
+        repeated_response = client.post(f"/api/v1/query-runs/{queued.id}/cancel")
+        assert repeated_response.status_code == 200
+        repeated_payload = repeated_response.json()["data"]["query_run"]
+        assert repeated_payload["finished_at"] == cancelled_payload["finished_at"]
+        assert repeated_payload["duration_ms"] == cancelled_payload["duration_ms"]
+
+        not_cancellable_response = client.post(f"/api/v1/query-runs/{received.id}/cancel")
+        assert not_cancellable_response.status_code == 409
+        not_cancellable_body = not_cancellable_response.json()
+        assert not_cancellable_body["data"] is None
+        assert not_cancellable_body["error"]["code"] == "query_run_not_cancellable"
+        assert not_cancellable_body["error"]["query_run_id"] == received.id
+
+        missing_response = client.post(f"/api/v1/query-runs/{uuid4()}/cancel")
+        assert missing_response.status_code == 404
+        assert missing_response.json()["error"]["code"] == "query_run_not_found"
+
+
 def test_cancellation_wins_a_concurrent_claim_race_in_postgresql(ownership_database_urls) -> None:
     api_database_url, worker_database_url = ownership_database_urls
     api_repository = QueryRunRepository(api_database_url)
@@ -153,13 +221,13 @@ def test_cancellation_wins_a_concurrent_claim_race_in_postgresql(ownership_datab
         lock_holder = executor.submit(hold_run_lock)
         assert lock_acquired.wait(timeout=5)
         cancellation = executor.submit(api_repository.cancel, queued.id)
-        sleep(0.05)
+        wait_for_lock_waiters(api_database_url, minimum=1)
         claim = executor.submit(worker_repository.claim_next, "racing-worker", 4, 15_000, 3)
+        assert claim.result(timeout=5) is None
         release_lock.set()
 
         assert lock_holder.result(timeout=5) is None
         outcome, cancelled = cancellation.result(timeout=5)
-        assert claim.result(timeout=5) is None
 
     assert outcome == "cancelled"
     assert cancelled is not None

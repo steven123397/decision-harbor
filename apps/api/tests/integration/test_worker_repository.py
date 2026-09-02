@@ -165,6 +165,30 @@ def test_cancellation_wins_a_concurrent_claim_race_in_postgresql(ownership_datab
     assert cancelled is not None
     assert cancelled.status == "cancelled"
     assert worker_repository.get(queued.id).status == "cancelled"
+
+    class RecordingExecutor:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def execute(self, raw_sql, statement_timeout_ms, max_rows, cancellation=None):
+            self.calls += 1
+            raise AssertionError("a cancelled queued run must not reach analytics execution")
+
+        def cancel(self) -> bool:
+            return False
+
+    executor = RecordingExecutor()
+    assert QueryWorker(
+        worker_repository,
+        executor,
+        worker_id="post-cancel-worker",
+        max_concurrency=4,
+        lease_ms=15_000,
+        heartbeat_ms=5,
+        max_execution_attempts=3,
+    ).process_one() is False
+    assert executor.calls == 0
+
     engine = create_engine(worker_database_url)
     try:
         with engine.connect() as connection:

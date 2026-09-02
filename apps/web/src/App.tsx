@@ -62,7 +62,7 @@ type ViewState =
 
 const CURRENT_RUN_KEY = 'decisionharbor.current-query-run'
 
-const ACTIVE_RUN_STATUSES = new Set<QueryRun['status']>(['received', 'queued', 'running', 'cancelling'])
+const ACTIVE_RUN_STATUSES = new Set<QueryRun['status']>(['received', 'queued', 'running'])
 
 function isActiveRun(run: QueryRun): boolean {
   return ACTIVE_RUN_STATUSES.has(run.status)
@@ -74,7 +74,7 @@ export function App({ api = httpApi, pollIntervalMs = 250 }: { api?: ApiClient; 
   const [readiness, setReadiness] = useState<'checking' | 'ready' | 'unavailable'>('checking')
   const [view, setView] = useState<ViewState>({ kind: 'idle' })
   const [currentRunId, setCurrentRunId] = useState<string | null>(() => localStorage.getItem(CURRENT_RUN_KEY))
-  const [cancelling, setCancelling] = useState(false)
+  const [cancelPending, setCancelPending] = useState(false)
 
   useEffect(() => {
     let active = true
@@ -158,10 +158,10 @@ export function App({ api = httpApi, pollIntervalMs = 250 }: { api?: ApiClient; 
 
   const running = view.kind === 'active'
   const cancelRun = async () => {
-    if (cancelling || view.kind !== 'active' || !view.run || !['queued', 'running'].includes(view.run.status)) return
-    setCancelling(true)
+    if (cancelPending || view.kind !== 'active' || !view.run || view.run.status !== 'queued') return
+    setCancelPending(true)
     const response = await api.cancelQueryRun(view.run.id)
-    setCancelling(false)
+    setCancelPending(false)
     const run = response.data?.query_run
     if (!run) {
       setView({ kind: 'complete', response })
@@ -239,7 +239,7 @@ export function App({ api = httpApi, pollIntervalMs = 250 }: { api?: ApiClient; 
 
         <section className="output" aria-live="polite">
           {view.kind === 'idle' && <IdleState />}
-          {view.kind === 'active' && <RunningState run={view.run} onCancel={cancelRun} cancelling={cancelling} />}
+          {view.kind === 'active' && <RunningState run={view.run} onCancel={cancelRun} cancelPending={cancelPending} />}
           {view.kind === 'complete' && <CompletedState response={view.response} />}
         </section>
       </main>
@@ -256,20 +256,20 @@ function IdleState() {
   )
 }
 
-function RunningState({ run, onCancel, cancelling }: { run: QueryRun | null; onCancel: () => void; cancelling: boolean }) {
+function RunningState({ run, onCancel, cancelPending }: { run: QueryRun | null; onCancel: () => void; cancelPending: boolean }) {
   const queued = run?.status === 'queued' || run?.status === 'received'
-  const canCancel = run?.status === 'queued' || run?.status === 'running'
+  const canCancel = run?.status === 'queued'
   return (
     <div className="run-state running-state">
       <LoaderCircle className="spin" size={21} />
       <div>
-        <strong>{run ? (run.status === 'cancelling' ? 'Cancelling' : queued ? 'Queued' : 'Running') : 'Submitting'}</strong>
-        <span>{run?.status === 'cancelling' ? 'Waiting for cancellation to settle.' : queued ? 'Waiting for an available worker.' : 'The governed query is being processed.'}</span>
+        <strong>{run ? (queued ? 'Queued' : 'Running') : 'Submitting'}</strong>
+        <span>{queued ? 'Waiting for an available worker.' : 'The governed query is being processed.'}</span>
       </div>
       {canCancel && (
-        <button type="button" className="cancel-button" onClick={onCancel} disabled={cancelling}>
-          {cancelling ? <LoaderCircle className="spin" size={15} /> : <X size={15} />}
-          {cancelling ? 'Cancelling' : 'Cancel query'}
+        <button type="button" className="cancel-button" onClick={onCancel} disabled={cancelPending}>
+          {cancelPending ? <LoaderCircle className="spin" size={15} /> : <X size={15} />}
+          {cancelPending ? 'Cancelling' : 'Cancel query'}
         </button>
       )}
     </div>

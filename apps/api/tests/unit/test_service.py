@@ -16,9 +16,18 @@ class FakePolicy:
 
 
 class FakeRepository:
-    def __init__(self, events: list[str], *, fail_create: bool = False) -> None:
+    def __init__(
+        self,
+        events: list[str],
+        *,
+        fail_create: bool = False,
+        cancel_result: tuple[str, QueryRun | None] | None = None,
+        fail_cancel: bool = False,
+    ) -> None:
         self.events = events
         self.fail_create = fail_create
+        self.cancel_result = cancel_result
+        self.fail_cancel = fail_cancel
         self.run = QueryRun.received(
             raw_sql="SELECT 1",
             policy_version="policy-v1",
@@ -48,6 +57,12 @@ class FakeRepository:
 
     def get(self, run_id: str) -> QueryRun | None:
         return self.run if run_id == self.run.id else None
+
+    def cancel(self, run_id: str) -> tuple[str, QueryRun | None]:
+        self.events.append("cancel")
+        if self.fail_cancel:
+            raise RuntimeError("database details must not escape")
+        return self.cancel_result or ("cancelled", self.run)
 
 
 class ResultRepository(FakeRepository):
@@ -179,3 +194,49 @@ def test_result_read_reports_a_cleaned_succeeded_snapshot_as_expired() -> None:
 
     assert caught.value.code == "result_expired"
     assert caught.value.query_run == succeeded
+
+
+def test_cancel_forwards_the_repository_outcome() -> None:
+    events: list[str] = []
+    repository = FakeRepository(events)
+    service = build_service(repository, PolicyDecision(True, None, None, ()))
+
+    outcome, run = service.cancel(repository.run.id)
+
+    assert outcome == "cancelled"
+    assert run is repository.run
+    assert events == ["cancel"]
+
+
+def test_cancel_maps_missing_and_not_cancellable_runs_to_stable_failures() -> None:
+    repository_run = QueryRun.received("SELECT 1", "policy-v1", 5_000, 500)
+    failed = replace(repository_run, status="failed")
+    service = build_service(
+        FakeRepository([], cancel_result=("not_found", None)),
+        PolicyDecision(True, None, None, ()),
+    )
+    with pytest.raises(ServiceFailure) as missing:
+        service.cancel(repository_run.id)
+    assert missing.value.code == "query_run_not_found"
+
+    service = build_service(
+        FakeRepository([], cancel_result=("not_cancellable", failed)),
+        PolicyDecision(True, None, None, ()),
+    )
+    with pytest.raises(ServiceFailure) as not_cancellable:
+        service.cancel(failed.id)
+    assert not_cancellable.value.code == "query_run_not_cancellable"
+    assert not_cancellable.value.query_run is failed
+
+
+def test_cancel_repository_failure_maps_to_audit_unavailable() -> None:
+    service = build_service(
+        FakeRepository([], fail_cancel=True),
+        PolicyDecision(True, None, None, ()),
+    )
+
+    with pytest.raises(ServiceFailure) as caught:
+        service.cancel("any-run")
+
+    assert caught.value.code == "audit_unavailable"
+    assert "database details" not in caught.value.message

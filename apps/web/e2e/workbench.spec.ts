@@ -48,6 +48,50 @@ test('marks row-limited results as truncated', async ({ page }) => {
 })
 
 
+test('cancels a queued run from the workbench', async ({ page }) => {
+  const runId = '11111111-1111-4111-8111-111111111111'
+  const queuedRun = {
+    id: runId,
+    status: 'queued',
+    policy_decision: 'allowed',
+    policy_version: 'policy-v1',
+    referenced_objects: ['analytics.customers'],
+    statement_timeout_ms: 5000,
+    max_rows: 500,
+    returned_row_count: null,
+    result_truncated: null,
+    error_code: null,
+    error_summary: null,
+    created_at: '2026-01-01T00:00:00Z',
+    started_at: null,
+    finished_at: null,
+    duration_ms: null,
+  }
+  await page.route('**/api/v1/query-runs', async (route) => {
+    if (route.request().method() !== 'POST') return route.continue()
+    await route.fulfill({ status: 202, contentType: 'application/json', body: JSON.stringify({ data: { query_run: queuedRun }, error: null }) })
+  })
+  await page.route(`**/api/v1/query-runs/${runId}`, async (route) => {
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ data: { query_run: queuedRun }, error: null }) })
+  })
+  await page.route(`**/api/v1/query-runs/${runId}/cancel`, async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ data: { query_run: { ...queuedRun, status: 'cancelled', finished_at: '2026-01-01T00:00:01Z', duration_ms: 1000 } }, error: null }),
+    })
+  })
+
+  await page.goto('/')
+  await expect(page.getByText('Ready')).toBeVisible()
+  await page.getByRole('button', { name: 'Run query' }).click()
+  await expect(page.getByText('Queued')).toBeVisible()
+  await page.getByRole('button', { name: 'Cancel query' }).click()
+  await expect(page.getByText('Query cancelled')).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Cancel query' })).toHaveCount(0)
+})
+
+
 test('rechecks readiness before enabling submission after recovery', async ({ page }) => {
   let ready = false
   await page.route('**/ready', (route) =>

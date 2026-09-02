@@ -73,13 +73,13 @@ def write_migration_tree(root: Path, revisions: list[tuple[str, str | None]]) ->
 def test_shipped_migration_configs_have_one_current_head() -> None:
     api_root = Path(readiness_module.__file__).resolve().parents[2]
 
-    assert migration_head(api_root / "alembic-platform.ini") == "platform_0005"
+    assert migration_head(api_root / "alembic-platform.ini") == "platform_0006"
     assert migration_head(api_root / "alembic-analytics.ini") == "analytics_0002"
 
 
 @pytest.mark.parametrize(
     ("database_version", "expected"),
-    [("platform_0005", True), ("platform_0004", False), ("platform_9999", False)],
+    [("platform_0006", True), ("platform_0005", False), ("platform_9999", False)],
 )
 def test_platform_readiness_requires_an_exact_migration_head(
     monkeypatch: pytest.MonkeyPatch,

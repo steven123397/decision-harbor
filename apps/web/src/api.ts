@@ -1,6 +1,6 @@
 export type QueryRun = {
   id: string
-  status: 'received' | 'queued' | 'running' | 'succeeded' | 'rejected' | 'failed'
+  status: 'received' | 'queued' | 'running' | 'cancelling' | 'cancelled' | 'succeeded' | 'rejected' | 'failed'
   returned_row_count: number | null
   result_truncated: boolean | null
   duration_ms: number | null
@@ -34,6 +34,7 @@ export type ApiClient = {
   checkReady(): Promise<boolean>
   runQuery(sql: string): Promise<QueryResponse>
   getQueryRun(runId: string): Promise<QueryResponse>
+  cancelQueryRun(runId: string): Promise<QueryResponse>
   getQueryResult(runId: string): Promise<QueryResultResponse>
 }
 
@@ -64,6 +65,17 @@ export const httpApi: ApiClient = {
   async getQueryRun(runId) {
     try {
       const response = await fetch(`/api/v1/query-runs/${encodeURIComponent(runId)}`)
+      return (await response.json()) as QueryResponse
+    } catch {
+      return {
+        data: null,
+        error: { code: 'service_not_ready', message: 'The service is not ready.' },
+      }
+    }
+  },
+  async cancelQueryRun(runId) {
+    try {
+      const response = await fetch(`/api/v1/query-runs/${encodeURIComponent(runId)}/cancel`, { method: 'POST' })
       return (await response.json()) as QueryResponse
     } catch {
       return {

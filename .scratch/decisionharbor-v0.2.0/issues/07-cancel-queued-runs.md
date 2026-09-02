@@ -4,7 +4,7 @@
 
 **Blocked by:** 01 — 打通持久异步查询主链
 
-**Status:** ready-for-agent
+**Status:** claimed
 
 - [ ] 取消 `queued` 查询运行以 HTTP 200 返回 `cancelled` 终态，并记录稳定取消时间与审计事实。
 - [ ] 重复取消已经 `cancelled` 的运行返回 HTTP 200 和同一终态，不创建新状态、新运行或新取消事实。

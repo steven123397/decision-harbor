@@ -51,6 +51,9 @@ textarea { display: block; width: 100%; height: 270px; resize: vertical; border:
 .run-state div { display: grid; gap: 3px; }
 .run-state span { color: #68716c; font-size: 13px; }
 .running-state { min-height: 100px; color: #126f67; }
+.cancel-button { margin-left: auto; min-height: 32px; border: 1px solid #c9a49d; border-radius: 5px; padding: 0 11px; display: inline-flex; align-items: center; gap: 6px; color: #8e3c2c; background: #fff; font-size: 12px; font-weight: 700; cursor: pointer; }
+.cancel-button:hover:not(:disabled) { border-color: #a43e2b; background: #fff8f6; }
+.cancel-button:disabled { cursor: not-allowed; opacity: 0.6; }
 .success-state { color: #237248; }
 .result-summary { min-height: 58px; display: flex; align-items: start; justify-content: space-between; gap: 24px; }
 .audit-facts { margin: 0; display: flex; gap: 24px; flex-wrap: wrap; }
@@ -72,9 +75,11 @@ tbody tr:hover { background: #fafbf8; }
 .error-state { border-left: 3px solid; padding: 16px 18px; background: #fff; }
 .error-rejected { border-color: #b56c22; }
 .error-failed { border-color: #b34b35; }
+.error-cancelled { border-color: #7a827d; }
 .error-heading { display: flex; align-items: flex-start; gap: 10px; }
 .error-rejected .error-heading { color: #9a581c; }
 .error-failed .error-heading { color: #a43e2b; }
+.error-cancelled .error-heading { color: #59615d; }
 .error-heading div { display: grid; gap: 5px; }
 .error-heading code { color: #626a65; font-size: 11px; }
 .error-state p { margin: 12px 0 18px 32px; color: #555e58; font-size: 14px; }
@@ -89,6 +94,8 @@ tbody tr:hover { background: #fafbf8; }
   .policy-lock { max-width: 130px; text-align: right; justify-content: end; }
   textarea { height: 320px; padding: 15px; font-size: 13px; }
   .result-summary { display: grid; }
+  .running-state { align-items: flex-start; flex-wrap: wrap; }
+  .cancel-button { margin-left: 31px; }
   .audit-facts { gap: 14px; }
   .audit-facts div:first-child { width: 100%; }
   .truncated-notice { align-items: flex-start; flex-wrap: wrap; }

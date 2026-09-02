@@ -91,6 +91,92 @@ def queued_sql_run(repository: QueryRunRepository, raw_sql: str):
     )
 
 
+def test_queued_cancellation_is_a_stable_terminal_fact_and_is_not_claimable(
+    ownership_database_urls,
+) -> None:
+    api_database_url, worker_database_url = ownership_database_urls
+    api_repository = QueryRunRepository(api_database_url)
+    worker_repository = QueryRunRepository(worker_database_url)
+    queued = queued_run(api_repository, "cancel-queued")
+
+    outcome, cancelled = api_repository.cancel(queued.id)
+    assert outcome == "cancelled"
+    assert cancelled is not None
+    assert cancelled.status == "cancelled"
+    assert cancelled.finished_at is not None
+    assert cancelled.duration_ms is not None
+
+    repeat_outcome, repeated = api_repository.cancel(queued.id)
+    assert repeat_outcome == "terminal"
+    assert repeated is not None
+    assert repeated.status == "cancelled"
+    assert repeated.finished_at == cancelled.finished_at
+    assert repeated.duration_ms == cancelled.duration_ms
+
+    assert worker_repository.claim_next("cancel-worker", 4, 15_000, 3) is None
+    engine = create_engine(worker_database_url)
+    try:
+        with engine.connect() as connection:
+            assert connection.execute(
+                text(
+                    "SELECT count(*) FROM query_execution_attempts "
+                    "WHERE query_run_id = CAST(:run_id AS uuid)"
+                ),
+                {"run_id": queued.id},
+            ).scalar_one() == 0
+    finally:
+        engine.dispose()
+
+
+def test_cancellation_wins_a_claim_race_when_it_commits_first(ownership_database_urls) -> None:
+    api_database_url, worker_database_url = ownership_database_urls
+    api_repository = QueryRunRepository(api_database_url)
+    worker_repository = QueryRunRepository(worker_database_url)
+    queued = queued_run(api_repository, "cancel-race")
+
+    outcome, cancelled = api_repository.cancel(queued.id)
+    assert outcome == "cancelled"
+    assert cancelled is not None
+
+    # The worker observes the conditional state after cancellation commits and cannot create an attempt.
+    assert worker_repository.claim_next("racing-worker", 4, 15_000, 3) is None
+    assert worker_repository.get(queued.id).status == "cancelled"
+
+
+def test_running_cancellation_is_converged_without_publishing_a_result(ownership_database_urls) -> None:
+    api_database_url, worker_database_url = ownership_database_urls
+    api_repository = QueryRunRepository(api_database_url)
+    worker_repository = QueryRunRepository(worker_database_url)
+    queued = queued_run(api_repository, "cancel-running")
+    ownership = worker_repository.claim_next("cancel-owner", 4, 15_000, 3)
+    assert ownership is not None
+
+    outcome, cancelling = api_repository.cancel(queued.id)
+    assert outcome == "cancelling"
+    assert cancelling is not None
+    assert cancelling.status == "cancelling"
+    assert worker_repository.converge_cancelled(ownership) is not None
+    assert worker_repository.get(queued.id).status == "cancelled"
+    assert worker_repository.claim_next("other-worker", 4, 15_000, 3) is None
+
+
+def test_expired_cancelling_run_is_converged_by_the_next_worker_poll(ownership_database_urls) -> None:
+    api_database_url, worker_database_url = ownership_database_urls
+    api_repository = QueryRunRepository(api_database_url)
+    worker_repository = QueryRunRepository(worker_database_url)
+    queued = queued_run(api_repository, "cancel-expired")
+    ownership = worker_repository.claim_next("expired-owner", 4, 1, 3)
+    assert ownership is not None
+    sleep(0.02)
+
+    outcome, cancelling = api_repository.cancel(queued.id)
+    assert outcome == "cancelling"
+    assert cancelling is not None
+    assert worker_repository.converge_expired_cancellations() == 1
+    assert worker_repository.get(queued.id).status == "cancelled"
+    assert worker_repository.claim_next("other-worker", 4, 15_000, 3) is None
+
+
 def claim_and_block(
     worker_database_url: str,
     claimed,

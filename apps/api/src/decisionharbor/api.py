@@ -46,6 +46,7 @@ HTTP_STATUS_BY_CODE = {
     "internal_error": 500,
     "unsupported_result_type": 500,
     "query_run_not_found": 404,
+    "query_run_not_cancellable": 409,
     "result_not_ready": 409,
     "result_unavailable": 409,
     "result_expired": 410,
@@ -60,6 +61,8 @@ class QueryRequest(BaseModel):
 
 class QueryService(Protocol):
     def submit(self, raw_sql: str, idempotency_key: str | None = None): ...
+
+    def cancel(self, run_id: str) -> tuple[str, QueryRun]: ...
 
     def read_result(self, run_id: str): ...
 
@@ -101,11 +104,11 @@ def _error(code: str, message: str, query_run_id: str | None = None) -> dict[str
     return payload
 
 
-def _failure_response(failure: ServiceFailure) -> JSONResponse:
+def _failure_response(failure: ServiceFailure, *, include_run: bool = True) -> JSONResponse:
     run = failure.query_run
     return JSONResponse(
         _envelope(
-            data={"query_run": _run_payload(run)} if run else None,
+            data={"query_run": _run_payload(run)} if include_run and run else None,
             error=_error(failure.code, failure.message, run.id if run else None),
         ),
         status_code=HTTP_STATUS_BY_CODE.get(failure.code, 500),
@@ -238,6 +241,18 @@ def create_app(
                 ServiceFailure("audit_unavailable", "The audit store is unavailable.", None)
             )
         return _envelope(data={"result": jsonable_encoder(asdict(result))})
+
+    @app.post("/api/v1/query-runs/{run_id}/cancel", response_model=None)
+    def cancel_query_run(run_id: UUID):
+        try:
+            outcome, run = service.cancel(str(run_id))
+        except ServiceFailure as failure:
+            return _failure_response(failure, include_run=False)
+        status_code = 200 if outcome in {"cancelled", "terminal"} else 202
+        return JSONResponse(
+            _envelope(data={"query_run": _run_payload(run)}),
+            status_code=status_code,
+        )
 
     return app
 

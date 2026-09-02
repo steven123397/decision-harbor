@@ -80,6 +80,7 @@ function api(
     checkReady: vi.fn().mockResolvedValue(true),
     runQuery,
     getQueryRun,
+    cancelQueryRun: vi.fn().mockResolvedValue({ data: { query_run: succeeded.data!.query_run }, error: null }),
     getQueryResult: vi.fn().mockResolvedValue({
       data: { result: succeeded.data!.result },
       error: null,
@@ -124,6 +125,50 @@ describe('query workbench', () => {
     expect(await screen.findByText('Query succeeded')).toBeInTheDocument()
     expect(pollingApi.getQueryRun).toHaveBeenCalledTimes(2)
     expect(pollingApi.getQueryResult).toHaveBeenCalledTimes(1)
+  })
+
+  it('cancels a queued run once and renders its cancelled terminal fact', async () => {
+    const cancelled = {
+      ...queued,
+      data: {
+        query_run: {
+          ...queued.data!.query_run,
+          status: 'cancelled' as const,
+        },
+      },
+    }
+    const cancelQueryRun = vi.fn().mockResolvedValue(cancelled)
+    const pollingApi = api(vi.fn().mockResolvedValue(queued), vi.fn().mockResolvedValue(queued))
+    pollingApi.cancelQueryRun = cancelQueryRun
+
+    render(<App api={pollingApi} pollIntervalMs={1_000} />)
+    await userEvent.click(await screen.findByRole('button', { name: 'Run query' }))
+    expect(await screen.findByText('Queued')).toBeInTheDocument()
+
+    await userEvent.click(screen.getByRole('button', { name: 'Cancel query' }))
+
+    expect(cancelQueryRun).toHaveBeenCalledTimes(1)
+    expect(await screen.findByText('Query cancelled')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Cancel query' })).not.toBeInTheDocument()
+  })
+
+  it('restores a cancelled run after a page refresh', async () => {
+    const cancelledRun: QueryResponse = {
+      data: {
+        query_run: {
+          ...queued.data!.query_run,
+          status: 'cancelled',
+        },
+      },
+      error: null,
+    }
+    localStorage.setItem('decisionharbor.current-query-run', cancelledRun.data!.query_run.id)
+    const restoredApi = api(vi.fn().mockResolvedValue(cancelledRun), vi.fn().mockResolvedValue(cancelledRun))
+
+    render(<App api={restoredApi} pollIntervalMs={0} />)
+
+    expect(await screen.findByText('Query cancelled')).toBeInTheDocument()
+    expect(restoredApi.getQueryRun).toHaveBeenCalledWith(cancelledRun.data!.query_run.id)
   })
 
   it('restores the current run after a page refresh', async () => {

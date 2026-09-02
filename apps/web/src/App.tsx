@@ -7,6 +7,7 @@ import {
   Play,
   RefreshCw,
   ShieldCheck,
+  X,
   XCircle,
 } from 'lucide-react'
 
@@ -46,6 +47,7 @@ const ERROR_MESSAGES: Record<string, string> = {
   result_too_large: 'The query result is too large to store.',
   unsupported_result_type: 'The query returned a result type that is not supported.',
   query_run_not_found: 'The query run was not found.',
+  query_run_not_cancellable: 'This query run cannot be cancelled in its current state.',
   execution_interrupted: 'The query execution was interrupted before completion.',
   execution_attempts_exhausted: 'Automatic execution attempts were exhausted.',
   result_not_ready: 'The query result is not ready yet.',
@@ -60,7 +62,7 @@ type ViewState =
 
 const CURRENT_RUN_KEY = 'decisionharbor.current-query-run'
 
-const ACTIVE_RUN_STATUSES = new Set<QueryRun['status']>(['received', 'queued', 'running'])
+const ACTIVE_RUN_STATUSES = new Set<QueryRun['status']>(['received', 'queued', 'running', 'cancelling'])
 
 function isActiveRun(run: QueryRun): boolean {
   return ACTIVE_RUN_STATUSES.has(run.status)
@@ -72,6 +74,7 @@ export function App({ api = httpApi, pollIntervalMs = 250 }: { api?: ApiClient; 
   const [readiness, setReadiness] = useState<'checking' | 'ready' | 'unavailable'>('checking')
   const [view, setView] = useState<ViewState>({ kind: 'idle' })
   const [currentRunId, setCurrentRunId] = useState<string | null>(() => localStorage.getItem(CURRENT_RUN_KEY))
+  const [cancelling, setCancelling] = useState(false)
 
   useEffect(() => {
     let active = true
@@ -154,6 +157,24 @@ export function App({ api = httpApi, pollIntervalMs = 250 }: { api?: ApiClient; 
   }
 
   const running = view.kind === 'active'
+  const cancelRun = async () => {
+    if (cancelling || view.kind !== 'active' || !view.run || !['queued', 'running'].includes(view.run.status)) return
+    setCancelling(true)
+    const response = await api.cancelQueryRun(view.run.id)
+    setCancelling(false)
+    const run = response.data?.query_run
+    if (!run) {
+      setView({ kind: 'complete', response })
+      return
+    }
+    localStorage.setItem(CURRENT_RUN_KEY, run.id)
+    if (isActiveRun(run)) {
+      setView({ kind: 'active', run })
+    } else {
+      setView({ kind: 'complete', response })
+      setCurrentRunId(null)
+    }
+  }
   const checkReadiness = async () => {
     setReadiness('checking')
     setReadiness((await api.checkReady()) ? 'ready' : 'unavailable')
@@ -218,7 +239,7 @@ export function App({ api = httpApi, pollIntervalMs = 250 }: { api?: ApiClient; 
 
         <section className="output" aria-live="polite">
           {view.kind === 'idle' && <IdleState />}
-          {view.kind === 'active' && <RunningState run={view.run} />}
+          {view.kind === 'active' && <RunningState run={view.run} onCancel={cancelRun} cancelling={cancelling} />}
           {view.kind === 'complete' && <CompletedState response={view.response} />}
         </section>
       </main>
@@ -235,15 +256,22 @@ function IdleState() {
   )
 }
 
-function RunningState({ run }: { run: QueryRun | null }) {
+function RunningState({ run, onCancel, cancelling }: { run: QueryRun | null; onCancel: () => void; cancelling: boolean }) {
   const queued = run?.status === 'queued' || run?.status === 'received'
+  const canCancel = run?.status === 'queued' || run?.status === 'running'
   return (
     <div className="run-state running-state">
       <LoaderCircle className="spin" size={21} />
       <div>
-        <strong>{run ? (queued ? 'Queued' : 'Running') : 'Submitting'}</strong>
-        <span>{queued ? 'Waiting for an available worker.' : 'The governed query is being processed.'}</span>
+        <strong>{run ? (run.status === 'cancelling' ? 'Cancelling' : queued ? 'Queued' : 'Running') : 'Submitting'}</strong>
+        <span>{run?.status === 'cancelling' ? 'Waiting for cancellation to settle.' : queued ? 'Waiting for an available worker.' : 'The governed query is being processed.'}</span>
       </div>
+      {canCancel && (
+        <button type="button" className="cancel-button" onClick={onCancel} disabled={cancelling}>
+          {cancelling ? <LoaderCircle className="spin" size={15} /> : <X size={15} />}
+          {cancelling ? 'Cancelling' : 'Cancel query'}
+        </button>
+      )}
     </div>
   )
 }
@@ -272,6 +300,15 @@ function CompletedState({ response }: { response: QueryResponse }) {
         message={safeMessage(response)}
         run={run}
       />
+    )
+  }
+  if (run?.status === 'cancelled') {
+    return (
+      <div className="error-state error-cancelled">
+        <div className="error-heading"><XCircle size={22} /><div><strong>Query cancelled</strong><code>cancelled</code></div></div>
+        <p>The query run was cancelled before a result was published.</p>
+        <AuditFacts run={run} />
+      </div>
     )
   }
   return (

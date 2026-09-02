@@ -12,6 +12,10 @@ from decisionharbor.domain import (
     result_read_failure,
 )
 from decisionharbor.policy import PolicyDecision
+from decisionharbor.repository import (
+    CANCEL_OUTCOME_NOT_CANCELLABLE,
+    CANCEL_OUTCOME_NOT_FOUND,
+)
 
 
 class Policy(Protocol):
@@ -36,6 +40,8 @@ class Repository(Protocol):
     ) -> QueryRun: ...
 
     def get(self, run_id: str) -> QueryRun | None: ...
+
+    def cancel(self, run_id: str) -> tuple[str, QueryRun | None]: ...
 
     def get_result_state(self, run_id: str) -> StoredResult | None: ...
 
@@ -160,6 +166,26 @@ class QueryRunService:
             raise ServiceFailure(failure, messages[failure], stored.run)
         assert stored.snapshot is not None
         return stored.snapshot
+
+    def cancel(self, run_id: str) -> tuple[str, QueryRun]:
+        try:
+            outcome, run = self._repository.cancel(run_id)
+        except Exception as exc:
+            raise ServiceFailure(
+                "audit_unavailable",
+                "The audit store is unavailable.",
+                None,
+            ) from exc
+        if outcome == CANCEL_OUTCOME_NOT_FOUND:
+            raise ServiceFailure("query_run_not_found", "Query run was not found.", None)
+        if outcome == CANCEL_OUTCOME_NOT_CANCELLABLE:
+            raise ServiceFailure(
+                "query_run_not_cancellable",
+                "The query run cannot be cancelled.",
+                run,
+            )
+        assert run is not None
+        return outcome, run
 
     def _replay(self, run: QueryRun) -> QueryRun:
         if run.status == "rejected":

@@ -13,6 +13,10 @@ TERMINAL_STATUSES = frozenset({"rejected", "succeeded", "failed", "cancelled"})
 RESULT_NOT_READY = "result_not_ready"
 RESULT_UNAVAILABLE = "result_unavailable"
 RESULT_EXPIRED = "result_expired"
+CANCEL_OUTCOME_CANCELLED = "cancelled"
+CANCEL_OUTCOME_TERMINAL = "terminal"
+CANCEL_OUTCOME_NOT_CANCELLABLE = "not_cancellable"
+CANCEL_OUTCOME_NOT_FOUND = "not_found"
 
 
 @dataclass(frozen=True)

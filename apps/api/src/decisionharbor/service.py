@@ -1,6 +1,8 @@
 from typing import Protocol
 
 from decisionharbor.domain import (
+    CANCEL_OUTCOME_NOT_CANCELLABLE,
+    CANCEL_OUTCOME_NOT_FOUND,
     RESULT_EXPIRED,
     RESULT_NOT_READY,
     RESULT_UNAVAILABLE,
@@ -12,10 +14,6 @@ from decisionharbor.domain import (
     result_read_failure,
 )
 from decisionharbor.policy import PolicyDecision
-from decisionharbor.repository import (
-    CANCEL_OUTCOME_NOT_CANCELLABLE,
-    CANCEL_OUTCOME_NOT_FOUND,
-)
 
 
 class Policy(Protocol):

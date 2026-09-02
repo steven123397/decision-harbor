@@ -1,7 +1,7 @@
 import json
 
 from sqlalchemy import create_engine, text
-from sqlalchemy.engine import Connection, Engine, Row
+from sqlalchemy.engine import Engine, Row
 
 from decisionharbor.domain import (
     RESULT_RETENTION,
@@ -11,6 +11,10 @@ from decisionharbor.domain import (
     QueryRun,
     QueryRunCreation,
     StoredResult,
+    CANCEL_OUTCOME_CANCELLED,
+    CANCEL_OUTCOME_NOT_CANCELLABLE,
+    CANCEL_OUTCOME_NOT_FOUND,
+    CANCEL_OUTCOME_TERMINAL,
     finished_fields,
 )
 from decisionharbor.result_snapshot import encode_result_snapshot
@@ -19,13 +23,6 @@ from decisionharbor.retention import RETENTION_PREDICATE_SQL
 
 class StateConflict(RuntimeError):
     pass
-
-
-CANCEL_OUTCOME_CANCELLED = "cancelled"
-CANCEL_OUTCOME_CANCELLING = "cancelling"
-CANCEL_OUTCOME_TERMINAL = "terminal"
-CANCEL_OUTCOME_NOT_CANCELLABLE = "not_cancellable"
-CANCEL_OUTCOME_NOT_FOUND = "not_found"
 
 
 TRANSITION_COLUMNS = frozenset(
@@ -160,98 +157,6 @@ class QueryRunRepository:
             ).one_or_none()
         return _row_to_query_run(row) if row else None
 
-    def converge_cancelled(self, ownership: ExecutionOwnership) -> QueryRun | None:
-        """Finalize a cancellation owned by this still-valid execution attempt."""
-
-        with self._engine.begin() as connection:
-            row = connection.execute(
-                text(
-                    f"""
-                    UPDATE query_runs
-                    SET status = 'cancelled',
-                        finished_at = now(),
-                        duration_ms = GREATEST(0, (EXTRACT(EPOCH FROM (now() - created_at)) * 1000)::integer),
-                        owner_worker_id = NULL,
-                        heartbeat_at = NULL,
-                        lease_expires_at = NULL
-                    WHERE id = CAST(:id AS uuid)
-                      AND status = 'cancelling'
-                      {VALID_EXECUTION_OWNERSHIP_SQL}
-                    RETURNING *
-                    """
-                ),
-                {
-                    "id": ownership.query_run.id,
-                    "generation": ownership.generation,
-                    "worker_id": ownership.worker_id,
-                },
-            ).one_or_none()
-            if row is None:
-                return None
-            connection.execute(
-                text(
-                    f"""
-                    UPDATE query_execution_attempts
-                    SET released_at = now(), release_reason = 'cancelled'
-                    {CURRENT_EXECUTION_ATTEMPT_SQL}
-                    """
-                ),
-                {
-                    "id": ownership.query_run.id,
-                    "generation": ownership.generation,
-                    "worker_id": ownership.worker_id,
-                },
-            )
-        return _row_to_query_run(row)
-
-    def converge_expired_cancellations(self) -> int:
-        """Finalize cancelling runs whose owner lease is no longer valid."""
-
-        with self._engine.begin() as connection:
-            return self._converge_expired_cancellations(connection)
-
-    def _converge_expired_cancellations(self, connection: Connection) -> int:
-        rows = connection.execute(
-            text(
-                """
-                SELECT id, current_generation
-                FROM query_runs
-                WHERE status = 'cancelling' AND lease_expires_at <= now()
-                FOR UPDATE SKIP LOCKED
-                """
-            )
-        ).all()
-        for row in rows:
-            values = row._mapping
-            connection.execute(
-                text(
-                    """
-                    UPDATE query_runs
-                    SET status = 'cancelled',
-                        finished_at = now(),
-                        duration_ms = GREATEST(0, (EXTRACT(EPOCH FROM (now() - created_at)) * 1000)::integer),
-                        owner_worker_id = NULL,
-                        heartbeat_at = NULL,
-                        lease_expires_at = NULL
-                    WHERE id = :id AND status = 'cancelling'
-                    """
-                ),
-                {"id": values["id"]},
-            )
-            connection.execute(
-                text(
-                    """
-                    UPDATE query_execution_attempts
-                    SET released_at = now(), release_reason = 'cancelled'
-                    WHERE query_run_id = :id
-                      AND generation = :generation
-                      AND released_at IS NULL
-                    """
-                ),
-                {"id": values["id"], "generation": values["current_generation"]},
-            )
-        return len(rows)
-
     def cancel(self, run_id: str) -> tuple[str, QueryRun | None]:
         """Conditionally record cancellation while serializing with worker claims."""
 
@@ -278,21 +183,6 @@ class QueryRunRepository:
                     {"id": run_id, **fields},
                 ).one()
                 return CANCEL_OUTCOME_CANCELLED, _row_to_query_run(cancelled)
-            if run.status == "running":
-                cancelling = connection.execute(
-                    text(
-                        """
-                        UPDATE query_runs
-                        SET status = 'cancelling'
-                        WHERE id = CAST(:id AS uuid) AND status = 'running'
-                        RETURNING *
-                        """
-                    ),
-                    {"id": run_id},
-                ).one()
-                return CANCEL_OUTCOME_CANCELLING, _row_to_query_run(cancelling)
-            if run.status == "cancelling":
-                return CANCEL_OUTCOME_CANCELLING, run
             if run.status in {"cancelled", "succeeded"}:
                 return CANCEL_OUTCOME_TERMINAL, run
             return CANCEL_OUTCOME_NOT_CANCELLABLE, run
@@ -310,7 +200,6 @@ class QueryRunRepository:
             raise ValueError("ownership limits must be positive")
         with self._engine.begin() as connection:
             connection.execute(text("SELECT pg_advisory_xact_lock(1146111311)"))
-            self._converge_expired_cancellations(connection)
             exhausted = connection.execute(
                 text(
                     """
@@ -368,7 +257,7 @@ class QueryRunRepository:
                     """
                     SELECT count(*)
                     FROM query_runs
-                    WHERE status IN ('running', 'cancelling') AND lease_expires_at > now()
+                    WHERE status = 'running' AND lease_expires_at > now()
                     """
                 )
             ).scalar_one()
@@ -464,7 +353,7 @@ class QueryRunRepository:
                     SET heartbeat_at = now(),
                         lease_expires_at = now() + :lease_ms * interval '1 millisecond'
                     WHERE id = CAST(:id AS uuid)
-                      AND status IN ('running', 'cancelling')
+                      AND status = 'running'
                       {VALID_EXECUTION_OWNERSHIP_SQL}
                     RETURNING *
                     """
@@ -505,7 +394,7 @@ class QueryRunRepository:
                     UPDATE query_runs
                     SET owner_worker_id = NULL, lease_expires_at = now()
                     WHERE id = CAST(:id AS uuid)
-                      AND status IN ('running', 'cancelling')
+                      AND status = 'running'
                       AND current_generation = :generation
                       AND owner_worker_id = :worker_id
                     RETURNING id

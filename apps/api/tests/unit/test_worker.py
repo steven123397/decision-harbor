@@ -7,7 +7,6 @@ import pytest
 
 from decisionharbor.domain import ExecutionOwnership, QueryColumn, QueryResult, QueryRun
 from decisionharbor.executor import ExecutionFailure
-from decisionharbor.repository import StateConflict
 from decisionharbor.worker import QueryWorker, WorkerStopping
 
 
@@ -117,20 +116,6 @@ class FakeRepository:
     def get(self, run_id: str) -> QueryRun | None:
         return self.run if run_id == self.run.id else None
 
-    def converge_cancelled(self, ownership: ExecutionOwnership) -> QueryRun | None:
-        if self.run.status != "cancelling":
-            return None
-        self.run = replace(
-            self.run,
-            status="cancelled",
-            finished_at=datetime.now(timezone.utc),
-            duration_ms=7,
-        )
-        return self.run
-
-    def converge_expired_cancellations(self) -> int:
-        return 0
-
     def get_result(self, run_id: str) -> QueryResult | None:
         return self.result if run_id == self.run.id else None
 
@@ -153,25 +138,6 @@ class RenewalFailureRepository(FakeRepository):
     ) -> ExecutionOwnership | None:
         self.renewals += 1
         raise RuntimeError("platform unavailable")
-
-
-class CancellationOnClaimRepository(FakeRepository):
-    def claim_next(
-        self,
-        worker_id: str,
-        max_concurrency: int,
-        lease_ms: int,
-        max_execution_attempts: int,
-    ) -> ExecutionOwnership | None:
-        ownership = super().claim_next(worker_id, max_concurrency, lease_ms, max_execution_attempts)
-        if ownership is not None:
-            self.run = replace(self.run, status="cancelling")
-        return ownership
-
-    def publish_success(self, ownership: ExecutionOwnership, result: QueryResult) -> QueryRun:
-        if self.run.status == "cancelling":
-            raise StateConflict("cancellation won before success publication")
-        return super().publish_success(ownership, result)
 
 
 class FakeExecutor:
@@ -346,17 +312,6 @@ def test_worker_claims_a_queued_run_and_publishes_its_result() -> None:
         rows=(("100",),),
         truncated=False,
     )
-
-
-def test_worker_converges_a_cancellation_before_publishing_a_late_result() -> None:
-    repository = CancellationOnClaimRepository()
-    executor = CancelableSlowExecutor()
-
-    assert worker(repository, executor).process_one() is True
-
-    assert executor.cancel_requested.is_set()
-    assert repository.run.status == "cancelled"
-    assert repository.result is None
 
 
 def test_worker_publishes_a_safe_failure_for_an_unknown_exception() -> None:

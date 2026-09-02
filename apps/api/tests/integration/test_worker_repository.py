@@ -3,7 +3,7 @@ import multiprocessing
 import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-from threading import Barrier
+from threading import Barrier, Event
 from time import sleep
 from uuid import uuid4
 
@@ -128,53 +128,55 @@ def test_queued_cancellation_is_a_stable_terminal_fact_and_is_not_claimable(
         engine.dispose()
 
 
-def test_cancellation_wins_a_claim_race_when_it_commits_first(ownership_database_urls) -> None:
+def test_cancellation_wins_a_concurrent_claim_race_in_postgresql(ownership_database_urls) -> None:
     api_database_url, worker_database_url = ownership_database_urls
     api_repository = QueryRunRepository(api_database_url)
     worker_repository = QueryRunRepository(worker_database_url)
     queued = queued_run(api_repository, "cancel-race")
+    lock_acquired = Event()
+    release_lock = Event()
 
-    outcome, cancelled = api_repository.cancel(queued.id)
+    def hold_run_lock() -> None:
+        engine = create_engine(api_database_url)
+        try:
+            with engine.begin() as connection:
+                connection.execute(
+                    text("SELECT id FROM query_runs WHERE id = CAST(:id AS uuid) FOR UPDATE"),
+                    {"id": queued.id},
+                )
+                lock_acquired.set()
+                assert release_lock.wait(timeout=5)
+        finally:
+            engine.dispose()
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        lock_holder = executor.submit(hold_run_lock)
+        assert lock_acquired.wait(timeout=5)
+        cancellation = executor.submit(api_repository.cancel, queued.id)
+        sleep(0.05)
+        claim = executor.submit(worker_repository.claim_next, "racing-worker", 4, 15_000, 3)
+        release_lock.set()
+
+        assert lock_holder.result(timeout=5) is None
+        outcome, cancelled = cancellation.result(timeout=5)
+        assert claim.result(timeout=5) is None
+
     assert outcome == "cancelled"
     assert cancelled is not None
-
-    # The worker observes the conditional state after cancellation commits and cannot create an attempt.
-    assert worker_repository.claim_next("racing-worker", 4, 15_000, 3) is None
+    assert cancelled.status == "cancelled"
     assert worker_repository.get(queued.id).status == "cancelled"
-
-
-def test_running_cancellation_is_converged_without_publishing_a_result(ownership_database_urls) -> None:
-    api_database_url, worker_database_url = ownership_database_urls
-    api_repository = QueryRunRepository(api_database_url)
-    worker_repository = QueryRunRepository(worker_database_url)
-    queued = queued_run(api_repository, "cancel-running")
-    ownership = worker_repository.claim_next("cancel-owner", 4, 15_000, 3)
-    assert ownership is not None
-
-    outcome, cancelling = api_repository.cancel(queued.id)
-    assert outcome == "cancelling"
-    assert cancelling is not None
-    assert cancelling.status == "cancelling"
-    assert worker_repository.converge_cancelled(ownership) is not None
-    assert worker_repository.get(queued.id).status == "cancelled"
-    assert worker_repository.claim_next("other-worker", 4, 15_000, 3) is None
-
-
-def test_expired_cancelling_run_is_converged_by_the_next_worker_poll(ownership_database_urls) -> None:
-    api_database_url, worker_database_url = ownership_database_urls
-    api_repository = QueryRunRepository(api_database_url)
-    worker_repository = QueryRunRepository(worker_database_url)
-    queued = queued_run(api_repository, "cancel-expired")
-    ownership = worker_repository.claim_next("expired-owner", 4, 1, 3)
-    assert ownership is not None
-    sleep(0.02)
-
-    outcome, cancelling = api_repository.cancel(queued.id)
-    assert outcome == "cancelling"
-    assert cancelling is not None
-    assert worker_repository.converge_expired_cancellations() == 1
-    assert worker_repository.get(queued.id).status == "cancelled"
-    assert worker_repository.claim_next("other-worker", 4, 15_000, 3) is None
+    engine = create_engine(worker_database_url)
+    try:
+        with engine.connect() as connection:
+            assert connection.execute(
+                text(
+                    "SELECT count(*) FROM query_execution_attempts "
+                    "WHERE query_run_id = CAST(:run_id AS uuid)"
+                ),
+                {"run_id": queued.id},
+            ).scalar_one() == 0
+    finally:
+        engine.dispose()
 
 
 def claim_and_block(

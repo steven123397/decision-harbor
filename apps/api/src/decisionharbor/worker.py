@@ -35,12 +35,6 @@ class WorkerRepository(Protocol):
 
     def release_for_next_attempt(self, ownership: ExecutionOwnership) -> bool: ...
 
-    def converge_cancelled(self, ownership: ExecutionOwnership) -> QueryRun | None: ...
-
-    def converge_expired_cancellations(self) -> int: ...
-
-    def get(self, run_id: str) -> QueryRun | None: ...
-
     def publish_success(self, ownership: ExecutionOwnership, result: QueryResult) -> QueryRun: ...
 
     def publish_failure(
@@ -97,7 +91,6 @@ class QueryWorker:
 
     def process_one(self) -> bool:
         self._clean_expired_results()
-        self._repository.converge_expired_cancellations()
         ownership: ExecutionOwnership | None = None
         try:
             ownership = self._repository.claim_next(
@@ -140,16 +133,6 @@ class QueryWorker:
 
         def maintain_ownership() -> None:
             while not stop_heartbeat.wait(self._heartbeat_seconds):
-                try:
-                    current = self._repository.get(ownership.query_run.id)
-                except Exception:
-                    current = None
-                if current is not None and current.status == "cancelling":
-                    cancellation.request()
-                    try:
-                        self._executor.cancel()
-                    except Exception:
-                        pass
                 try:
                     renewed = self._repository.renew_lease(ownership, self._lease_ms)
                 except Exception:
@@ -201,11 +184,6 @@ class QueryWorker:
                 self._repository.publish_success(ownership, result)
         except StateConflict:
             pass
-        if not ownership_lost.is_set():
-            try:
-                self._repository.converge_cancelled(ownership)
-            except StateConflict:
-                pass
         return True
 
 

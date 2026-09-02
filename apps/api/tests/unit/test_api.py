@@ -89,7 +89,6 @@ class FakeService:
             raise self.cancel_failure
         status = {
             "cancelled": "cancelled",
-            "cancelling": "cancelling",
             "terminal": "succeeded",
         }[self.cancel_outcome]
         return self.cancel_outcome, terminal_run(status)
@@ -382,7 +381,7 @@ def test_get_maps_audit_store_failure_to_safe_envelope() -> None:
 
 @pytest.mark.parametrize(
     ("outcome", "status_code", "run_status"),
-    [("cancelled", 200, "cancelled"), ("cancelling", 202, "cancelling"), ("terminal", 200, "succeeded")],
+    [("cancelled", 200, "cancelled"), ("terminal", 200, "succeeded")],
 )
 def test_cancel_maps_service_outcomes_to_the_http_contract(
     outcome: str,

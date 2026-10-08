@@ -31,9 +31,9 @@ class FakeProcessor:
     def __init__(self) -> None:
         self.calls = 0
 
-    def process_next(self) -> bool:
+    def process_available(self) -> int:
         self.calls += 1
-        return False
+        return 0
 
 
 class FakeRetention:

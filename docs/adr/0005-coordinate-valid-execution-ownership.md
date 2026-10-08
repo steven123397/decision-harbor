@@ -29,7 +29,7 @@ platform PostgreSQL 协调带租约和递增 generation 的有效执行所有权
 
 v0.2.0 的 ticket 01 把执行尝试所有权落为 `query_runs` 上的 generation、租约、心跳与尝试序号列，并用 CHECK 约束与 `query_runs_lifecycle_guard` 触发器拒绝终态回退、generation 与尝试序号回退、取消意图被丢弃以及在取消后领取新尝试；`test_query_run_state_model.py` 证明这些约束。
 
-ticket 03 让每次领取产生递增 generation 的新执行尝试，并让状态与结果发布都带 `status = 'running'`、`attempt_number` 与 `attempt_generation` 栅栏，旧 generation 的写入不产生效果。租约在领取时写入但尚未参与发布判定，心跳续租、全局容量上限与接管由 ticket 07 交付，因此当前栅栏不核对 `lease_expires_at`。
+ticket 07 交付数据库协调的全局容量、心跳续租与失租接管。`QueryRunQueue.claim()` 在一条事务内先取事务级 advisory lock，再统计租约未过期的有效执行所有权，只有计数小于 `QUERY_MAX_CONCURRENCY` 时才领取：排队运行与租约已过期的运行共用同一条语句，因此接管同样受这个上限约束，而已经失租的旧活动不计入计数。接管只在 `running` 内进行并保留首次 `started_at`，所以运行不会回退到 `queued`。`worker/leases.py` 的 `LeaseHeartbeat` 按 `WORKER_HEARTBEAT_MS` 续租，每次续租与每次发布都以「执行尝试 + generation + 租约未过期」为栅栏：被接管的旧尝试既续不了租，也发不了状态或结果。`platform_0005` 为租约扫描建立部分索引，使每轮轮询不必读完整条运行历史。`tests/worker/test_lease_capacity.py` 在真实数据库与两个 Worker 副本上证明所有权上限被真正填满且从未突破、心跳在查询执行期间续租、失租被另一副本接管、以及旧 generation 的续租与发布均无效果；`tests/unit/test_worker_leases.py` 与 `tests/unit/test_worker_execution.py` 覆盖续租逻辑与副本自身的容量边界。执行尝试上限与 `cancelling` 的收敛仍属 ticket 08 与 09。
 
 ## Revisit when
 

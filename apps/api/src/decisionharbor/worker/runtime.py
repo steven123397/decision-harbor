@@ -55,7 +55,7 @@ class WorkerRuntime:
             self._ready.clear()
             raise
         self._ready.set()
-        self._processor.process_next()
+        self._processor.process_available()
         self._clean_expired_results()
 
     def _clean_expired_results(self) -> None:

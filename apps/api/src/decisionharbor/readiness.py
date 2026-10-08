@@ -29,7 +29,7 @@ class PlatformReadinessProbe:
             with self._engine.connect() as connection:
                 return (
                     connection.execute(text("SELECT version_num FROM public.alembic_version")).scalar_one()
-                    == "platform_0004"
+                    == "platform_0005"
                 )
         except Exception:
             return False

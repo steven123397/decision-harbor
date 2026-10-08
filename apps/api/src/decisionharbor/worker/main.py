@@ -6,6 +6,7 @@ from decisionharbor.executor import PostgresQueryExecutor
 from decisionharbor.worker.config import WorkerConfigurationError, WorkerSettings
 from decisionharbor.worker.execution import QueryRunProcessor
 from decisionharbor.worker.health import WorkerHealthServer
+from decisionharbor.worker.leases import LeaseHeartbeat
 from decisionharbor.worker.queue import QueryRunQueue
 from decisionharbor.worker.retention import ResultRetention
 from decisionharbor.worker.runtime import PlatformProbe, WorkerRuntime
@@ -25,9 +26,18 @@ def main() -> int:
         print(f"worker configuration error: {error}", file=sys.stderr)
         return CONFIGURATION_EXIT_CODE
 
+    queue = QueryRunQueue(
+        settings.platform_database_url,
+        settings.worker_id,
+        settings.lease_ms,
+        settings.max_concurrency,
+    )
+    leases = LeaseHeartbeat(queue, settings.heartbeat_ms)
     processor = QueryRunProcessor(
-        QueryRunQueue(settings.platform_database_url, settings.worker_id, settings.lease_ms),
+        queue,
         PostgresQueryExecutor(settings.analytics_database_url, settings.max_concurrency),
+        leases,
+        settings.max_concurrency,
     )
     retention = ResultRetention(settings.platform_database_url)
     runtime = WorkerRuntime(
@@ -38,6 +48,7 @@ def main() -> int:
     )
     health_server = WorkerHealthServer(HEALTH_PORT, is_ready=lambda: runtime.ready)
     health_server.start()
+    leases.start()
     LOGGER.info(
         "worker %s started with concurrency=%d lease=%dms heartbeat=%dms poll=%dms attempts=%d cleanup=%dms",
         settings.worker_id,
@@ -58,5 +69,10 @@ def main() -> int:
     try:
         runtime.run()
     finally:
+        # The heartbeat outlives the queue poll and the pool shutdown: an
+        # execution that is still running keeps its lease until it publishes,
+        # so a graceful stop hands it over rather than losing it mid-flight.
+        processor.close()
+        leases.stop()
         health_server.stop()
     return 0

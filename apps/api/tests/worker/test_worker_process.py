@@ -9,6 +9,7 @@ from decisionharbor.executor import PostgresQueryExecutor
 from decisionharbor.worker.config import WorkerSettings
 from decisionharbor.worker.execution import QueryRunProcessor
 from decisionharbor.worker.health import WorkerHealthServer
+from decisionharbor.worker.leases import LeaseHeartbeat
 from decisionharbor.worker.queue import QueryRunQueue
 from decisionharbor.worker.retention import ResultRetention
 from decisionharbor.worker.runtime import PlatformProbe, WorkerRuntime
@@ -18,9 +19,17 @@ pytestmark = pytest.mark.worker
 
 
 def runtime(settings: WorkerSettings) -> WorkerRuntime:
+    queue = QueryRunQueue(
+        settings.platform_database_url,
+        settings.worker_id,
+        settings.lease_ms,
+        settings.max_concurrency,
+    )
     processor = QueryRunProcessor(
-        QueryRunQueue(settings.platform_database_url, settings.worker_id, settings.lease_ms),
-        PostgresQueryExecutor(settings.analytics_database_url, 1),
+        queue,
+        PostgresQueryExecutor(settings.analytics_database_url, settings.max_concurrency),
+        LeaseHeartbeat(queue, settings.heartbeat_ms),
+        settings.max_concurrency,
     )
     return WorkerRuntime(
         settings,
